@@ -2,6 +2,12 @@
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
+
+#define OTA_AP_SSID   "POV-OTA"
+#define OTA_AP_PASS   "povupdate"
 
 // ====== SD-MMC custom pinout (yours) ======
 static const int PIN_SD_CLK = 14;
@@ -37,6 +43,194 @@ static const uint32_t bytesPerFrame = channels;
 Adafruit_DotStar* strips[NUM_ARMS] = {nullptr};
 File fseqFile;
 
+WebServer server(80);
+
+static bool g_playbackEnabled = true;
+static uint32_t g_frameIndex  = 0;
+static uint32_t g_lastFrameMs = 0;
+static String g_uploadStatus  = "Ready";
+
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>POV Maintenance</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:2rem; }
+    h1 { color:#6cf; }
+    section { background:#1b1b1b; padding:1rem 1.5rem; margin-bottom:1.5rem; border-radius:8px; }
+    form { margin-top:0.75rem; }
+    label { display:block; margin-bottom:0.5rem; }
+    input[type="text"], input[type="file"] { width:100%; max-width:320px; }
+    button { padding:0.5rem 1rem; border:0; border-radius:4px; background:#6cf; color:#111; font-size:1rem; cursor:pointer; }
+    button:hover { background:#8df; }
+    .status { margin-top:0.5rem; font-size:0.9rem; color:#9f9; }
+  </style>
+</head>
+<body>
+  <h1>POV Maintenance Portal</h1>
+  <section>
+    <h2>Firmware OTA Update</h2>
+    <form method="post" action="/update" enctype="multipart/form-data">
+      <label for="ota">Select firmware (.bin)</label>
+      <input type="file" id="ota" name="update" accept=".bin" required>
+      <button type="submit">Upload &amp; Flash</button>
+    </form>
+  </section>
+  <section>
+    <h2>Playback Control</h2>
+    <form method="post" action="/playback/start">
+      <button type="submit">Start FSEQ Playback</button>
+    </form>
+    <form method="post" action="/playback/stop">
+      <button type="submit">Stop FSEQ Playback</button>
+    </form>
+  </section>
+  <section>
+    <h2>Upload to SD Card</h2>
+    <form method="post" action="/upload-sd" enctype="multipart/form-data">
+      <label for="path">Destination path on SD (e.g. /test2.fseq)</label>
+      <input type="text" id="path" name="path" value="/test2.fseq" required>
+      <label for="sd">Select file</label>
+      <input type="file" id="sd" name="upload" required>
+      <button type="submit">Upload File</button>
+    </form>
+    <div class="status">%STATUS%</div>
+  </section>
+</body>
+</html>
+)rawliteral";
+
+static String expandTemplate(const String& placeholder) {
+  String page = FPSTR(INDEX_HTML);
+  page.replace("%STATUS%", placeholder);
+  return page;
+}
+
+static void handleRoot() {
+  server.send(200, "text/html", expandTemplate(g_uploadStatus));
+}
+
+static void handlePlaybackStart() {
+  g_playbackEnabled = true;
+  g_frameIndex = 0;
+  g_lastFrameMs = millis();
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+static void handlePlaybackStop() {
+  g_playbackEnabled = false;
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+static void handleOTAComplete() {
+  bool ok = !Update.hasError();
+  String msg = ok ? "Update Success. Rebooting..." : "Update Failed.";
+  server.send(200, "text/plain", msg);
+  delay(100);
+  if (ok) ESP.restart();
+}
+
+static void handleOTAUpload() {
+  HTTPUpload& upload = server.upload();
+  switch (upload.status) {
+    case UPLOAD_FILE_START:
+      Serial.printf("[OTA] Update start: %s\n", upload.filename.c_str());
+      if (!Update.begin()) {
+        Serial.println("[OTA] Update.begin failed");
+        Update.printError(Serial);
+      }
+      break;
+    case UPLOAD_FILE_WRITE:
+      if (Update.isRunning()) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Serial.println("[OTA] Update.write failed");
+        }
+      }
+      break;
+    case UPLOAD_FILE_END:
+      if (Update.end(true)) {
+        Serial.printf("[OTA] Update finished (%u bytes)\n", upload.totalSize);
+      } else {
+        Serial.print("[OTA] Update failed: ");
+        Update.printError(Serial);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static File uploadFile;
+
+static void handleSdUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (uploadFile) {
+      uploadFile.close();
+    }
+    String path = server.arg("path");
+    if (!path.length() || path[0] != '/') {
+      path = "/" + path;
+    }
+    Serial.printf("[SD] Upload start: %s\n", path.c_str());
+    uploadFile = SD_MMC.open(path, FILE_WRITE);
+    if (!uploadFile) {
+      g_uploadStatus = "Failed to open " + path;
+      Serial.println("[SD] Open failed");
+    } else {
+      g_uploadStatus = "Uploading to " + path;
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      if (uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Serial.println("[SD] Write mismatch");
+        g_uploadStatus = "Write error";
+      }
+    } else {
+      g_uploadStatus = "No open file";
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      uploadFile = File();
+      g_uploadStatus = "Upload complete (" + String(upload.totalSize) + " bytes)";
+      Serial.println("[SD] Upload complete");
+    } else {
+      g_uploadStatus = "Upload failed";
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) {
+      uploadFile.close();
+      uploadFile = File();
+    }
+    g_uploadStatus = "Upload aborted";
+    Serial.println("[SD] Upload aborted");
+  }
+}
+
+static void startAccessPoint() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(OTA_AP_SSID, OTA_AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[WIFI] AP '%s' started. IP: %s\n", OTA_AP_SSID, ip.toString().c_str());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/playback/start", HTTP_POST, handlePlaybackStart);
+  server.on("/playback/stop", HTTP_POST, handlePlaybackStop);
+  server.on("/update", HTTP_POST, handleOTAComplete, handleOTAUpload);
+  server.on("/upload-sd", HTTP_POST, []() {
+    server.sendHeader("Location", "/", true);
+    server.send(303);
+  }, handleSdUpload);
+  server.onNotFound(handleRoot);
+  server.begin();
+  Serial.println("[WIFI] HTTP server ready");
+}
+
 // ---------------- util ----------------
 static inline bool cardPresent() {
   pinMode(PIN_SD_CD, INPUT_PULLUP);
@@ -66,6 +260,8 @@ void setup() {
   Serial.begin(115200);
   delay(1200);
   Serial.println("\n[POV] FSEQ→APA102 (4 arms, static spokes @ 0/90/180/270)");
+
+  startAccessPoint();
 
   // Restore brightness % from NVS
   prefs.begin("display", false);
@@ -106,8 +302,7 @@ void setup() {
 
 // ---------------- main loop ----------------
 void loop() {
-  static uint32_t frameIndex = 0;
-  static uint32_t last = 0;
+  server.handleClient();
 
   // Serial brightness command (e.g. B10 for 10%)
   if (Serial.available()) {
@@ -126,21 +321,26 @@ void loop() {
     }
   }
 
+  if (!g_playbackEnabled) {
+    delay(1);
+    return;
+  }
+
   // Timing @ 40fps
-  if (millis() - last < STEP_MS) return;
-  last = millis();
-  if (frameIndex >= frames) {
-    frameIndex = 0;
+  if (millis() - g_lastFrameMs < STEP_MS) return;
+  g_lastFrameMs = millis();
+  if (g_frameIndex >= frames) {
+    g_frameIndex = 0;
     Serial.println("[FSEQ] Looping back to frame 0");
   }
 
   // Read one full frame
-  const uint32_t offset = chanOffset + frameIndex * bytesPerFrame;
-  if (!fseqFile.seek(offset, fs::SeekSet)) { frameIndex = 0; return; }
+  const uint32_t offset = chanOffset + g_frameIndex * bytesPerFrame;
+  if (!fseqFile.seek(offset, fs::SeekSet)) { g_frameIndex = 0; return; }
 
   static uint8_t frameBuf[channels];
   const size_t n = fseqFile.read(frameBuf, bytesPerFrame);
-  if (n != bytesPerFrame) { frameIndex = 0; return; }
+  if (n != bytesPerFrame) { g_frameIndex = 0; return; }
 
   // Determine arms per revolution in the file
   const uint32_t armSize   = LED_COUNT * 3;                   // bytes per logical arm
@@ -173,5 +373,5 @@ void loop() {
   // Latch all arms together
   for (int a = 0; a < NUM_ARMS; ++a) { strips[a]->show(); }
 
-  frameIndex++;
+  g_frameIndex++;
 }
