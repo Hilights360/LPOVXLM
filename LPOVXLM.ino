@@ -2,6 +2,9 @@
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>
 
 // ====== SD-MMC custom pinout (yours) ======
 static const int PIN_SD_CLK = 14;
@@ -23,6 +26,139 @@ static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 45 };
 // ^^^ If some pins aren’t exposed on your S3 board, swap for ones that are.
 // Avoid GPIO45/46 (strap/input-only). 40/41 are known-good fast pins.
 
+// ====== Wi-Fi OTA access point ======
+#define OTA_AP_SSID   "POV-OTA"
+#define OTA_AP_PASS   "povupdate"
+
+WebServer server(80);
+
+// ====== Web UI ======
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>POV Control</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }
+    h1 { margin-top:0; }
+    section { background:#1d1d1d; border-radius:8px; padding:16px; margin-bottom:20px; box-shadow:0 2px 4px rgba(0,0,0,0.4); }
+    button { font-size:1rem; padding:10px 18px; margin:6px 12px 6px 0; border:none; border-radius:4px; cursor:pointer; }
+    button.start { background:#1e90ff; color:#fff; }
+    button.stop { background:#ff6347; color:#fff; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    label { display:block; margin-bottom:8px; }
+    input[type="file"] { color:#eee; }
+    form { margin-top:12px; }
+    #status { margin-top:12px; font-weight:bold; }
+    progress { width:100%; height:20px; }
+  </style>
+</head>
+<body>
+  <h1>POV Controller</h1>
+  <section>
+    <h2>Playback</h2>
+    <p id="playback-state">Status: <span id="playing">?</span></p>
+    <button class="start" id="btn-start">Start Playback</button>
+    <button class="stop" id="btn-stop">Stop Playback</button>
+  </section>
+  <section>
+    <h2>OTA Firmware Update</h2>
+    <form id="ota-form">
+      <label for="ota-file">Select firmware (.bin)</label>
+      <input type="file" id="ota-file" name="firmware" accept=".bin" required>
+      <progress id="ota-progress" value="0" max="100" hidden></progress>
+      <div id="ota-status"></div>
+      <button type="submit">Upload Firmware</button>
+    </form>
+  </section>
+  <section>
+    <h2>Upload FSEQ / Assets to SD</h2>
+    <form id="sd-form">
+      <label for="sd-file">Select file</label>
+      <input type="file" id="sd-file" name="file" required>
+      <progress id="sd-progress" value="0" max="100" hidden></progress>
+      <div id="sd-status"></div>
+      <button type="submit">Upload to SD</button>
+    </form>
+  </section>
+  <script>
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        document.getElementById('playing').textContent = data.playing ? 'Playing' : 'Stopped';
+      } catch (err) {
+        document.getElementById('playing').textContent = 'Error';
+      }
+    }
+
+    document.getElementById('btn-start').addEventListener('click', async () => {
+      await fetch('/start', { method: 'POST' });
+      refreshStatus();
+    });
+
+    document.getElementById('btn-stop').addEventListener('click', async () => {
+      await fetch('/stop', { method: 'POST' });
+      refreshStatus();
+    });
+
+    document.getElementById('ota-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const fileInput = document.getElementById('ota-file');
+      if (!fileInput.files.length) return;
+      const formData = new FormData();
+      formData.append('firmware', fileInput.files[0]);
+      const progress = document.getElementById('ota-progress');
+      const status = document.getElementById('ota-status');
+      progress.hidden = false; progress.value = 0; status.textContent = 'Uploading…';
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/update');
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          progress.value = Math.round((event.loaded / event.total) * 100);
+        }
+      };
+      xhr.onload = () => {
+        status.textContent = xhr.status === 200 ? 'Update uploaded. Device will reboot if successful.' : 'Upload failed';
+        if (xhr.status === 200) progress.value = 100;
+      };
+      xhr.onerror = () => { status.textContent = 'Upload error'; };
+      xhr.send(formData);
+    });
+
+    document.getElementById('sd-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const fileInput = document.getElementById('sd-file');
+      if (!fileInput.files.length) return;
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      const progress = document.getElementById('sd-progress');
+      const status = document.getElementById('sd-status');
+      progress.hidden = false; progress.value = 0; status.textContent = 'Uploading…';
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload');
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          progress.value = Math.round((event.loaded / event.total) * 100);
+        }
+      };
+      xhr.onload = () => {
+        status.textContent = xhr.status === 200 ? 'File stored to SD.' : 'Upload failed';
+        if (xhr.status === 200) progress.value = 100;
+      };
+      xhr.onerror = () => { status.textContent = 'Upload error'; };
+      xhr.send(formData);
+    });
+
+    refreshStatus();
+    setInterval(refreshStatus, 3000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
 // ====== Brightness (percentage, persisted) ======
 Preferences prefs;
 uint8_t g_brightnessPercent = 25;  // 0–100
@@ -36,6 +172,10 @@ static const uint32_t bytesPerFrame = channels;
 
 Adafruit_DotStar* strips[NUM_ARMS] = {nullptr};
 File fseqFile;
+File uploadFile;
+
+bool g_playbackEnabled = true;
+bool g_shouldReboot    = false;
 
 // ---------------- util ----------------
 static inline bool cardPresent() {
@@ -102,12 +242,120 @@ void setup() {
   }
   Serial.println("[LED] 4 arms ready");
   Serial.println("Type 'Bxx' (e.g. B25) to set brightness percent (0–100).");
+
+  // Start Wi-Fi access point for OTA + control panel
+  WiFi.mode(WIFI_AP);
+  if (WiFi.softAP(OTA_AP_SSID, OTA_AP_PASS)) {
+    Serial.printf("[WIFI] AP '%s' started. IP: %s\n", OTA_AP_SSID, WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[WIFI] Failed to start AP");
+  }
+
+  // HTTP routes
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/status", HTTP_GET, []() {
+    String json = String("{\"playing\":") + (g_playbackEnabled ? "true" : "false") + "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/start", HTTP_POST, []() {
+    g_playbackEnabled = true;
+    server.send(200, "application/json", "{\"playing\":true}");
+  });
+
+  server.on("/stop", HTTP_POST, []() {
+    g_playbackEnabled = false;
+    server.send(200, "application/json", "{\"playing\":false}");
+  });
+
+  server.on("/upload", HTTP_POST, []() {
+    if (uploadFile) {
+      uploadFile.close();
+      uploadFile = File();
+    }
+    server.send(200, "text/plain", "Upload complete");
+  }, []() {
+    HTTPUpload &upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      String path = "/" + upload.filename;
+      Serial.printf("[HTTP] Upload start: %s (%u bytes expected)\n", path.c_str(), upload.totalSize);
+      if (SD_MMC.exists(path)) {
+        SD_MMC.remove(path);
+      }
+      uploadFile = SD_MMC.open(path, FILE_WRITE);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (uploadFile) {
+        uploadFile.write(upload.buf, upload.currentSize);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (uploadFile) {
+        uploadFile.close();
+        uploadFile = File();
+        Serial.printf("[HTTP] Upload complete: %s (%u bytes)\n", upload.filename.c_str(), upload.totalSize);
+      }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      if (uploadFile) {
+        uploadFile.close();
+        uploadFile = File();
+      }
+      SD_MMC.remove(String("/") + upload.filename);
+      Serial.println("[HTTP] Upload aborted");
+    }
+  });
+
+  server.on("/update", HTTP_POST, []() {
+    bool ok = !Update.hasError();
+    server.send(ok ? 200 : 500, "text/plain", ok ? "Update successful" : "Update failed");
+    if (ok) {
+      g_shouldReboot = true;
+    }
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("[OTA] Update start: %s\n", upload.filename.c_str());
+      g_playbackEnabled = false;
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (!Update.end(true)) {
+        Update.printError(Serial);
+      } else {
+        Serial.printf("[OTA] Update complete (%u bytes)\n", upload.totalSize);
+      }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+      Update.end();
+      Serial.println("[OTA] Update aborted");
+    }
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Web server started on 192.168.4.1");
 }
 
 // ---------------- main loop ----------------
 void loop() {
+  server.handleClient();
+
+  if (g_shouldReboot) {
+    delay(1000);
+    ESP.restart();
+  }
+
   static uint32_t frameIndex = 0;
   static uint32_t last = 0;
+
+  if (!g_playbackEnabled) {
+    delay(5);
+    return;
+  }
 
   // Serial brightness command (e.g. B10 for 10%)
   if (Serial.available()) {
