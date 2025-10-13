@@ -18,8 +18,8 @@ static const int PIN_SD_CD  = 42;     // move to 27 if 42 doesn’t read
 #define STEP_MS      25               // 40 fps
 
 // Arm 0 (you already wired these fast pins)
-static const int ARM_CLK[NUM_ARMS]  = { 18, 38, 36, 11 };
-static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 10 };
+static const int ARM_CLK[NUM_ARMS]  = { 18, 38, 36, 48 };
+static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 45 };
 // ^^^ If some pins aren’t exposed on your S3 board, swap for ones that are.
 // Avoid GPIO45/46 (strap/input-only). 40/41 are known-good fast pins.
 
