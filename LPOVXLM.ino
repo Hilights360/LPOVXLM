@@ -1,10 +1,24 @@
+// ESP32-S3 POV Player with AP + OTA (hardened for core 3.2.1)
+// - Pre-allocates frame buffers in INTERNAL 8-bit DRAM before Wi-Fi/AP starts
+// - Pixel render loop runs in its own task pinned to core 1 with bigger stack
+// - Playback is paused during OTA and SD uploads
+// - Bounds-safe frame read: clamps to expected channels and skips any excess
+// - No large stack arrays; no per-frame heap churn
+
 #include <Arduino.h>
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+  #include <USB.h>   // ensures HWCDCSerial (native USB CDC) is declared in core 3.x
+#endif
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // ====== SD-MMC custom pinout (yours) ======
 static const int PIN_SD_CLK = 14;
@@ -20,11 +34,10 @@ static const int PIN_SD_CD  = 42;     // move to 27 if 42 doesn’t read
 #define LED_COUNT    144
 #define STEP_MS      25               // 40 fps
 
-// Arm 0 (you already wired these fast pins)
+// Arm pins
 static const int ARM_CLK[NUM_ARMS]  = { 18, 38, 36, 48 };
 static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 45 };
-// ^^^ If some pins aren’t exposed on your S3 board, swap for ones that are.
-// Avoid GPIO45/46 (strap/input-only). 40/41 are known-good fast pins.
+// Avoid GPIO45/46 (strap/input-only). 40/41 are also fine on many S3 boards.
 
 // ====== Wi-Fi OTA access point ======
 #define OTA_AP_SSID   "POV-OTA"
@@ -35,128 +48,66 @@ WebServer server(80);
 // ====== Web UI ======
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>POV Control</title>
-  <style>
-    body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }
-    h1 { margin-top:0; }
-    section { background:#1d1d1d; border-radius:8px; padding:16px; margin-bottom:20px; box-shadow:0 2px 4px rgba(0,0,0,0.4); }
-    button { font-size:1rem; padding:10px 18px; margin:6px 12px 6px 0; border:none; border-radius:4px; cursor:pointer; }
-    button.start { background:#1e90ff; color:#fff; }
-    button.stop { background:#ff6347; color:#fff; }
-    button:disabled { opacity:0.5; cursor:not-allowed; }
-    label { display:block; margin-bottom:8px; }
-    input[type="file"] { color:#eee; }
-    form { margin-top:12px; }
-    #status { margin-top:12px; font-weight:bold; }
-    progress { width:100%; height:20px; }
-  </style>
-</head>
-<body>
-  <h1>POV Controller</h1>
-  <section>
-    <h2>Playback</h2>
-    <p id="playback-state">Status: <span id="playing">?</span></p>
-    <button class="start" id="btn-start">Start Playback</button>
-    <button class="stop" id="btn-stop">Stop Playback</button>
-  </section>
-  <section>
-    <h2>OTA Firmware Update</h2>
-    <form id="ota-form">
-      <label for="ota-file">Select firmware (.bin)</label>
-      <input type="file" id="ota-file" name="firmware" accept=".bin" required>
-      <progress id="ota-progress" value="0" max="100" hidden></progress>
-      <div id="ota-status"></div>
-      <button type="submit">Upload Firmware</button>
-    </form>
-  </section>
-  <section>
-    <h2>Upload FSEQ / Assets to SD</h2>
-    <form id="sd-form">
-      <label for="sd-file">Select file</label>
-      <input type="file" id="sd-file" name="file" required>
-      <progress id="sd-progress" value="0" max="100" hidden></progress>
-      <div id="sd-status"></div>
-      <button type="submit">Upload to SD</button>
-    </form>
-  </section>
-  <script>
-    async function refreshStatus() {
-      try {
-        const res = await fetch('/status');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        document.getElementById('playing').textContent = data.playing ? 'Playing' : 'Stopped';
-      } catch (err) {
-        document.getElementById('playing').textContent = 'Error';
-      }
-    }
-
-    document.getElementById('btn-start').addEventListener('click', async () => {
-      await fetch('/start', { method: 'POST' });
-      refreshStatus();
-    });
-
-    document.getElementById('btn-stop').addEventListener('click', async () => {
-      await fetch('/stop', { method: 'POST' });
-      refreshStatus();
-    });
-
-    document.getElementById('ota-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const fileInput = document.getElementById('ota-file');
-      if (!fileInput.files.length) return;
-      const formData = new FormData();
-      formData.append('firmware', fileInput.files[0]);
-      const progress = document.getElementById('ota-progress');
-      const status = document.getElementById('ota-status');
-      progress.hidden = false; progress.value = 0; status.textContent = 'Uploading…';
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/update');
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
-          progress.value = Math.round((event.loaded / event.total) * 100);
-        }
-      };
-      xhr.onload = () => {
-        status.textContent = xhr.status === 200 ? 'Update uploaded. Device will reboot if successful.' : 'Upload failed';
-        if (xhr.status === 200) progress.value = 100;
-      };
-      xhr.onerror = () => { status.textContent = 'Upload error'; };
-      xhr.send(formData);
-    });
-
-    document.getElementById('sd-form').addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const fileInput = document.getElementById('sd-file');
-      if (!fileInput.files.length) return;
-      const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
-      const progress = document.getElementById('sd-progress');
-      const status = document.getElementById('sd-status');
-      progress.hidden = false; progress.value = 0; status.textContent = 'Uploading…';
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/upload');
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
-          progress.value = Math.round((event.loaded / event.total) * 100);
-        }
-      };
-      xhr.onload = () => {
-        status.textContent = xhr.status === 200 ? 'File stored to SD.' : 'Upload failed';
-        if (xhr.status === 200) progress.value = 100;
-      };
-      xhr.onerror = () => { status.textContent = 'Upload error'; };
-      xhr.send(formData);
-    });
-
-    refreshStatus();
-    setInterval(refreshStatus, 3000);
-  </script>
-</body>
-</html>
+<html><head><meta charset="utf-8"><title>POV Control</title>
+<style>
+body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
+h1{margin-top:0}section{background:#1d1d1d;border-radius:8px;padding:16px;margin-bottom:20px;
+box-shadow:0 2px 4px rgba(0,0,0,.4)}button{font-size:1rem;padding:10px 18px;margin:6px 12px 6px 0;
+border:none;border-radius:4px;cursor:pointer}button.start{background:#1e90ff;color:#fff}
+button.stop{background:#ff6347;color:#fff}button:disabled{opacity:.5;cursor:not-allowed}
+label{display:block;margin-bottom:8px}input[type=file]{color:#eee}form{margin-top:12px}
+#status{margin-top:12px;font-weight:bold}progress{width:100%;height:20px}
+</style></head><body>
+<h1>POV Controller</h1>
+<section>
+  <h2>Playback</h2>
+  <p id="playback-state">Status: <span id="playing">?</span></p>
+  <button class="start" id="btn-start">Start Playback</button>
+  <button class="stop" id="btn-stop">Stop Playback</button>
+</section>
+<section>
+  <h2>OTA Firmware Update</h2>
+  <form id="ota-form">
+    <label for="ota-file">Select firmware (.bin)</label>
+    <input type="file" id="ota-file" name="firmware" accept=".bin" required>
+    <progress id="ota-progress" value="0" max="100" hidden></progress>
+    <div id="ota-status"></div>
+    <button type="submit">Upload Firmware</button>
+  </form>
+</section>
+<section>
+  <h2>Upload FSEQ / Assets to SD</h2>
+  <form id="sd-form">
+    <label for="sd-file">Select file</label>
+    <input type="file" id="sd-file" name="file" required>
+    <progress id="sd-progress" value="0" max="100" hidden></progress>
+    <div id="sd-status"></div>
+    <button type="submit">Upload to SD</button>
+  </form>
+</section>
+<script>
+async function refreshStatus(){
+  try{const res=await fetch('/status');if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();document.getElementById('playing').textContent=data.playing?'Playing':'Stopped';
+  }catch(err){document.getElementById('playing').textContent='Error'}}
+document.getElementById('btn-start').addEventListener('click',async()=>{await fetch('/start',{method:'POST'});refreshStatus()});
+document.getElementById('btn-stop').addEventListener('click',async()=>{await fetch('/stop',{method:'POST'});refreshStatus()});
+document.getElementById('ota-form').addEventListener('submit',async(e)=>{
+  e.preventDefault();const f=document.getElementById('ota-file');if(!f.files.length)return;
+  const fd=new FormData();fd.append('firmware',f.files[0]);const p=document.getElementById('ota-progress');
+  const s=document.getElementById('ota-status');p.hidden=false;p.value=0;s.textContent='Uploading…';
+  const x=new XMLHttpRequest();x.open('POST','/update');x.upload.onprogress=(ev)=>{if(ev.lengthComputable)p.value=Math.round(100*ev.loaded/ev.total)};
+  x.onload=()=>{s.textContent=x.status===200?'Update uploaded. Device will reboot if successful.':'Upload failed';if(x.status===200)p.value=100};
+  x.onerror=()=>s.textContent='Upload error';x.send(fd)});
+document.getElementById('sd-form').addEventListener('submit',async(e)=>{
+  e.preventDefault();const f=document.getElementById('sd-file');if(!f.files.length)return;
+  const fd=new FormData();fd.append('file',f.files[0]);const p=document.getElementById('sd-progress');
+  const s=document.getElementById('sd-status');p.hidden=false;p.value=0;s.textContent='Uploading…';
+  const x=new XMLHttpRequest();x.open('POST','/upload');x.upload.onprogress=(ev)=>{if(ev.lengthComputable)p.value=Math.round(100*ev.loaded/ev.total)};
+  x.onload=()=>{s.textContent=x.status===200?'File stored to SD.':'Upload failed';if(x.status===200)p.value=100};
+  x.onerror=()=>s.textContent='Upload error';x.send(fd)});
+refreshStatus();setInterval(refreshStatus,3000);
+</script></body></html>
 )rawliteral";
 
 // ====== Brightness (percentage, persisted) ======
@@ -164,18 +115,25 @@ Preferences prefs;
 uint8_t g_brightnessPercent = 25;  // 0–100
 uint8_t g_brightness        = (255 * g_brightnessPercent) / 100;
 
-// ====== FSEQ metadata (from your file) ======
-static const uint32_t chanOffset    = 17408;   // start of frame data
-static const uint32_t channels      = 17284;   // bytes per frame (all channels)
-static const uint32_t frames        = 1200;    // total frames
-static const uint32_t bytesPerFrame = channels;
+// ====== FSEQ constants (your current file layout) ======
+static const uint32_t kChanOffset        = 17408;   // start of frame data
+static const uint32_t kBytesPerFrameFile = 17284;   // bytes per frame in file
+static const uint32_t kFramesTotal       = 1200;    // total frames
 
+// ====== Derived display constants ======
+static const uint32_t kExpectedChannels  = NUM_ARMS * LED_COUNT * 3; // 4 * 144 * 3 = 1728
+static const uint32_t kArmSizeBytes      = LED_COUNT * 3;
+
+// ====== Globals ======
 Adafruit_DotStar* strips[NUM_ARMS] = {nullptr};
 File fseqFile;
 File uploadFile;
 
-bool g_playbackEnabled = true;
-bool g_shouldReboot    = false;
+volatile bool g_playbackEnabled = true;
+bool g_shouldReboot = false;
+
+static uint8_t* gFrame = nullptr; // frame buffer (exactly kExpectedChannels)
+static TaskHandle_t sPixelTask = nullptr;
 
 // ---------------- util ----------------
 static inline bool cardPresent() {
@@ -201,6 +159,91 @@ static bool mountSdmmc() {
   return false;
 }
 
+static void dumpHeap(const char* tag) {
+  size_t free_int8   = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t large_int8  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t large_spiram= heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  size_t free_8      = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+
+  Serial.printf("[mem] %s: int8 free=%u largest=%u | spiram free=%u largest=%u | total8=%u\n",
+    tag, (unsigned)free_int8, (unsigned)large_int8,
+    (unsigned)free_spiram, (unsigned)large_spiram,
+    (unsigned)free_8);
+}
+
+static void earlyAlloc() {
+  gFrame = (uint8_t*)heap_caps_malloc(kExpectedChannels, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!gFrame) halt("[mem] earlyAlloc failed (gFrame)");
+}
+
+// ---------------- pixel task ----------------
+static void pixelLoop(void*) {
+  TickType_t lastWake = xTaskGetTickCount();
+  uint32_t frameIndex = 0;
+
+  for (;;) {
+    if (!g_playbackEnabled) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+
+    // Bounds-safe read from FSEQ
+    const uint32_t bpf    = kBytesPerFrameFile;
+    const size_t   toRead = (bpf < kExpectedChannels) ? bpf : kExpectedChannels;
+    const size_t   toSkip = (bpf > kExpectedChannels) ? (bpf - kExpectedChannels) : 0;
+
+    const uint32_t offset = kChanOffset + frameIndex * bpf;
+    if (!fseqFile.seek(offset, fs::SeekSet)) {
+      frameIndex = 0;
+      continue;
+    }
+
+    // Read what we can display, skip the rest
+    size_t n = fseqFile.read(gFrame, toRead);
+    if (n != toRead) {
+      frameIndex = 0;
+      continue;
+    }
+    if (toSkip) {
+      fseqFile.seek(fseqFile.position() + toSkip, fs::SeekSet);
+    }
+
+    // Determine total arms implied by the file's frame size
+    const uint32_t totalArms = (bpf / kArmSizeBytes); // e.g., 40 for your 17284 BPF
+    if (totalArms == 0) { vTaskDelay(pdMS_TO_TICKS(STEP_MS)); continue; }
+
+    // Choose four static spokes 0/90/180/270
+    const uint32_t quarter = totalArms / 4;
+    const uint32_t srcIdx[NUM_ARMS] = {
+      0,
+      (quarter) % totalArms,
+      (2*quarter) % totalArms,
+      (3*quarter) % totalArms
+    };
+
+    // Copy slices into each physical arm and show
+    for (int a = 0; a < NUM_ARMS; ++a) {
+      const uint32_t armOff = srcIdx[a] * kArmSizeBytes;
+      if (armOff + kArmSizeBytes > toRead) continue; // guard
+
+      for (uint32_t i = 0; i < LED_COUNT; ++i) {
+        const uint32_t p = armOff + i * 3;
+        const uint8_t r = gFrame[p + 0];
+        const uint8_t g = gFrame[p + 1];
+        const uint8_t b = gFrame[p + 2];
+        strips[a]->setPixelColor(i, r, g, b);
+      }
+    }
+    for (int a = 0; a < NUM_ARMS; ++a) { strips[a]->show(); }
+
+    frameIndex++;
+    if (frameIndex >= kFramesTotal) {
+      frameIndex = 0;
+      Serial.println("[FSEQ] Looping back to frame 0");
+    }
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(STEP_MS));
+  }
+}
+
 // ---------------- setup ----------------
 void setup() {
   Serial.begin(115200);
@@ -212,6 +255,10 @@ void setup() {
   g_brightnessPercent = prefs.getUChar("brightness", 25);
   g_brightness        = (255 * g_brightnessPercent) / 100;
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
+
+  // Pre-allocate critical buffers BEFORE Wi-Fi/AP/OTA to avoid fragmentation
+  earlyAlloc();
+  dumpHeap("after earlyAlloc");
 
   if (!cardPresent()) {
     Serial.printf("[SD_MMC] Card-detect HIGH on GPIO%d (no card)\n", PIN_SD_CD);
@@ -228,12 +275,12 @@ void setup() {
   if (!fseqFile) halt("[SD_MMC] Cannot open /test2.fseq");
 
   const uint64_t fileSize = fseqFile.size();
-  const uint64_t payload  = (fileSize > chanOffset) ? (fileSize - chanOffset) : 0ULL;
+  const uint64_t payload  = (fileSize > kChanOffset) ? (fileSize - kChanOffset) : 0ULL;
   Serial.printf("[FSEQ] size=%llu  payload=%llu  bytesPerFrame=%lu  frames=%lu\n",
                 (unsigned long long)fileSize, (unsigned long long)payload,
-                (unsigned long)bytesPerFrame, (unsigned long)frames);
+                (unsigned long)kBytesPerFrameFile, (unsigned long)kFramesTotal);
 
-  // Create and init 4 DotStar strips
+  // Create and init DotStar strips
   for (int a = 0; a < NUM_ARMS; ++a) {
     strips[a] = new Adafruit_DotStar(LED_COUNT, ARM_DATA[a], ARM_CLK[a], DOTSTAR_BGR);
     strips[a]->begin();
@@ -243,13 +290,16 @@ void setup() {
   Serial.println("[LED] 4 arms ready");
   Serial.println("Type 'Bxx' (e.g. B25) to set brightness percent (0–100).");
 
-  // Start Wi-Fi access point for OTA + control panel
+  // Bring up AP for OTA + control panel (keep heap healthy)
+  WiFi.persistent(false);
+  WiFi.setSleep(true);
   WiFi.mode(WIFI_AP);
   if (WiFi.softAP(OTA_AP_SSID, OTA_AP_PASS)) {
     Serial.printf("[WIFI] AP '%s' started. IP: %s\n", OTA_AP_SSID, WiFi.softAPIP().toString().c_str());
   } else {
     Serial.println("[WIFI] Failed to start AP");
   }
+  dumpHeap("after AP");
 
   // HTTP routes
   server.on("/", HTTP_GET, []() {
@@ -271,25 +321,24 @@ void setup() {
     server.send(200, "application/json", "{\"playing\":false}");
   });
 
+  // SD upload: pause playback while writing
   server.on("/upload", HTTP_POST, []() {
     if (uploadFile) {
       uploadFile.close();
       uploadFile = File();
     }
+    g_playbackEnabled = true; // resume after upload completes
     server.send(200, "text/plain", "Upload complete");
   }, []() {
     HTTPUpload &upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
+      g_playbackEnabled = false; // pause playback during write
       String path = "/" + upload.filename;
       Serial.printf("[HTTP] Upload start: %s (%u bytes expected)\n", path.c_str(), upload.totalSize);
-      if (SD_MMC.exists(path)) {
-        SD_MMC.remove(path);
-      }
+      if (SD_MMC.exists(path)) SD_MMC.remove(path);
       uploadFile = SD_MMC.open(path, FILE_WRITE);
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (uploadFile) {
-        uploadFile.write(upload.buf, upload.currentSize);
-      }
+      if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
     } else if (upload.status == UPLOAD_FILE_END) {
       if (uploadFile) {
         uploadFile.close();
@@ -297,26 +346,23 @@ void setup() {
         Serial.printf("[HTTP] Upload complete: %s (%u bytes)\n", upload.filename.c_str(), upload.totalSize);
       }
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
-      if (uploadFile) {
-        uploadFile.close();
-        uploadFile = File();
-      }
+      if (uploadFile) { uploadFile.close(); uploadFile = File(); }
       SD_MMC.remove(String("/") + upload.filename);
       Serial.println("[HTTP] Upload aborted");
+      g_playbackEnabled = true; // allow playback again
     }
   });
 
+  // OTA: pause playback during update
   server.on("/update", HTTP_POST, []() {
     bool ok = !Update.hasError();
     server.send(ok ? 200 : 500, "text/plain", ok ? "Update successful" : "Update failed");
-    if (ok) {
-      g_shouldReboot = true;
-    }
+    if (ok) g_shouldReboot = true;
   }, []() {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
       Serial.printf("[OTA] Update start: %s\n", upload.filename.c_str());
-      g_playbackEnabled = false;
+      g_playbackEnabled = false; // pause rendering
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
         Update.printError(Serial);
       }
@@ -333,11 +379,16 @@ void setup() {
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
       Update.end();
       Serial.println("[OTA] Update aborted");
+      g_playbackEnabled = true; // resume
     }
   });
 
   server.begin();
   Serial.println("[HTTP] Web server started on 192.168.4.1");
+
+  // Start pixel task on core 1 with ample stack
+  const uint32_t STACK = 12288; // 12 KB
+  xTaskCreatePinnedToCore(pixelLoop, "pixel", STACK, nullptr, 3, &sPixelTask, 1);
 }
 
 // ---------------- main loop ----------------
@@ -347,14 +398,6 @@ void loop() {
   if (g_shouldReboot) {
     delay(1000);
     ESP.restart();
-  }
-
-  static uint32_t frameIndex = 0;
-  static uint32_t last = 0;
-
-  if (!g_playbackEnabled) {
-    delay(5);
-    return;
   }
 
   // Serial brightness command (e.g. B10 for 10%)
@@ -374,52 +417,6 @@ void loop() {
     }
   }
 
-  // Timing @ 40fps
-  if (millis() - last < STEP_MS) return;
-  last = millis();
-  if (frameIndex >= frames) {
-    frameIndex = 0;
-    Serial.println("[FSEQ] Looping back to frame 0");
-  }
-
-  // Read one full frame
-  const uint32_t offset = chanOffset + frameIndex * bytesPerFrame;
-  if (!fseqFile.seek(offset, fs::SeekSet)) { frameIndex = 0; return; }
-
-  static uint8_t frameBuf[channels];
-  const size_t n = fseqFile.read(frameBuf, bytesPerFrame);
-  if (n != bytesPerFrame) { frameIndex = 0; return; }
-
-  // Determine arms per revolution in the file
-  const uint32_t armSize   = LED_COUNT * 3;                   // bytes per logical arm
-  const uint32_t totalArms = bytesPerFrame / armSize;         // e.g. 40
-  if (totalArms == 0) return;
-
-  // Choose four static source spokes 90° apart:
-  // 0°, 90°, 180°, 270°  => arm indices {0, totalArms/4, totalArms/2, 3*totalArms/4}
-  const uint32_t quarter = totalArms / 4;                     // integer divide
-  const uint32_t srcIdx[NUM_ARMS] = {
-    0,
-    (quarter) % totalArms,
-    (2*quarter) % totalArms,
-    (3*quarter) % totalArms
-  };
-
-  // For each physical arm, copy that arm’s slice to its strip
-  for (int a = 0; a < NUM_ARMS; ++a) {
-    const uint32_t armOff = srcIdx[a] * armSize;
-    if (armOff + armSize > bytesPerFrame) continue;           // guard
-
-    for (uint32_t i = 0; i < LED_COUNT; ++i) {
-      const uint32_t p = armOff + i*3;
-      const uint8_t r = frameBuf[p + 0];
-      const uint8_t g = frameBuf[p + 1];
-      const uint8_t b = frameBuf[p + 2];
-      strips[a]->setPixelColor(i, r, g, b);
-    }
-  }
-  // Latch all arms together
-  for (int a = 0; a < NUM_ARMS; ++a) { strips[a]->show(); }
-
-  frameIndex++;
+  // Keep loop light; pixel rendering runs in pixelLoop task.
+  delay(1);
 }
