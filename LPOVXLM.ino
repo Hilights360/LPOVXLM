@@ -51,8 +51,8 @@ uint32_t g_framePeriodMs     = 25;
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
 uint16_t g_spokesTotal   = 40;   // total spokes in spinner
-uint16_t g_pitchSpokes   = 10;   // arm-to-arm spoke pitch: 1,10,20,30… when pitch=10
-int16_t  g_arm1LedOffset = 0;    // LED offset ONLY for Arm 1
+uint16_t g_modelArms     = NUM_ARMS;   // logical arm count (<= NUM_ARMS)
+uint16_t g_pixelsPerArm  = LED_COUNT;  // logical LED count per arm
 
 enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;  // default SPOKE
@@ -104,7 +104,6 @@ bool         g_compPerFrame= false;       // per-frame zlib (supported)
 
 /* -------------------- Small helpers -------------------- */
 static inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
-static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
 
 static bool isFseqName(const String& n) {
   int dot = n.lastIndexOf('.');
@@ -379,38 +378,39 @@ static bool renderFrame(uint32_t idx){
     (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (LED_COUNT * 3u);
 
 
+  const uint16_t armsActive = (uint16_t)clampU32(g_modelArms ? g_modelArms : 1, 1, (uint32_t)NUM_ARMS);
+  const uint16_t pixelsActive = (uint16_t)clampU32(g_pixelsPerArm ? g_pixelsPerArm : LED_COUNT, 1, (uint32_t)LED_COUNT);
+  const uint32_t startBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
+  const uint32_t indexOffset = (g_spokesTotal > 0) ? (idx % g_spokesTotal) : 0;
+
   for (int arm=0; arm<NUM_ARMS; ++arm){
-    // Arm 1 is index 0. Apply Arm-1-only LED offset.
-    int32_t ledOffset = (arm==0) ? g_arm1LedOffset : 0;
-    ledOffset = clampI32(ledOffset, 0, (int32_t)LED_COUNT);
+    Adafruit_DotStar* strip = strips[arm];
+    if (!strip) continue;
 
-    // Arm1 is spoke 1 → offset 0 spokes.
-    // Arm2 -> 10 => (10-1)=9 spokes, Arm3 -> 20 => 19, Arm4 -> 30 => 29.
-    uint32_t armSpoke0 = (arm == 0) ? 0u : ((uint32_t)arm * (uint32_t)g_pitchSpokes - 1u);
-    // If you want to be extra safe against weird inputs, you can modulo:
-    // if (spokes) armSpoke0 %= spokes;
+    if (arm >= (int)armsActive) {
+      for (uint32_t i=0;i<LED_COUNT;++i) strip->setPixelColor(i,0,0,0);
+      continue;
+    }
 
-    // Base channel (R) at the start of the selected spoke for this arm.
-    const uint32_t baseChAbsR =
-        (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0) + armSpoke0 * chPerSpoke;
+    const uint32_t baseSpoke =
+      (g_spokesTotal > 0) ? (((uint32_t)arm * (uint32_t)g_spokesTotal) / armsActive) : 0u;
+    const uint32_t spokeIndex =
+      (g_spokesTotal > 0) ? ((baseSpoke + indexOffset) % g_spokesTotal) : 0u;
+    const uint32_t baseChAbsR = startBase + spokeIndex * chPerSpoke;
 
     for (uint32_t i=0; i<LED_COUNT; ++i){
-      // ONLY Arm 1 uses the LED offset; others stay exactly on spokes 10/20/30.
-      int32_t logicalI = (int32_t)i + ledOffset;
-      if (logicalI < 0 || logicalI >= (int32_t)LED_COUNT) {
-        strips[arm]->setPixelColor(i,0,0,0); continue;
-      }
+      if (i >= pixelsActive) { strip->setPixelColor(i,0,0,0); continue; }
 
-      const uint32_t absR = baseChAbsR + (uint32_t)logicalI * blockStride;
+      const uint32_t absR = baseChAbsR + i * blockStride;
       const int64_t  idxR = sparseTranslate(absR);
       if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
-        strips[arm]->setPixelColor(i,0,0,0); continue;
+        strip->setPixelColor(i,0,0,0); continue;
       }
       uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
-      strips[arm]->setPixelColor(i, R,G,B);
+      strip->setPixelColor(i, R,G,B);
     }
   }
-  for (int a=0;a<NUM_ARMS;++a) strips[a]->show();
+  for (int a=0;a<NUM_ARMS;++a) if (strips[a]) strips[a]->show();
   return true;
 }
 
@@ -683,8 +683,8 @@ static void handleStatus(){
     +",\"fps\":"+String(g_fps)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
-    +",\"pitch\":"+String(g_pitchSpokes)
-    +",\"arm1off\":"+String(g_arm1LedOffset)
+    +",\"arms\":"+String(g_modelArms)
+    +",\"pixels\":"+String(g_pixelsPerArm)
     +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
     +"}";
   server.send(200,"application/json",json);
@@ -738,9 +738,9 @@ static void handleRoot() {
       "<h3>Spinner Layout</h3>"
       "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
         "<div><label>Start Channel (Arm 1)</label><input id='startch' type='number' min='1' value='" + String(g_startChArm1) + "'></div>"
-        "<div><label>Total Spokes</label><input id='spokes' type='number' min='4' value='" + String(g_spokesTotal) + "'></div>"
-        "<div><label>Pitch (spokes arm→arm)</label><input id='pitch' type='number' min='1' value='" + String(g_pitchSpokes) + "'></div>"
-        "<div><label>Arm 1 LED Offset</label><input id='arm1off' type='number' min='0' max='" + String(LED_COUNT) + "' value='" + String(g_arm1LedOffset) + "'></div>"
+        "<div><label>Total Spokes</label><input id='spokes' type='number' min='1' value='" + String(g_spokesTotal) + "'></div>"
+        "<div><label>Arms</label><input id='arms' type='number' min='1' max='" + String(NUM_ARMS) + "' value='" + String(g_modelArms) + "'></div>"
+        "<div><label>Pixels per Arm</label><input id='pixels' type='number' min='1' max='" + String(LED_COUNT) + "' value='" + String(g_pixelsPerArm) + "'></div>"
         "<div><label>Stride</label><select id='stride'><option value='spoke' "+String(g_strideMode==STRIDE_SPOKE?"selected":"")+">SPOKE</option><option value='led' "+String(g_strideMode==STRIDE_LED?"selected":"")+">LED</option></select></div>"
         "<div style='align-self:end'><button id='applymap'>Apply Layout</button></div>"
       "</div>"
@@ -797,11 +797,11 @@ static void handleRoot() {
     "document.getElementById('refresh').onclick=()=>location.reload();"
     "document.getElementById('applymap').onclick=()=>{"
       "const sc=+document.getElementById('startch').value||1;"
-      "const sp=+document.getElementById('spokes').value||40;"
-      "const pt=+document.getElementById('pitch').value||10;"
-      "const of=+document.getElementById('arm1off').value||0;"
+      "const sp=+document.getElementById('spokes').value||1;"
+      "const ar=+document.getElementById('arms').value||1;"
+      "const px=+document.getElementById('pixels').value||1;"
       "const st=(document.getElementById('stride').value)||'spoke';"
-      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&pitch='+pt+'&arm1off='+of+'&stride='+st,{method:'POST'})"
+      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
     "};"
     "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
@@ -858,20 +858,20 @@ static void handleSpeed() {
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
-// POST /mapcfg?start=1&spokes=40&pitch=10&arm1off=0&stride=spoke|led
+// POST /mapcfg?start=1&spokes=40&arms=4&pixels=144&stride=spoke|led
 static void handleMapCfg(){
   if (server.hasArg("start"))  { uint32_t v=strtoul(server.arg("start").c_str(),nullptr,10); g_startChArm1=(v<1)?1:v; prefs.putULong("startch", g_startChArm1); }
-  if (server.hasArg("spokes")) { int v=server.arg("spokes").toInt(); if (v<4) v=4; g_spokesTotal=(uint16_t)v; prefs.putUShort("spokes", g_spokesTotal); }
-  if (server.hasArg("pitch"))  { int v=server.arg("pitch").toInt(); if (v<1) v=1; g_pitchSpokes=(uint16_t)v; prefs.putUShort("pitch", g_pitchSpokes); }
-  if (server.hasArg("arm1off")){ g_arm1LedOffset = server.arg("arm1off").toInt(); g_arm1LedOffset = clampI32(g_arm1LedOffset,0,(int32_t)LED_COUNT); prefs.putShort("arm1off", g_arm1LedOffset); }
+  if (server.hasArg("spokes")) { int v=server.arg("spokes").toInt(); if (v<1) v=1; g_spokesTotal=(uint16_t)v; prefs.putUShort("spokes", g_spokesTotal); }
+  if (server.hasArg("arms"))   { int v=server.arg("arms").toInt(); if (v<1) v=1; if (v>NUM_ARMS) v=NUM_ARMS; g_modelArms=(uint16_t)v; prefs.putUShort("arms", g_modelArms); }
+  if (server.hasArg("pixels")) { int v=server.arg("pixels").toInt(); if (v<1) v=1; if (v>LED_COUNT) v=LED_COUNT; g_pixelsPerArm=(uint16_t)v; prefs.putUShort("pixels", g_pixelsPerArm); }
   if (server.hasArg("stride")) {
     String s = server.arg("stride"); s.toLowerCase();
     g_strideMode = (s=="led") ? STRIDE_LED : STRIDE_SPOKE;
     prefs.putUChar("stride", (uint8_t)g_strideMode);
   }
   server.send(200,"application/json",
-    String("{\"start\":")+g_startChArm1+",\"spokes\":"+g_spokesTotal+",\"pitch\":"+g_pitchSpokes+
-    ",\"arm1off\":"+g_arm1LedOffset+",\"stride\":\""+(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"}");
+    String("{\"start\":")+g_startChArm1+",\"spokes\":"+g_spokesTotal+",\"arms\":"+g_modelArms+
+    ",\"pixels\":"+g_pixelsPerArm+",\"stride\":\""+(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"}");
 }
 
 // Diagnostics
@@ -967,15 +967,20 @@ void setup(){
 
   g_startChArm1       = prefs.getULong("startch", 1);
   g_spokesTotal       = prefs.getUShort("spokes", 40);
-  g_pitchSpokes       = prefs.getUShort("pitch", 10);
-  g_arm1LedOffset     = prefs.getShort("arm1off", 0);
+  if (!g_spokesTotal) g_spokesTotal = 1;
+  g_modelArms         = prefs.getUShort("arms", NUM_ARMS);
+  if (!g_modelArms) g_modelArms = 1;
+  if (g_modelArms > NUM_ARMS) g_modelArms = NUM_ARMS;
+  g_pixelsPerArm      = prefs.getUShort("pixels", LED_COUNT);
+  if (!g_pixelsPerArm) g_pixelsPerArm = 1;
+  if (g_pixelsPerArm > LED_COUNT) g_pixelsPerArm = LED_COUNT;
   g_strideMode        = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
 
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
-  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u pitch=%u arm1off=%d stride=%s\n",
-                (unsigned long)g_startChArm1, g_spokesTotal, g_pitchSpokes,
-                (int)g_arm1LedOffset, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
+  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u stride=%s\n",
+                (unsigned long)g_startChArm1, g_spokesTotal, g_modelArms, g_pixelsPerArm,
+                (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
 
   startWifiAP();
 
