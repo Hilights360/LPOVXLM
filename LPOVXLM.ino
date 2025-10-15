@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "spinner_types.h"
+#include "web_pages.h"
+#include "web_utils.h"
+
 /* -------------------- Optional zlib backends (auto-detect) -------------------- */
 #if defined(__has_include)
   #if __has_include(<miniz.h>)
@@ -55,7 +59,6 @@ uint16_t g_spokesTotal   = 40;   // total spokes in spinner
 uint8_t  g_armCount      = MAX_ARMS;
 uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
 
-enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;  // default SPOKE
 
 // Rotary index (0..spokes-1)
@@ -121,47 +124,15 @@ static bool isFseqName(const String& n) {
   return ext == "fseq";
 }
 
-static String htmlEscape(const String& in) {
-  String s; s.reserve(in.length()+8);
-  for (size_t i=0;i<in.length();++i){
-    char c=in[i];
-    if(c=='&') s+="&amp;";
-    else if(c=='<') s+="&lt;";
-    else if(c=='>') s+="&gt;";
-    else if(c=='\"') s+="&quot;";
-    else if(c=='\'') s+="&#39;";
-    else s+=c;
-  }
-  return s;
-}
-static String urlEncode(const String& in){
-  const char* hex="0123456789ABCDEF";
-  String s; s.reserve(in.length()*3);
-  for (size_t i=0;i<in.length();++i){
-    uint8_t c=(uint8_t)in[i];
-    if( (c>='A'&&c<='Z') || (c>='a'&&c<='z') || (c>='0'&&c<='9') || c=='-'||c=='_'||c=='.'||c=='/' ){
-      s+=(char)c;
-    } else {
-      s+='%'; s+=hex[c>>4]; s+=hex[c&0xF];
-    }
-  }
-  return s;
-}
-static String dirnameOf(const String& path){
-  if(path=="/") return "/";
-  int slash = path.lastIndexOf('/');
-  if (slash<=0) return "/";
-  return path.substring(0, slash);
-}
-static String joinPath(const String& dir, const String& name){
-  String d = dir;
-  if (!d.length() || d[0] != '/') d = "/" + d;
-  if (d != "/" && d.endsWith("/")) d.remove(d.length()-1);
-  String base = name;
-  int slash = base.lastIndexOf('/');
-  if (slash >= 0) base = base.substring(slash+1); // strip any directories
-  return (d == "/") ? ("/" + base) : (d + "/" + base);
-}
+using WebPages::buildControlPage;
+using WebPages::buildDirectoryRow;
+using WebPages::buildFileRow;
+using WebPages::buildFilesPage;
+using WebPages::buildUploadFailedPage;
+using WebPages::buildUploadRejectedPage;
+using WebPages::buildUploadSuccessPage;
+using WebPages::ControlPageData;
+using WebPages::FilesPageData;
 
 /* -------------------- SD helpers -------------------- */
 static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
@@ -463,71 +434,23 @@ static void handleFiles() {
     return;
   }
 
-  String parent = dirnameOf(path);
-  String html =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Files - " + htmlEscape(path) + "</title>"
-    "<style>"
-    "body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
-    ".card{max-width:860px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}"
-    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
-    "table{width:100%;border-collapse:collapse;margin-top:.5rem}"
-    "th,td{padding:.5rem;border-bottom:1px solid #1b2741}"
-    ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}"
-    "button{padding:.4rem .7rem;border:0;border-radius:8px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
-    "button:hover{filter:brightness(1.1)}"
-    "input{padding:.45rem .5rem;border-radius:8px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
-    "</style></head><body><div class='card'>"
-    "<div style='display:flex;justify-content:space-between;align-items:center'>"
-      "<h2 style='margin:0'>Files</h2>"
-      "<a href='/'>Back to Control</a>"
-    "</div>"
-    "<p>Path: <b>" + htmlEscape(path) + "</b> &middot; "
-    "<a href='/files?path=" + urlEncode(parent) + "'>Up</a></p>"
+  const String parent = dirnameOf(path);
+  const String pathEncoded = urlEncode(path);
+  const String parentEncoded = urlEncode(parent);
+  const String uploadBackEncoded = urlEncode(String("/files?path=") + path);
 
-    // upload to this folder
-    "<form method='POST' action='/upload?dir=" + urlEncode(path) + "&back=" + urlEncode(String("/files?path=") + path) + "' enctype='multipart/form-data'>"
-      "<input type='file' name='f' accept='.fseq' required> "
-      "<button type='submit'>Upload here</button>"
-      "<div class='muted' style='margin-top:.25rem'>Only <b>.fseq</b> files are accepted.</div>"
-    "</form>"
-
-    "<div class='row' style='margin-top:.75rem'>"
-      "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + urlEncode(path) + "&name='+encodeURIComponent(n);\">New Folder</button>"
-      "<button onclick=\"location.reload()\">Refresh</button>"
-    "</div>"
-    "<table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody>";
-
+  String rows;
   File ent;
   while ((ent = dir.openNextFile())) {
-    String name = ent.name();
-    String esc = htmlEscape(name);
-    String enc = urlEncode(name);
-    if (ent.isDirectory()) {
-      html += "<tr><td>📁 <a href='/files?path=" + enc + "'>" + esc + "</a></td>"
-              "<td>—</td>"
-              "<td>"
-                "<a href='#' onclick=\"if(confirm('Delete folder " + esc + "? (must be empty)')) location='/rm?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'; return false;\">🗑️ Delete</a> &nbsp; "
-                "<a href='#' onclick=\"const n=prompt('Rename folder to:', '" + htmlEscape(String(ent.name()).substring(String(ent.name()).lastIndexOf('/')+1)) + "'); if(n) location='/ren?path=" + enc + "&to='+encodeURIComponent(n)+'&back=/files?path=" + urlEncode(path) + "'; return false;\">✏️ Rename</a>"
-              "</td></tr>";
-    } else {
-      uint64_t sz = ent.size();
-      html += "<tr><td>📄 " + esc + "</td>"
-              "<td>" + String((unsigned long)sz) + "</td>"
-              "<td>"
-                "<a href='/dl?path=" + enc + "'>⬇️ Download</a> &nbsp; "
-                "<a href='/play?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'>▶️ Play</a> &nbsp; "
-                "<a href='#' onclick=\"if(confirm('Delete " + esc + "?')) location='/rm?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'; return false;\">🗑️ Delete</a> &nbsp; "
-                "<a href='#' onclick=\"const n=prompt('Rename file to:', '" + htmlEscape(String(ent.name()).substring(String(ent.name()).lastIndexOf('/')+1)) + "'); if(n) location='/ren?path=" + enc + "&to='+encodeURIComponent(n)+'&back=/files?path=" + urlEncode(path) + "'; return false;\">✏️ Rename</a>"
-              "</td></tr>";
-    }
+    const String name = ent.name();
+    if (ent.isDirectory()) rows += buildDirectoryRow(name, pathEncoded);
+    else rows += buildFileRow(name, ent.size(), pathEncoded);
     ent.close();
   }
   dir.close();
 
-  html += "</tbody></table></div></body></html>";
-  server.send(200, "text/html; charset=utf-8", html);
+  FilesPageData pageData{path, parent, pathEncoded, parentEncoded, uploadBackEncoded, rows};
+  server.send(200, "text/html; charset=utf-8", buildFilesPage(pageData));
 }
 
 static void handleDownload() {
@@ -647,21 +570,16 @@ static void handleUploadData() {
 static void handleUploadDone() {
   String back = server.hasArg("back") ? server.arg("back") : "/";
   if (!isFseqName(g_uploadFilename)) {
-    server.send(415, "text/html",
-      "<meta http-equiv='refresh' content='2;url=" + back + "'>"
-      "<body style='font-family:system-ui'><p>Upload rejected. Only <b>.fseq</b> files are allowed.</p><p>Returning…</p></body>");
+    server.send(415, "text/html", buildUploadRejectedPage(back));
     return;
   }
   if (!SD_MMC.exists(g_uploadFilename)) {
-    server.send(500, "text/html",
-      "<meta http-equiv='refresh' content='3;url=" + back + "'>"
-      "<body style='font-family:system-ui'><p>Upload failed.</p><p>Returning…</p></body>");
+    server.send(500, "text/html", buildUploadFailedPage(back));
     return;
   }
-  server.send(200, "text/html",
-    "<meta http-equiv='refresh' content='1;url=" + back + "'>"
-    "<body style='font-family:system-ui'><p>Uploaded <b>" + htmlEscape(g_uploadFilename) + "</b> (" + String(g_uploadBytes) + " bytes).</p><p>Refreshing…</p></body>");
+  server.send(200, "text/html", buildUploadSuccessPage(g_uploadFilename, g_uploadBytes, back));
 }
+
 
 /* -------------------- Web: Control page & API -------------------- */
 static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth = 0) {
@@ -715,127 +633,23 @@ static void handleStatus(){
 
 static void handleRoot() {
   String options; listFseqInDir("/", options);
-  String cur = g_currentPath.length() ? g_currentPath : "(none)";
-
-  String html =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>POV Spinner</title>"
-    "<style>"
-    "body{font:16px system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
-    ".card{max-width:960px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px;box-shadow:0 1px 8px rgba(0,0,0,.2)}"
-    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
-    "label{display:block;margin:.5rem 0 .2rem}select,input[type=range],input[type=number]{width:100%}"
-    ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}"
-    "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
-    "button:hover{filter:brightness(1.1)}"
-    "input[type=file],input[type=number]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
-    ".muted{opacity:.75}"
-    ".pill{display:inline-block;padding:.2rem .6rem;border-radius:999px;background:#0e1627;margin-left:.5rem}"
-    ".sep{height:1px;background:#1b2741;margin:1rem 0}"
-    ".badge{display:inline-block;margin-left:.5rem;padding:.15rem .55rem;border-radius:999px;font-size:.85rem}"
-    ".badge.play{background:#0e2a19;color:#9af0b7}"
-    ".badge.pause{background:#2a1f0e;color:#f0d49a}"
-    ".badge.stop{background:#2a0e12;color:#f09aa6}"
-    "</style></head><body>"
-    "<div class='card'>"
-      "<div style='display:flex;justify-content:space-between;align-items:center'>"
-        "<h1 style='display:flex;align-items:center;gap:.4rem;margin:0'>"
-          "POV Spinner"
-          "<span id='status' class='" + String(statusClass()) + "'>" + String(statusText()) + "</span>"
-          "<span id='which' class='pill'>" + cur + "</span>"
-        "</h1>"
-        "<a href='/files?path=/'>Files</a>"
-      "</div>"
-      "<p class='muted'>AP SSID: <b>POV-Spinner</b> &middot; IP: <b>192.168.4.1</b> &middot; mDNS: <b>pov.local</b></p>"
-
-      "<label>Choose .fseq file</label>"
-      "<select id='sel'>" + options + "</select>"
-      "<div class='row'>"
-        "<button id='start'>Start</button>"
-        "<button id='stop'>Stop</button>"
-        "<button id='refresh'>Refresh</button>"
-      "</div>"
-
-      "<div class='sep'></div>"
-      "<h3>Spinner Layout</h3>"
-      "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
-        "<div><label>Start Channel (Arm 1)</label><input id='startch' type='number' min='1' value='" + String(g_startChArm1) + "'></div>"
-        "<div><label>Total Spokes</label><input id='spokes' type='number' min='1' value='" + String(g_spokesTotal) + "'></div>"
-        "<div><label>Arm Count</label><input id='arms' type='number' min='1' max='" + String((int)MAX_ARMS) + "' value='" + String(g_armCount) + "'></div>"
-        "<div><label>Pixels per Arm</label><input id='pixels' type='number' min='1' max='" + String((int)MAX_PIXELS_PER_ARM) + "' value='" + String(g_pixelsPerArm) + "'></div>"
-        "<div><label>Stride</label><select id='stride'><option value='spoke' "+String(g_strideMode==STRIDE_SPOKE?"selected":"")+">SPOKE</option><option value='led' "+String(g_strideMode==STRIDE_LED?"selected":"")+">LED</option></select></div>"
-        "<div style='align-self:end'><button id='applymap'>Apply Layout</button></div>"
-      "</div>"
-
-      "<div class='sep'></div>"
-      "<h3>Upload a new .fseq to SD (root)</h3>"
-      "<form id='u' method='POST' action='/upload' enctype='multipart/form-data'>"
-        "<input type='file' name='f' accept='.fseq' required>"
-        "<div class='row'><button type='submit'>Upload to /</button></div>"
-        "<p class='muted'>Uploads here go to the SD card root. Use the Files page to upload into a specific folder.</p>"
-      "</form>"
-
-      "<div class='sep'></div>"
-      "<h3>Playback Speed</h3>"
-      "<label>FPS: <span id='fpsv'>" + String(g_fps) + "</span></label>"
-      "<input id='fps' type='range' min='1' max='120' value='" + String(g_fps) + "'>"
-      "<div class='row'><button id='applyfps'>Apply</button><button id='fps10'>10 FPS</button><button id='fps40'>40 FPS</button><button id='fps60'>60 FPS</button></div>"
-
-      "<div class='sep'></div>"
-      "<h3>Brightness</h3>"
-      "<label>Value: <span id='v'>" + String(g_brightnessPercent) + "%</span></label>"
-      "<input id='rng' type='range' min='0' max='100' value='" + String(g_brightnessPercent) + "'>"
-      "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
-
-      "<div class='sep'></div>"
-      "<h3>Diagnostics</h3>"
-      "<div class='row'>"
-        "<button id='hdr'>FSEQ Header</button>"
-        "<button id='cblocks'>Compression Blocks</button>"
-        "<button id='sdre'>SD Reinit</button>"
-        "<button id='stat'>Status JSON</button>"
-      "</div>"
-
-      "<div class='sep'></div>"
-      "<p class='muted'>If no file is started within 5 minutes after boot, <b>/test2.fseq</b> will auto-play.</p>"
-    "</div>"
-
-    "<script>"
-    "const fps=document.getElementById('fps'), fpsv=document.getElementById('fpsv');"
-    "fps.oninput=()=>fpsv.textContent=fps.value;"
-    "const r=document.getElementById('rng'),v=document.getElementById('v');"
-    "r.oninput=()=>v.textContent=r.value+'%';"
-    "function post(u){fetch(u,{method:'POST'}).then(()=>location.reload());}"
-    "document.getElementById('applyfps').onclick=()=>post('/speed?fps='+fps.value);"
-    "document.getElementById('fps10').onclick=()=>post('/speed?fps=10');"
-    "document.getElementById('fps40').onclick=()=>post('/speed?fps=40');"
-    "document.getElementById('fps60').onclick=()=>post('/speed?fps=60');"
-    "document.getElementById('set').onclick=()=>post('/b?value='+r.value);"
-    "document.getElementById('low').onclick=()=>post('/b?value=10');"
-    "document.getElementById('med').onclick=()=>post('/b?value=40');"
-    "document.getElementById('hi').onclick=()=>post('/b?value=100');"
-    "document.getElementById('start').onclick=()=>{const p=document.getElementById('sel').value;fetch('/start?path='+encodeURIComponent(p)).then(()=>location.reload());};"
-    "document.getElementById('stop').onclick =()=>post('/stop');"
-    "document.getElementById('refresh').onclick=()=>location.reload();"
-    "document.getElementById('applymap').onclick=()=>{"
-      "const sc=+document.getElementById('startch').value||1;"
-      "const sp=+document.getElementById('spokes').value||40;"
-      "const ar=+document.getElementById('arms').value||1;"
-      "const px=+document.getElementById('pixels').value||1;"
-      "const st=(document.getElementById('stride').value)||'spoke';"
-      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
-      ".then(()=>location.reload());"
-    "};"
-    "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
-    "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
-    "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
-    "document.getElementById('stat').onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
-    "</script>"
-    "</body></html>";
-
-  server.send(200, "text/html; charset=utf-8", html);
+  ControlPageData data;
+  data.optionsHtml = options;
+  data.currentPath = g_currentPath;
+  data.statusClass = statusClass();
+  data.statusText = statusText();
+  data.startChannel = g_startChArm1;
+  data.totalSpokes = g_spokesTotal;
+  data.armCount = g_armCount;
+  data.maxArms = MAX_ARMS;
+  data.pixelsPerArm = g_pixelsPerArm;
+  data.maxPixelsPerArm = MAX_PIXELS_PER_ARM;
+  data.strideMode = g_strideMode;
+  data.fps = g_fps;
+  data.brightnessPercent = g_brightnessPercent;
+  server.send(200, "text/html; charset=utf-8", buildControlPage(data));
 }
+
 
 static void applyBrightness(uint8_t pct){
   if (pct>100) pct=100;
