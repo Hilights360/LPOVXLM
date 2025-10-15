@@ -7,6 +7,7 @@
 #include <ESPmDNS.h>
 #include <stdlib.h>
 #include <string.h>
+#include "QuadMap.h"
 
 #include "WebPages.h"
 
@@ -22,9 +23,9 @@
 /* ----------------------------------------------------------------------------- */
 
 // ---------- SK9822 / APA102 ----------
-static const uint8_t  MAX_ARMS             = 4;
+static const uint8_t  MAX_ARMS               = 4;
 static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
-static const uint16_t MAX_PIXELS_PER_ARM   = 1024;
+static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 static const int ARM_CLK[MAX_ARMS]  = { 18, 38, 36, 48 };
 static const int ARM_DATA[MAX_ARMS] = { 17, 39, 35, 45 };
 
@@ -37,6 +38,11 @@ static const int PIN_SD_D1  = 4;
 static const int PIN_SD_D2  = 12;
 static const int PIN_SD_D3  = 13;
 static const int PIN_SD_CD  = 42;  // LOW = inserted
+
+// === Quadrant mapping controls ===
+static int START_SPOKE_1BASED = 1;                    // make this user-settable later
+static SpokeLabelMode gLabelMode = FLOOR_TO_BOUNDARY; // matches xLights labels: 1,11,20,30
+static const int SPOKES = 40;                         // your xLights radial spokes
 
 // ---------- Wi-Fi AP ----------
 static const char* AP_SSID  = "POV-Spinner";
@@ -313,7 +319,7 @@ static bool openFseq(const String& path, String& why){
 
   Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
     path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
-    g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, g_fh.sparseCnt, g_fh.chanDataOffset);
+    g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, (unsigned)g_fh.sparseCnt, g_fh.chanDataOffset);
 
 #if !(defined(MZ_OK) || defined(Z_OK))
   if (g_fh.compType==2) {
@@ -408,18 +414,15 @@ static bool renderFrame(uint32_t idx){
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
   const uint32_t indexOffset = (spokes > 0) ? (g_indexPosition % spokes) : 0;
 
+  // ---- QUADRANT MAPPING: start spoke + stride (spokes/arms) ----
+  const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
+
   for (uint8_t arm=0; arm<arms; ++arm){
     if (!strips[arm]) continue;
 
-    uint32_t armBaseSpoke = 0;
-    if (spokes > 0) {
-      if (arms > 1) {
-        uint64_t spaced = ((uint64_t)arm * (uint64_t)spokes) / (uint64_t)arms;
-        if (arm == 0) armBaseSpoke = (uint32_t)(spaced % spokes);
-        else armBaseSpoke = (uint32_t)((spaced + spokes - 1) % spokes);
-      }
-      armBaseSpoke = (armBaseSpoke + indexOffset) % spokes;
-    }
+    // Map each arm to its spoke using quadrant stride, then add rotary index offset
+    uint32_t armBaseSpoke = (uint32_t)armSpokeIdx0((int)arm, startIdx0, (int)spokes, (int)arms);
+    armBaseSpoke = (armBaseSpoke + indexOffset) % spokes;
 
     const uint32_t baseChAbsR = startChBase + armBaseSpoke * chPerSpoke;
     const uint32_t pixelCount = strips[arm]->numPixels();
@@ -846,6 +849,13 @@ void setup(){
   Serial.begin(115200);
   delay(800);
   Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
+  Serial.println(F("[Quadrant self-check]"));
+  for (int k = 0; k < activeArmCount(); ++k) {
+    int s0 = armSpokeIdx0(k, spoke1BasedToIdx0(START_SPOKE_1BASED, SPOKES), SPOKES, activeArmCount());
+    // display as 1-based so it matches xLights labels
+    Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
+  }
+  // Expect: 1, 11, 20, 30 when START_SPOKE_1BASED=1 and gLabelMode=FLOOR_TO_BOUNDARY
 
   // Restore settings
   prefs.begin("display", false);
