@@ -20,10 +20,11 @@
 /* ----------------------------------------------------------------------------- */
 
 // ---------- SK9822 / APA102 ----------
-#define NUM_ARMS   4
-#define LED_COUNT  144
-static const int ARM_CLK[NUM_ARMS]  = { 18, 38, 36, 48 };
-static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 45 };
+static const uint8_t  MAX_ARMS             = 4;
+static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
+static const uint16_t MAX_PIXELS_PER_ARM   = 1024;
+static const int ARM_CLK[MAX_ARMS]  = { 18, 38, 36, 48 };
+static const int ARM_DATA[MAX_ARMS] = { 17, 39, 35, 45 };
 
 // ---------- SD-MMC pins (1-bit) ----------
 static const int PIN_SD_CLK = 14;
@@ -51,11 +52,14 @@ uint32_t g_framePeriodMs     = 25;
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
 uint16_t g_spokesTotal   = 40;   // total spokes in spinner
-uint16_t g_pitchSpokes   = 10;   // arm-to-arm spoke pitch: 1,10,20,30… when pitch=10
-int16_t  g_arm1LedOffset = 0;    // LED offset ONLY for Arm 1
+uint8_t  g_armCount      = MAX_ARMS;
+uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
 
 enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;  // default SPOKE
+
+// Rotary index (0..spokes-1)
+volatile uint16_t g_indexPosition = 0;
 
 // Playback state
 volatile bool  g_playing = false, g_paused = false;
@@ -64,7 +68,7 @@ uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
-Adafruit_DotStar* strips[NUM_ARMS] = { nullptr };
+Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
 /* -------------------- FSEQ v2 reader (sparse + compression-aware) -------------------- */
 struct SparseRange {
@@ -105,6 +109,9 @@ bool         g_compPerFrame= false;       // per-frame zlib (supported)
 /* -------------------- Small helpers -------------------- */
 static inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
 static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
+static inline uint8_t  clampArmCount(int32_t v){ if (v<1) return 1; if (v>MAX_ARMS) return MAX_ARMS; return (uint8_t)v; }
+static inline uint16_t clampPixelsPerArm(int32_t v){ if (v<1) return 1; if (v>MAX_PIXELS_PER_ARM) return MAX_PIXELS_PER_ARM; return (uint16_t)v; }
+static inline uint8_t  activeArmCount(){ return (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount); }
 
 static bool isFseqName(const String& n) {
   int dot = n.lastIndexOf('.');
@@ -359,10 +366,27 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
   }
 }
 
+static void rebuildStrips(){
+  const uint8_t arms = activeArmCount();
+  const uint16_t pixels = g_pixelsPerArm ? g_pixelsPerArm : 1;
+
+  for (uint8_t a=0; a<MAX_ARMS; ++a){
+    if (strips[a]){ delete strips[a]; strips[a] = nullptr; }
+  }
+  for (uint8_t a=0; a<arms; ++a){
+    strips[a] = new Adafruit_DotStar(pixels, ARM_DATA[a], ARM_CLK[a], DOTSTAR_BGR);
+    strips[a]->begin();
+    strips[a]->setBrightness(g_brightness);
+    strips[a]->show();
+  }
+}
+
 static void blackoutAll(){
-  for (int a=0;a<NUM_ARMS;++a){
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a=0; a<arms; ++a){
     if (!strips[a]) continue;
-    for (uint32_t i=0;i<LED_COUNT;++i) strips[a]->setPixelColor(i,0,0,0);
+    uint16_t pix = strips[a]->numPixels();
+    for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
     strips[a]->show();
   }
 }
@@ -370,38 +394,36 @@ static void blackoutAll(){
 static bool renderFrame(uint32_t idx){
   if (!loadFrame(idx)) return false;
 
-  const uint32_t spokes = (g_spokesTotal ? g_spokesTotal : 40);
-  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE) ? (spokes*3UL) : 3UL;
+  const uint32_t spokes = (g_spokesTotal ? g_spokesTotal : 1);
+  const uint8_t  arms = activeArmCount();
+  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
 
-  // Use channels-per-spoke from the FSEQ frame size, not LED_COUNT*3.
-  // Example: stepChannels=17284, spokes=40 → chPerSpoke = 432 (with a 4-byte remainder in the frame).
+  // Use channels-per-spoke from the FSEQ frame size, not a fixed LED count.
+  const uint32_t fallbackPixels = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
   const uint32_t chPerSpoke =
-    (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (LED_COUNT * 3u);
+    (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
 
+  const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
+  const uint32_t indexOffset = (spokes > 0) ? (g_indexPosition % spokes) : 0;
 
-  for (int arm=0; arm<NUM_ARMS; ++arm){
-    // Arm 1 is index 0. Apply Arm-1-only LED offset.
-    int32_t ledOffset = (arm==0) ? g_arm1LedOffset : 0;
-    ledOffset = clampI32(ledOffset, 0, (int32_t)LED_COUNT);
+  for (uint8_t arm=0; arm<arms; ++arm){
+    if (!strips[arm]) continue;
 
-    // Arm1 is spoke 1 → offset 0 spokes.
-    // Arm2 -> 10 => (10-1)=9 spokes, Arm3 -> 20 => 19, Arm4 -> 30 => 29.
-    uint32_t armSpoke0 = (arm == 0) ? 0u : ((uint32_t)arm * (uint32_t)g_pitchSpokes - 1u);
-    // If you want to be extra safe against weird inputs, you can modulo:
-    // if (spokes) armSpoke0 %= spokes;
-
-    // Base channel (R) at the start of the selected spoke for this arm.
-    const uint32_t baseChAbsR =
-        (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0) + armSpoke0 * chPerSpoke;
-
-    for (uint32_t i=0; i<LED_COUNT; ++i){
-      // ONLY Arm 1 uses the LED offset; others stay exactly on spokes 10/20/30.
-      int32_t logicalI = (int32_t)i + ledOffset;
-      if (logicalI < 0 || logicalI >= (int32_t)LED_COUNT) {
-        strips[arm]->setPixelColor(i,0,0,0); continue;
+    uint32_t armBaseSpoke = 0;
+    if (spokes > 0) {
+      if (arms > 1) {
+        uint64_t spaced = ((uint64_t)arm * (uint64_t)spokes) / (uint64_t)arms;
+        if (arm == 0) armBaseSpoke = (uint32_t)(spaced % spokes);
+        else armBaseSpoke = (uint32_t)((spaced + spokes - 1) % spokes);
       }
+      armBaseSpoke = (armBaseSpoke + indexOffset) % spokes;
+    }
 
-      const uint32_t absR = baseChAbsR + (uint32_t)logicalI * blockStride;
+    const uint32_t baseChAbsR = startChBase + armBaseSpoke * chPerSpoke;
+    const uint32_t pixelCount = strips[arm]->numPixels();
+
+    for (uint32_t i=0; i<pixelCount; ++i){
+      const uint32_t absR = baseChAbsR + i * blockStride;
       const int64_t  idxR = sparseTranslate(absR);
       if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
         strips[arm]->setPixelColor(i,0,0,0); continue;
@@ -409,8 +431,8 @@ static bool renderFrame(uint32_t idx){
       uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
       strips[arm]->setPixelColor(i, R,G,B);
     }
+    strips[arm]->show();
   }
-  for (int a=0;a<NUM_ARMS;++a) strips[a]->show();
   return true;
 }
 
@@ -683,8 +705,9 @@ static void handleStatus(){
     +",\"fps\":"+String(g_fps)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
-    +",\"pitch\":"+String(g_pitchSpokes)
-    +",\"arm1off\":"+String(g_arm1LedOffset)
+    +",\"arms\":"+String(g_armCount)
+    +",\"pixels\":"+String(g_pixelsPerArm)
+    +",\"index\":"+String(g_indexPosition)
     +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
     +"}";
   server.send(200,"application/json",json);
@@ -738,9 +761,9 @@ static void handleRoot() {
       "<h3>Spinner Layout</h3>"
       "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
         "<div><label>Start Channel (Arm 1)</label><input id='startch' type='number' min='1' value='" + String(g_startChArm1) + "'></div>"
-        "<div><label>Total Spokes</label><input id='spokes' type='number' min='4' value='" + String(g_spokesTotal) + "'></div>"
-        "<div><label>Pitch (spokes arm→arm)</label><input id='pitch' type='number' min='1' value='" + String(g_pitchSpokes) + "'></div>"
-        "<div><label>Arm 1 LED Offset</label><input id='arm1off' type='number' min='0' max='" + String(LED_COUNT) + "' value='" + String(g_arm1LedOffset) + "'></div>"
+        "<div><label>Total Spokes</label><input id='spokes' type='number' min='1' value='" + String(g_spokesTotal) + "'></div>"
+        "<div><label>Arm Count</label><input id='arms' type='number' min='1' max='" + String((int)MAX_ARMS) + "' value='" + String(g_armCount) + "'></div>"
+        "<div><label>Pixels per Arm</label><input id='pixels' type='number' min='1' max='" + String((int)MAX_PIXELS_PER_ARM) + "' value='" + String(g_pixelsPerArm) + "'></div>"
         "<div><label>Stride</label><select id='stride'><option value='spoke' "+String(g_strideMode==STRIDE_SPOKE?"selected":"")+">SPOKE</option><option value='led' "+String(g_strideMode==STRIDE_LED?"selected":"")+">LED</option></select></div>"
         "<div style='align-self:end'><button id='applymap'>Apply Layout</button></div>"
       "</div>"
@@ -798,10 +821,10 @@ static void handleRoot() {
     "document.getElementById('applymap').onclick=()=>{"
       "const sc=+document.getElementById('startch').value||1;"
       "const sp=+document.getElementById('spokes').value||40;"
-      "const pt=+document.getElementById('pitch').value||10;"
-      "const of=+document.getElementById('arm1off').value||0;"
+      "const ar=+document.getElementById('arms').value||1;"
+      "const px=+document.getElementById('pixels').value||1;"
       "const st=(document.getElementById('stride').value)||'spoke';"
-      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&pitch='+pt+'&arm1off='+of+'&stride='+st,{method:'POST'})"
+      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
     "};"
     "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
@@ -817,7 +840,8 @@ static void handleRoot() {
 static void applyBrightness(uint8_t pct){
   if (pct>100) pct=100;
   g_brightnessPercent=pct; g_brightness=(uint8_t)((255*pct)/100);
-  for (int a=0;a<NUM_ARMS;++a){ if (strips[a]){ strips[a]->setBrightness(g_brightness); strips[a]->show(); } }
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a=0; a<arms; ++a){ if (strips[a]){ strips[a]->setBrightness(g_brightness); strips[a]->show(); } }
   prefs.putUChar("brightness", g_brightnessPercent); // persisted in NVS
 }
 
@@ -858,20 +882,23 @@ static void handleSpeed() {
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
-// POST /mapcfg?start=1&spokes=40&pitch=10&arm1off=0&stride=spoke|led
+// POST /mapcfg?start=1&spokes=40&arms=4&pixels=144&stride=spoke|led
 static void handleMapCfg(){
+  bool needRebuild = false;
+
   if (server.hasArg("start"))  { uint32_t v=strtoul(server.arg("start").c_str(),nullptr,10); g_startChArm1=(v<1)?1:v; prefs.putULong("startch", g_startChArm1); }
-  if (server.hasArg("spokes")) { int v=server.arg("spokes").toInt(); if (v<4) v=4; g_spokesTotal=(uint16_t)v; prefs.putUShort("spokes", g_spokesTotal); }
-  if (server.hasArg("pitch"))  { int v=server.arg("pitch").toInt(); if (v<1) v=1; g_pitchSpokes=(uint16_t)v; prefs.putUShort("pitch", g_pitchSpokes); }
-  if (server.hasArg("arm1off")){ g_arm1LedOffset = server.arg("arm1off").toInt(); g_arm1LedOffset = clampI32(g_arm1LedOffset,0,(int32_t)LED_COUNT); prefs.putShort("arm1off", g_arm1LedOffset); }
+  if (server.hasArg("spokes")) { int v=server.arg("spokes").toInt(); if (v<1) v=1; g_spokesTotal=(uint16_t)v; prefs.putUShort("spokes", g_spokesTotal); }
+  if (server.hasArg("arms"))   { int v=server.arg("arms").toInt(); uint8_t nv=clampArmCount(v); if (nv!=g_armCount){ g_armCount=nv; prefs.putUChar("arms", g_armCount); needRebuild=true; } }
+  if (server.hasArg("pixels")) { int v=server.arg("pixels").toInt(); uint16_t np=clampPixelsPerArm(v); if (np!=g_pixelsPerArm){ g_pixelsPerArm=np; prefs.putUShort("pixels", g_pixelsPerArm); needRebuild=true; } }
   if (server.hasArg("stride")) {
     String s = server.arg("stride"); s.toLowerCase();
     g_strideMode = (s=="led") ? STRIDE_LED : STRIDE_SPOKE;
     prefs.putUChar("stride", (uint8_t)g_strideMode);
   }
+  if (needRebuild) rebuildStrips();
   server.send(200,"application/json",
-    String("{\"start\":")+g_startChArm1+",\"spokes\":"+g_spokesTotal+",\"pitch\":"+g_pitchSpokes+
-    ",\"arm1off\":"+g_arm1LedOffset+",\"stride\":\""+(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"}");
+    String("{\"start\":")+g_startChArm1+",\"spokes\":"+g_spokesTotal+",\"arms\":"+(int)g_armCount+
+    ",\"pixels\":"+g_pixelsPerArm+",\"stride\":\""+(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"}");
 }
 
 // Diagnostics
@@ -967,15 +994,16 @@ void setup(){
 
   g_startChArm1       = prefs.getULong("startch", 1);
   g_spokesTotal       = prefs.getUShort("spokes", 40);
-  g_pitchSpokes       = prefs.getUShort("pitch", 10);
-  g_arm1LedOffset     = prefs.getShort("arm1off", 0);
+  if (!g_spokesTotal) g_spokesTotal = 1;
+  g_armCount          = clampArmCount(prefs.getUChar("arms", MAX_ARMS));
+  g_pixelsPerArm      = clampPixelsPerArm(prefs.getUShort("pixels", DEFAULT_PIXELS_PER_ARM));
   g_strideMode        = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
 
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
-  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u pitch=%u arm1off=%d stride=%s\n",
-                (unsigned long)g_startChArm1, g_spokesTotal, g_pitchSpokes,
-                (int)g_arm1LedOffset, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
+  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u stride=%s\n",
+                (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
+                (unsigned)g_pixelsPerArm, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
 
   startWifiAP();
 
@@ -990,12 +1018,7 @@ void setup(){
                   (unsigned)type, (unsigned long long)(SD_MMC.cardSize() / (1024ULL*1024ULL)));
   }
 
-  for (int a = 0; a < NUM_ARMS; ++a) {
-    strips[a] = new Adafruit_DotStar(LED_COUNT, ARM_DATA[a], ARM_CLK[a], DOTSTAR_BGR);
-    strips[a]->begin();
-    strips[a]->setBrightness(g_brightness);
-    strips[a]->show();
-  }
+  rebuildStrips();
   blackoutAll();
 
   g_bootMs   = millis();
