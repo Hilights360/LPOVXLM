@@ -2,80 +2,349 @@
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
 #include <Preferences.h>
-
-// ===== Wi-Fi AP + Web UI =====
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <stdlib.h>
+#include <string.h>
 
-// ===== SD-MMC (1-bit per your current wiring) =====
-static const int PIN_SD_CLK = 14;
-static const int PIN_SD_CMD = 15;
-static const int PIN_SD_D0  = 2;
-// Keep these for an easy switch back to 4-bit later:
-static const int PIN_SD_D1  = 4;
-static const int PIN_SD_D2  = 12;
-static const int PIN_SD_D3  = 13;
-static const int PIN_SD_CD  = 42;     // LOW = inserted (invert if needed)
+/* -------------------- Optional zlib backends (auto-detect) -------------------- */
+#if defined(__has_include)
+  #if __has_include(<miniz.h>)
+    #include <miniz.h>
+  #endif
+  #if __has_include(<zlib.h>)
+    #include <zlib.h>
+  #endif
+#endif
+/* ----------------------------------------------------------------------------- */
 
-// ===== APA102 pins per arm =====
-#define NUM_ARMS     4
-#define LED_COUNT    144
-
-// ===== Playback timing (now variable FPS) =====
-Preferences prefs;
-uint16_t g_fps = 40;                  // adjustable 1..120
-uint32_t g_framePeriodMs = 1000 / 40; // derived from g_fps
-
-// ===== FSEQ timing =====
-static const uint32_t STEP_MS_DEFAULT = 25; // legacy reference
-// ===== FSEQ metadata (static for now) =====
-static const uint32_t chanOffset    = 17408;   // start of frame data
-static const uint32_t channels      = 17284;   // bytes per frame (all channels)
-static const uint32_t frames        = 1200;    // total frames in file
-static const uint32_t bytesPerFrame = channels;
-
-// NOTE: Some ESP32-S3 modules have GPIO45 input-only.
+// ---------- SK9822 / APA102 ----------
+#define NUM_ARMS   4
+#define LED_COUNT  144
 static const int ARM_CLK[NUM_ARMS]  = { 18, 38, 36, 48 };
 static const int ARM_DATA[NUM_ARMS] = { 17, 39, 35, 45 };
 
-Adafruit_DotStar* strips[NUM_ARMS] = {nullptr};
-File fseqFile;
+// ---------- SD-MMC pins (1-bit) ----------
+static const int PIN_SD_CLK = 14;
+static const int PIN_SD_CMD = 15;
+static const int PIN_SD_D0  = 2;
+// keep defined in case you flip back to 4-bit later
+static const int PIN_SD_D1  = 4;
+static const int PIN_SD_D2  = 12;
+static const int PIN_SD_D3  = 13;
+static const int PIN_SD_CD  = 42;  // LOW = inserted
 
-// ===== Brightness (percentage, persisted) =====
-uint8_t g_brightnessPercent = 25;  // 0–100
-uint8_t g_brightness        = (255 * g_brightnessPercent) / 100;
-
-// ===== Playback state =====
-volatile bool g_playing   = false;  // "a sequence is selected"
-volatile bool g_paused    = false;  // "auto advance disabled"
-String   g_currentPath    = "";     // e.g. "/test2.fseq"
-uint32_t g_frameIndex     = 0;      // NEXT frame to render
-uint32_t g_lastTickMs     = 0;
-
-// ===== 5-minute selection timeout =====
-const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
-uint32_t g_bootMs = 0;
-
-// ===== Wi-Fi AP config =====
+// ---------- Wi-Fi AP ----------
 static const char* AP_SSID  = "POV-Spinner";
-static const char* AP_PASS  = "POV123456";   // 8+ chars
-static const IPAddress AP_IP(192,168,4,1);
-static const IPAddress AP_GW(192,168,4,1);
-static const IPAddress AP_MASK(255,255,255,0);
-
+static const char* AP_PASS  = "POV123456";
+static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
 WebServer server(80);
 
-// ===== Upload state (streaming to SD) =====
-File   g_uploadFile;
-String g_uploadFilename;
-size_t g_uploadBytes = 0;
+// ---------- Persisted settings (NVS = flash) ----------
+Preferences prefs;
+uint8_t  g_brightnessPercent = 25;
+uint8_t  g_brightness        = 63;
+uint16_t g_fps               = 40;
+uint32_t g_framePeriodMs     = 25;
 
-// ===== Debug & mapping =====
-// Per-arm whole-direction (global reverse)
-bool g_armReverse[NUM_ARMS] = { false, false, false, false };
+// Spinner model mapping (persisted)
+uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
+uint16_t g_spokesTotal   = 40;   // total spokes in spinner
+uint16_t g_pitchSpokes   = 10;   // arm-to-arm spoke pitch: 1,10,20,30… when pitch=10
+int16_t  g_arm1LedOffset = 0;    // LED offset ONLY for Arm 1
 
-// Color channel mapping: file buffer -> R,G,B we send to DotStar
+enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
+StrideMode g_strideMode = STRIDE_SPOKE;  // default SPOKE
+
+// Playback state
+volatile bool  g_playing = false, g_paused = false;
+String         g_currentPath;
+uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
+uint32_t       g_bootMs = 0;
+const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+
+Adafruit_DotStar* strips[NUM_ARMS] = { nullptr };
+
+/* -------------------- FSEQ v2 reader (sparse + compression-aware) -------------------- */
+struct SparseRange {
+  uint32_t start;   // 0-based absolute channel
+  uint32_t count;   // channels in this range
+  uint32_t accum;   // starting index within frame (prefix sum)
+};
+
+struct CompBlock {
+  uint32_t uSize;   // uncompressed size (bytes)
+  uint32_t cSize;   // compressed size (bytes)
+};
+
+struct FseqHeader {
+  uint16_t chanDataOffset = 0;   // where channel/compressed payload begins
+  uint8_t  minor = 0, major = 2;
+  uint16_t varDataOffset = 0;
+  uint32_t channelCount = 0;
+  uint32_t frameCount   = 0;
+  uint8_t  stepTimeMs   = 25;
+  uint8_t  flags        = 0;
+  uint8_t  compType     = 0;     // 0=none, 1=zstd, 2=zlib
+  uint8_t  compBlockCnt = 0;
+  uint8_t  sparseCnt    = 0;
+  uint64_t uniqueId     = 0;
+};
+
+File         g_fseq;
+FseqHeader   g_fh;
+SparseRange* g_ranges      = nullptr;     // sparse table
+uint8_t*     g_frameBuf    = nullptr;     // size==channelCount
+// Compression state
+CompBlock*   g_cblocks     = nullptr;
+uint32_t     g_compCount   = 0;
+uint64_t     g_compBase    = 0;           // start of compressed data
+bool         g_compPerFrame= false;       // per-frame zlib (supported)
+
+/* -------------------- Small helpers -------------------- */
+static inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
+static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if (v<lo) return lo; if (v>hi) return hi; return v; }
+
+static bool isFseqName(const String& n) {
+  int dot = n.lastIndexOf('.');
+  if (dot < 0) return false;
+  String ext = n.substring(dot + 1);
+  ext.toLowerCase();
+  return ext == "fseq";
+}
+
+static String htmlEscape(const String& in) {
+  String s; s.reserve(in.length()+8);
+  for (size_t i=0;i<in.length();++i){
+    char c=in[i];
+    if(c=='&') s+="&amp;";
+    else if(c=='<') s+="&lt;";
+    else if(c=='>') s+="&gt;";
+    else if(c=='\"') s+="&quot;";
+    else if(c=='\'') s+="&#39;";
+    else s+=c;
+  }
+  return s;
+}
+static String urlEncode(const String& in){
+  const char* hex="0123456789ABCDEF";
+  String s; s.reserve(in.length()*3);
+  for (size_t i=0;i<in.length();++i){
+    uint8_t c=(uint8_t)in[i];
+    if( (c>='A'&&c<='Z') || (c>='a'&&c<='z') || (c>='0'&&c<='9') || c=='-'||c=='_'||c=='.'||c=='/' ){
+      s+=(char)c;
+    } else {
+      s+='%'; s+=hex[c>>4]; s+=hex[c&0xF];
+    }
+  }
+  return s;
+}
+static String dirnameOf(const String& path){
+  if(path=="/") return "/";
+  int slash = path.lastIndexOf('/');
+  if (slash<=0) return "/";
+  return path.substring(0, slash);
+}
+static String joinPath(const String& dir, const String& name){
+  String d = dir;
+  if (!d.length() || d[0] != '/') d = "/" + d;
+  if (d != "/" && d.endsWith("/")) d.remove(d.length()-1);
+  String base = name;
+  int slash = base.lastIndexOf('/');
+  if (slash >= 0) base = base.substring(slash+1); // strip any directories
+  return (d == "/") ? ("/" + base) : (d + "/" + base);
+}
+
+/* -------------------- SD helpers -------------------- */
+static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
+static bool mountSdmmc(){
+  SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
+  const uint32_t FREQ_KHZ = 10000; // 10 MHz, 1-bit
+  return SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, FREQ_KHZ);
+}
+
+/* -------------------- Endianness readers -------------------- */
+static bool readU16(File& f, uint16_t& v){ uint8_t b[2]; if(f.read(b,2)!=2) return false; v=(uint16_t)(b[0]|(b[1]<<8)); return true; }
+static bool readU32(File& f, uint32_t& v){ uint8_t b[4]; if(f.read(b,4)!=4) return false; v=(uint32_t)(b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24)); return true; }
+static bool readU64(File& f, uint64_t& v){ uint8_t b[8]; if(f.read(b,8)!=8) return false;
+  v=(uint64_t)b[0]|((uint64_t)b[1]<<8)|((uint64_t)b[2]<<16)|((uint64_t)b[3]<<24)|
+    ((uint64_t)b[4]<<32)|((uint64_t)b[5]<<40)|((uint64_t)b[6]<<48)|((uint64_t)b[7]<<56);
+  return true;
+}
+
+/* -------------------- zlib inflate wrapper -------------------- */
+static bool zlib_decompress(const uint8_t* in, size_t in_len, uint8_t* out, size_t out_len){
+#if defined(MZ_OK) /* miniz present */
+  mz_ulong dst = (mz_ulong)out_len;
+  int rc = mz_uncompress((unsigned char*)out, &dst,
+                         (const unsigned char*)in, (mz_ulong)in_len);
+  return (rc == MZ_OK) && (dst == (mz_ulong)out_len);
+#elif defined(Z_OK) /* zlib present */
+  uLongf dst = (uLongf)out_len;
+  int rc = uncompress((Bytef*)out, &dst, (const Bytef*)in, (uLong)in_len);
+  return (rc == Z_OK) && (dst == (uLongf)out_len);
+#else
+  (void)in; (void)in_len; (void)out; (void)out_len;
+  return false;
+#endif
+}
+
+/* -------------------- FSEQ open/close/load -------------------- */
+static void freeFseq(){
+  if (g_fseq) g_fseq.close();
+  if (g_ranges){ free(g_ranges); g_ranges=nullptr; }
+  if (g_frameBuf){ free(g_frameBuf); g_frameBuf=nullptr; }
+  if (g_cblocks){ free(g_cblocks); g_cblocks=nullptr; }
+  g_compCount=0; g_compBase=0; g_compPerFrame=false;
+  memset(&g_fh,0,sizeof(g_fh));
+}
+
+static int64_t sparseTranslate(uint32_t absCh) {
+  if (g_fh.sparseCnt == 0) {
+    return (absCh < g_fh.channelCount) ? (int64_t)absCh : -1;
+  }
+  for (uint8_t i=0;i<g_fh.sparseCnt;++i){
+    const SparseRange &r = g_ranges[i];
+    if (absCh >= r.start && absCh < r.start + r.count) {
+      return (int64_t)r.accum + (absCh - r.start);
+    }
+  }
+  return -1;
+}
+
+static bool openFseq(const String& path, String& why){
+  freeFseq();
+  g_fseq = SD_MMC.open(path, FILE_READ);
+  if (!g_fseq){ why="open fail"; return false; }
+
+  // Magic
+  uint8_t magic[4];
+  if (g_fseq.read(magic,4)!=4){ why="short"; return false; }
+  if (!((magic[0]=='F'||magic[0]=='P') && magic[1]=='S' && magic[2]=='E' && magic[3]=='Q')){
+    why="bad magic"; return false;
+  }
+  if (!readU16(g_fseq, g_fh.chanDataOffset)) { why="hdr"; return false; }
+  if (g_fseq.read(&g_fh.minor,1)!=1) { why="hdr"; return false; }
+  if (g_fseq.read(&g_fh.major,1)!=1) { why="hdr"; return false; }
+  if (!readU16(g_fseq, g_fh.varDataOffset)) { why="hdr"; return false; }
+  if (!readU32(g_fseq, g_fh.channelCount))  { why="hdr"; return false; }
+  if (!readU32(g_fseq, g_fh.frameCount))    { why="hdr"; return false; }
+  if (g_fseq.read(&g_fh.stepTimeMs,1)!=1)   { why="hdr"; return false; }
+  if (g_fseq.read(&g_fh.flags,1)!=1)        { why="hdr"; return false; }
+
+  uint8_t ecct_ct_scc_res[4];
+  if (g_fseq.read(ecct_ct_scc_res,4)!=4)    { why="hdr"; return false; }
+  g_fh.compType     = (ecct_ct_scc_res[0] & 0x0F);
+  g_fh.compBlockCnt = ecct_ct_scc_res[1];
+  g_fh.sparseCnt    = ecct_ct_scc_res[2];
+  if (!readU64(g_fseq, g_fh.uniqueId))      { why="hdr"; return false; }
+
+  // Compression block table (optional)
+  if (g_fh.compBlockCnt > 0) {
+    g_cblocks = (CompBlock*)malloc(sizeof(CompBlock)*g_fh.compBlockCnt);
+    if (!g_cblocks){ why="oom ctab"; return false; }
+    for (uint32_t i=0;i<g_fh.compBlockCnt;++i){
+      if (!readU32(g_fseq, g_cblocks[i].uSize)) { why="ctab"; return false; }
+      if (!readU32(g_fseq, g_cblocks[i].cSize)) { why="ctab"; return false; }
+    }
+    g_compCount = g_fh.compBlockCnt;
+  }
+
+  // Sparse table (optional)
+  if (g_fh.sparseCnt > 0){
+    g_ranges = (SparseRange*)malloc(sizeof(SparseRange)*g_fh.sparseCnt);
+    if (!g_ranges){ why="oom ranges"; return false; }
+    uint32_t accum=0;
+    for (uint8_t i=0;i<g_fh.sparseCnt;++i){
+      uint8_t b[6]; if (g_fseq.read(b,6)!=6){ why="ranges"; return false; }
+      uint32_t start = (uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16);
+      uint32_t count = (uint32_t)b[3]|((uint32_t)b[4]<<8)|((uint32_t)b[5]<<16);
+      g_ranges[i] = { start, count, accum };
+      accum += count;
+    }
+  }
+
+  // Jump to payload
+  g_fseq.seek(g_fh.chanDataOffset, SeekSet);
+
+  // Compression detection
+  if (g_fh.compType == 0) {
+    g_compBase = g_fh.chanDataOffset; // raw
+  } else if (g_fh.compType == 2) {
+    g_compBase = g_fh.chanDataOffset;
+    bool perFrame = (g_compCount == g_fh.frameCount && g_fh.channelCount>0);
+    if (perFrame){
+      for (uint32_t i=0;i<g_compCount;++i){
+        if (g_cblocks[i].uSize != g_fh.channelCount){ perFrame=false; break; }
+      }
+    }
+#if defined(MZ_OK) || defined(Z_OK)
+    g_compPerFrame = perFrame;
+    if (!g_compPerFrame) { why="zlib block!=frame (not yet supported)"; return false; }
+#else
+    (void)perFrame;
+    why="zlib not available in this toolchain";
+    return false;
+#endif
+  } else {
+    why="zstd unsupported";
+    return false;
+  }
+
+  // Allocate frame buffer
+  if (g_fh.channelCount==0){ why="zero chans"; return false; }
+  g_frameBuf = (uint8_t*)malloc(g_fh.channelCount);
+  if (!g_frameBuf){ why="oom frame"; return false; }
+
+  g_currentPath = path;
+  g_frameIndex  = 0;
+  g_lastTickMs  = millis();
+  g_playing     = true;
+
+  Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
+    path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
+    g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, g_fh.sparseCnt, g_fh.chanDataOffset);
+
+#if !(defined(MZ_OK) || defined(Z_OK))
+  if (g_fh.compType==2) {
+    Serial.println("[FSEQ] NOTE: zlib file detected but no zlib/miniz headers found. Please export uncompressed or add zlib/miniz.");
+  }
+#endif
+  return true;
+}
+
+static bool loadFrame(uint32_t idx){
+  if (!g_fseq || !g_fh.frameCount) return false;
+  idx %= g_fh.frameCount;
+
+  if (g_fh.compType == 0){
+    const uint64_t base = (uint64_t)g_fh.chanDataOffset + (uint64_t)idx * (uint64_t)g_fh.channelCount;
+    if (!g_fseq.seek(base, SeekSet)) return false;
+    return g_fseq.read(g_frameBuf, g_fh.channelCount) == g_fh.channelCount;
+  }
+
+#if defined(MZ_OK) || defined(Z_OK)
+  if (g_fh.compType == 2 && g_compPerFrame){
+    // offset into compressed stream
+    uint64_t offs = g_compBase;
+    for (uint32_t i=0;i<idx;++i) offs += g_cblocks[i].cSize;
+    if (!g_fseq.seek(offs, SeekSet)) return false;
+    uint32_t clen = g_cblocks[idx].cSize;
+    if (clen == 0 || clen > 8*1024*1024) return false; // sanity
+    uint8_t* ctmp = (uint8_t*)malloc(clen);
+    if (!ctmp) return false;
+    size_t got = g_fseq.read(ctmp, clen);
+    bool ok = false;
+    if (got == clen) ok = zlib_decompress(ctmp, clen, g_frameBuf, g_fh.channelCount);
+    free(ctmp);
+    return ok;
+  }
+#endif
+  return false;
+}
+
+/* -------------------- Color & stride mapping -------------------- */
 enum ColorMap { MAP_RGB, MAP_RBG, MAP_GBR, MAP_GRB, MAP_BRG, MAP_BGR };
 ColorMap g_colorMap = MAP_RGB;
 
@@ -90,92 +359,289 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
   }
 }
 
-// ----- Status helpers (UI) -----
-static inline const char* statusText() {
-  if (g_paused && g_playing) return "Paused";
-  if (g_playing)             return "Playing";
-  return "Stopped";
-}
-static inline const char* statusClass() {
-  if (g_paused && g_playing) return "badge pause";
-  if (g_playing)             return "badge play";
-  return "badge stop";
-}
-
-// ---- Per-arm split remap ----
-// For each arm: indices [0..split-1] = Segment A, [split..LED_COUNT-1] = Segment B
-// Each segment can be normal (0) or reversed (1) relative to logical inside->outside.
-uint16_t g_armSplit[NUM_ARMS]   = { LED_COUNT, LED_COUNT, LED_COUNT, LED_COUNT }; // LED_COUNT => no split
-bool     g_segRevA[NUM_ARMS]    = { false, false, false, false };
-bool     g_segRevB[NUM_ARMS]    = { false, false, false, false };
-
-// Map logical LED index 'i' (inside->outside) to physical index with split + segments + whole-arm reverse.
-static inline uint32_t mapIndexWithSplit(int arm, uint32_t i) {
-  uint16_t split = g_armSplit[arm];
-  if (split > LED_COUNT) split = LED_COUNT;
-
-  const bool armRev = g_armReverse[arm];
-
-  if (i < split) {
-    uint32_t lenA = split;
-    uint32_t idxA = g_segRevA[arm] ? (lenA - 1 - i) : i;
-    return armRev ? (LED_COUNT - 1 - idxA) : idxA;
-  } else {
-    uint32_t lenB = LED_COUNT - split;
-    uint32_t j    = i - split;
-    uint32_t idxB = g_segRevB[arm] ? (lenB - 1 - j) : j;
-    uint32_t phys = split + idxB;
-    return armRev ? (LED_COUNT - 1 - phys) : phys;
-  }
-}
-
-// ---------------- util ----------------
-static inline bool cardPresent() {
-  pinMode(PIN_SD_CD, INPUT_PULLUP);
-  return digitalRead(PIN_SD_CD) == LOW;  // LOW = inserted
-}
-
-static bool mountSdmmc() {
-  Serial.print("[SD_MMC] setPins (custom)… ");
-  SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
-  Serial.println("OK");
-
-  const uint32_t FREQ_KHZ = 10000; // 10 MHz
-  Serial.printf("[SD_MMC] begin (1-bit, %u kHz)… ", (unsigned)FREQ_KHZ);
-  if (SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no format*/, FREQ_KHZ)) {
-    Serial.println("OK");
-    return true;
-  }
-  Serial.println("FAIL");
-  return false;
-}
-
-static void blackoutAll() {
-  for (int a = 0; a < NUM_ARMS; ++a) {
+static void blackoutAll(){
+  for (int a=0;a<NUM_ARMS;++a){
     if (!strips[a]) continue;
-    for (uint32_t i = 0; i < LED_COUNT; ++i) strips[a]->setPixelColor(i, 0, 0, 0);
+    for (uint32_t i=0;i<LED_COUNT;++i) strips[a]->setPixelColor(i,0,0,0);
     strips[a]->show();
   }
 }
 
-static void applyBrightness(uint8_t pct) {
-  if (pct > 100) pct = 100;
-  g_brightnessPercent = pct;
-  g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
-  for (int a = 0; a < NUM_ARMS; ++a) if (strips[a]) strips[a]->setBrightness(g_brightness);
-  for (int a = 0; a < NUM_ARMS; ++a) if (strips[a]) strips[a]->show();
-  prefs.putUChar("brightness", g_brightnessPercent);
-  Serial.printf("[LED] Brightness %u%% (%u) saved\n", g_brightnessPercent, g_brightness);
+static bool renderFrame(uint32_t idx){
+  if (!loadFrame(idx)) return false;
+
+  const uint32_t spokes = (g_spokesTotal ? g_spokesTotal : 40);
+  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE) ? (spokes*3UL) : 3UL;
+
+  // Use channels-per-spoke from the FSEQ frame size, not LED_COUNT*3.
+  // Example: stepChannels=17284, spokes=40 → chPerSpoke = 432 (with a 4-byte remainder in the frame).
+  const uint32_t chPerSpoke =
+    (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (LED_COUNT * 3u);
+
+
+  for (int arm=0; arm<NUM_ARMS; ++arm){
+    // Arm 1 is index 0. Apply Arm-1-only LED offset.
+    int32_t ledOffset = (arm==0) ? g_arm1LedOffset : 0;
+    ledOffset = clampI32(ledOffset, 0, (int32_t)LED_COUNT);
+
+    // Arm1 is spoke 1 → offset 0 spokes.
+    // Arm2 -> 10 => (10-1)=9 spokes, Arm3 -> 20 => 19, Arm4 -> 30 => 29.
+    uint32_t armSpoke0 = (arm == 0) ? 0u : ((uint32_t)arm * (uint32_t)g_pitchSpokes - 1u);
+    // If you want to be extra safe against weird inputs, you can modulo:
+    // if (spokes) armSpoke0 %= spokes;
+
+    // Base channel (R) at the start of the selected spoke for this arm.
+    const uint32_t baseChAbsR =
+        (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0) + armSpoke0 * chPerSpoke;
+
+    for (uint32_t i=0; i<LED_COUNT; ++i){
+      // ONLY Arm 1 uses the LED offset; others stay exactly on spokes 10/20/30.
+      int32_t logicalI = (int32_t)i + ledOffset;
+      if (logicalI < 0 || logicalI >= (int32_t)LED_COUNT) {
+        strips[arm]->setPixelColor(i,0,0,0); continue;
+      }
+
+      const uint32_t absR = baseChAbsR + (uint32_t)logicalI * blockStride;
+      const int64_t  idxR = sparseTranslate(absR);
+      if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
+        strips[arm]->setPixelColor(i,0,0,0); continue;
+      }
+      uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
+      strips[arm]->setPixelColor(i, R,G,B);
+    }
+  }
+  for (int a=0;a<NUM_ARMS;++a) strips[a]->show();
+  return true;
 }
 
-static bool isFseqName(const String& n) {
-  int dot = n.lastIndexOf('.');
-  if (dot < 0) return false;
-  String ext = n.substring(dot + 1);
-  ext.toLowerCase();
-  return ext == "fseq";
+
+/* -------------------- Web: Files page + ops -------------------- */
+static void handleFiles();     // list & UI (with upload form)
+static void handleDownload();  // /dl?path=...
+static void handlePlayLink();  // /play?path=...&back=...
+static void handleDelete();    // /rm?path=...&back=...
+static void handleMkdir();     // /mkdir?path=/current&name=New
+static void handleRename();    // /ren?path=/old&to=NewName
+static void handleUploadData();
+static void handleUploadDone();
+
+// Upload state
+File   g_uploadFile;
+String g_uploadFilename;   // full SD path of the file being written
+size_t g_uploadBytes = 0;
+
+static void handleFiles() {
+  String path = server.hasArg("path") ? server.arg("path") : "/";
+  if (!path.length() || path[0] != '/') path = "/" + path;
+
+  File dir = SD_MMC.open(path);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    server.send(404, "text/plain", "Directory not found");
+    return;
+  }
+
+  String parent = dirnameOf(path);
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Files - " + htmlEscape(path) + "</title>"
+    "<style>"
+    "body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
+    ".card{max-width:860px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}"
+    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
+    "table{width:100%;border-collapse:collapse;margin-top:.5rem}"
+    "th,td{padding:.5rem;border-bottom:1px solid #1b2741}"
+    ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}"
+    "button{padding:.4rem .7rem;border:0;border-radius:8px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
+    "button:hover{filter:brightness(1.1)}"
+    "input{padding:.45rem .5rem;border-radius:8px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+    "</style></head><body><div class='card'>"
+    "<div style='display:flex;justify-content:space-between;align-items:center'>"
+      "<h2 style='margin:0'>Files</h2>"
+      "<a href='/'>Back to Control</a>"
+    "</div>"
+    "<p>Path: <b>" + htmlEscape(path) + "</b> &middot; "
+    "<a href='/files?path=" + urlEncode(parent) + "'>Up</a></p>"
+
+    // upload to this folder
+    "<form method='POST' action='/upload?dir=" + urlEncode(path) + "&back=" + urlEncode(String("/files?path=") + path) + "' enctype='multipart/form-data'>"
+      "<input type='file' name='f' accept='.fseq' required> "
+      "<button type='submit'>Upload here</button>"
+      "<div class='muted' style='margin-top:.25rem'>Only <b>.fseq</b> files are accepted.</div>"
+    "</form>"
+
+    "<div class='row' style='margin-top:.75rem'>"
+      "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + urlEncode(path) + "&name='+encodeURIComponent(n);\">New Folder</button>"
+      "<button onclick=\"location.reload()\">Refresh</button>"
+    "</div>"
+    "<table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody>";
+
+  File ent;
+  while ((ent = dir.openNextFile())) {
+    String name = ent.name();
+    String esc = htmlEscape(name);
+    String enc = urlEncode(name);
+    if (ent.isDirectory()) {
+      html += "<tr><td>📁 <a href='/files?path=" + enc + "'>" + esc + "</a></td>"
+              "<td>—</td>"
+              "<td>"
+                "<a href='#' onclick=\"if(confirm('Delete folder " + esc + "? (must be empty)')) location='/rm?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'; return false;\">🗑️ Delete</a> &nbsp; "
+                "<a href='#' onclick=\"const n=prompt('Rename folder to:', '" + htmlEscape(String(ent.name()).substring(String(ent.name()).lastIndexOf('/')+1)) + "'); if(n) location='/ren?path=" + enc + "&to='+encodeURIComponent(n)+'&back=/files?path=" + urlEncode(path) + "'; return false;\">✏️ Rename</a>"
+              "</td></tr>";
+    } else {
+      uint64_t sz = ent.size();
+      html += "<tr><td>📄 " + esc + "</td>"
+              "<td>" + String((unsigned long)sz) + "</td>"
+              "<td>"
+                "<a href='/dl?path=" + enc + "'>⬇️ Download</a> &nbsp; "
+                "<a href='/play?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'>▶️ Play</a> &nbsp; "
+                "<a href='#' onclick=\"if(confirm('Delete " + esc + "?')) location='/rm?path=" + enc + "&back=/files?path=" + urlEncode(path) + "'; return false;\">🗑️ Delete</a> &nbsp; "
+                "<a href='#' onclick=\"const n=prompt('Rename file to:', '" + htmlEscape(String(ent.name()).substring(String(ent.name()).lastIndexOf('/')+1)) + "'); if(n) location='/ren?path=" + enc + "&to='+encodeURIComponent(n)+'&back=/files?path=" + urlEncode(path) + "'; return false;\">✏️ Rename</a>"
+              "</td></tr>";
+    }
+    ent.close();
+  }
+  dir.close();
+
+  html += "</tbody></table></div></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
+static void handleDownload() {
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
+  String path = server.arg("path");
+  if (!path.startsWith("/")) path = "/" + path;
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f || f.isDirectory()) { if (f) f.close(); server.send(404, "text/plain", "not found"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + htmlEscape(path.substring(path.lastIndexOf('/')+1)) + "\"");
+  server.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+static void handlePlayLink() {
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
+  String path = server.arg("path");
+  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
+  if (!path.startsWith("/")) path = "/" + path;
+  if (!SD_MMC.exists(path) || !isFseqName(path)) {
+    server.sendHeader("Location", back); server.send(302, "text/plain", "Not a .fseq or missing"); return;
+  }
+  String why;
+  openFseq(path, why);
+  server.sendHeader("Location", back);
+  server.send(302, "text/plain", "OK");
+}
+
+static void handleDelete() {
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
+  String path = server.arg("path");
+  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
+  if (!path.startsWith("/")) path = "/" + path;
+
+  File f = SD_MMC.open(path);
+  bool ok=false;
+  if (f) {
+    if (f.isDirectory()) {
+      f.close();
+      ok = SD_MMC.rmdir(path);
+    } else {
+      f.close();
+      ok = SD_MMC.remove(path);
+    }
+  }
+  server.sendHeader("Location", back);
+  server.send(ok?302:500, "text/plain", ok?"Deleted":"Delete failed");
+}
+
+static void handleMkdir() {
+  if (!server.hasArg("path") || !server.hasArg("name")) { server.send(400, "text/plain", "args"); return; }
+  String base = server.arg("path");
+  String name = server.arg("name");
+  if (!base.startsWith("/")) base = "/" + base;
+  if (name.indexOf('/')>=0 || !name.length()) { server.send(400, "text/plain", "bad name"); return; }
+  if (!base.endsWith("/")) base += "/";
+  bool ok = SD_MMC.mkdir(base + name);
+  server.sendHeader("Location", String("/files?path=") + urlEncode(base.substring(0, base.length()-1)));
+  server.send(ok?302:500, "text/plain", ok?"Created":"Create failed");
+}
+
+static void handleRename() {
+  if (!server.hasArg("path") || !server.hasArg("to")) { server.send(400, "text/plain", "args"); return; }
+  String p = server.arg("path");
+  String to = server.arg("to");
+  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
+  if (!p.startsWith("/")) p = "/" + p;
+  if (to.indexOf('/')>=0 || !to.length()) { server.sendHeader("Location", back); server.send(302, "text/plain", "bad name"); return; }
+  String dir = dirnameOf(p);
+  String dst = (dir == "/") ? ("/" + to) : (dir + "/" + to);
+  bool ok = SD_MMC.rename(p, dst);
+  server.sendHeader("Location", back);
+  server.send(ok?302:500, "text/plain", ok?"Renamed":"Rename failed");
+}
+
+static void handleUploadData() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_uploadBytes = 0;
+
+    // Destination dir & back target (optional)
+    String dir = server.hasArg("dir") ? server.arg("dir") : "/";
+    if (dir.indexOf("..") >= 0) dir = "/";            // basic safety
+    if (!dir.startsWith("/")) dir = "/" + dir;
+
+    // Filename (basename only)
+    g_uploadFilename = up.filename;
+    if (!g_uploadFilename.length()) g_uploadFilename = "upload.fseq";
+    int slash = g_uploadFilename.lastIndexOf('/');
+    if (slash >= 0) g_uploadFilename = g_uploadFilename.substring(slash + 1);
+
+    // Compose full path inside selected dir
+    g_uploadFilename = joinPath(dir, g_uploadFilename);
+
+    if (!isFseqName(g_uploadFilename)) {
+      Serial.printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
+    } else {
+      // Ensure dir exists
+      File d = SD_MMC.open(dir);
+      bool okdir = d && d.isDirectory();
+      if (d) d.close();
+      if (!okdir) {
+        Serial.printf("[UPLOAD] Target dir missing: %s\n", dir.c_str());
+      } else {
+        if (SD_MMC.exists(g_uploadFilename)) SD_MMC.remove(g_uploadFilename);
+        g_uploadFile = SD_MMC.open(g_uploadFilename, FILE_WRITE);
+        Serial.printf("[UPLOAD] START %s\n", g_uploadFilename.c_str());
+      }
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_uploadFile) { g_uploadFile.write(up.buf, up.currentSize); g_uploadBytes += up.currentSize; }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (g_uploadFile) { g_uploadFile.close(); Serial.printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes); }
+    else { Serial.println("[UPLOAD] Aborted/invalid file"); }
+  }
+}
+
+static void handleUploadDone() {
+  String back = server.hasArg("back") ? server.arg("back") : "/";
+  if (!isFseqName(g_uploadFilename)) {
+    server.send(415, "text/html",
+      "<meta http-equiv='refresh' content='2;url=" + back + "'>"
+      "<body style='font-family:system-ui'><p>Upload rejected. Only <b>.fseq</b> files are allowed.</p><p>Returning…</p></body>");
+    return;
+  }
+  if (!SD_MMC.exists(g_uploadFilename)) {
+    server.send(500, "text/html",
+      "<meta http-equiv='refresh' content='3;url=" + back + "'>"
+      "<body style='font-family:system-ui'><p>Upload failed.</p><p>Returning…</p></body>");
+    return;
+  }
+  server.send(200, "text/html",
+    "<meta http-equiv='refresh' content='1;url=" + back + "'>"
+    "<body style='font-family:system-ui'><p>Uploaded <b>" + htmlEscape(g_uploadFilename) + "</b> (" + String(g_uploadBytes) + " bytes).</p><p>Refreshing…</p></body>");
+}
+
+/* -------------------- Web: Control page & API -------------------- */
 static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth = 0) {
   File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
@@ -188,9 +654,7 @@ static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth =
       if (isFseqName(name)) {
         optionsHtml += "<option value='";
         optionsHtml += name;
-        optionsHtml += "'";
-        if (name == g_currentPath) optionsHtml += " selected";
-        optionsHtml += ">";
+        optionsHtml += "'>";
         optionsHtml += name;
         optionsHtml += "</option>";
       }
@@ -200,101 +664,30 @@ static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth =
   dir.close();
 }
 
-static bool openFseq(const String& path) {
-  if (fseqFile) fseqFile.close();
-  File f = SD_MMC.open(path, FILE_READ);
-  if (!f) { Serial.printf("[FSEQ] Open failed: %s\n", path.c_str()); return false; }
-  fseqFile = f;
-  g_currentPath = path;
-  g_frameIndex = 0;                 // next to render
-  g_playing = true;
-  g_lastTickMs = millis();
-  Serial.printf("[FSEQ] Playing: %s\n", g_currentPath.c_str());
-
-  const uint64_t fileSize = fseqFile.size();
-  const uint64_t payload  = (fileSize > chanOffset) ? (fileSize - chanOffset) : 0ULL;
-  Serial.printf("[FSEQ] size=%llu payload=%llu bytesPerFrame=%lu frames(const)=%lu\n",
-    (unsigned long long)fileSize, (unsigned long long)payload,
-    (unsigned long)bytesPerFrame, (unsigned long)frames);
-  return true;
+static inline const char* statusText() {
+  if (g_paused && g_playing) return "Paused";
+  if (g_playing)             return "Playing";
+  return "Stopped";
+}
+static inline const char* statusClass() {
+  if (g_paused && g_playing) return "badge pause";
+  if (g_playing)             return "badge play";
+  return "badge stop";
 }
 
-static void stopPlayback() {
-  g_playing = false;
-  if (fseqFile) fseqFile.close();
-  g_currentPath = "";
-  blackoutAll();
-  Serial.println("[FSEQ] Stopped, LEDs blacked out");
-}
-
-// ======= RENDERING CORE =======
-static uint8_t frameBuf[channels]; // persistent buffer
-
-// Render EXACTLY the frame at index 'idx' and LATCH.
-// Does not consider g_paused; pure render.
-static bool renderFrame(uint32_t idx) {
-  if (!fseqFile) return false;
-  if (frames == 0) return false;
-
-  idx %= frames;
-  const uint32_t offset = chanOffset + idx * bytesPerFrame;
-  if (!fseqFile.seek(offset, fs::SeekSet)) {
-    Serial.println("[FSEQ] seek fail"); return false;
-  }
-  const size_t n = fseqFile.read(frameBuf, bytesPerFrame);
-  if (n != bytesPerFrame) {
-    Serial.println("[FSEQ] short read"); return false;
-  }
-
-  // Determine arms per revolution in the file
-  const uint32_t armSize   = LED_COUNT * 3;            // bytes per logical arm
-  const uint32_t totalArms = bytesPerFrame / armSize;  // e.g. 40
-  if (totalArms == 0) return false;
-
-  // Choose four static source spokes 90° apart
-  const uint32_t quarter = totalArms / 4;
-  const uint32_t srcIdx[NUM_ARMS] = {
-    0, quarter % totalArms, (2*quarter) % totalArms, (3*quarter) % totalArms
-  };
-
-  // Paint each arm from the chosen source slice
-  for (int a = 0; a < NUM_ARMS; ++a) {
-    const uint32_t armOff = srcIdx[a] * armSize;
-    if (armOff + armSize > bytesPerFrame) continue;
-
-    for (uint32_t i = 0; i < LED_COUNT; ++i) {
-      const uint32_t p = armOff + i*3;
-      uint8_t R,G,B; mapChannels(&frameBuf[p], R,G,B);
-      uint32_t phys = mapIndexWithSplit(a, i);
-      strips[a]->setPixelColor(phys, R, G, B);
-    }
-  }
-  for (int a = 0; a < NUM_ARMS; ++a) strips[a]->show();
-  return true;
-}
-
-// Auto-advance scheduler: if playing and not paused, render next frame when due
-static void tickPlayer() {
-  if (!g_playing || g_paused) return;
-
-  const uint32_t now = millis();
-  if (now - g_lastTickMs < g_framePeriodMs) return;
-  g_lastTickMs = now;
-
-  if (!renderFrame(g_frameIndex)) { g_frameIndex = 0; return; }
-  g_frameIndex = (g_frameIndex + 1) % frames;
-}
-
-// ---------------- Web handlers ----------------
-static void handleStatus() {
-  String cur = g_currentPath.length() ? g_currentPath : "";
-  String json = String("{\"playing\":") + (g_playing ? "true":"false")
-              + ",\"paused\":" + (g_paused ? "true":"false")
-              + ",\"text\":\"" + statusText() + "\""
-              + ",\"path\":\"" + cur + "\""
-              + ",\"frame\":" + g_frameIndex
-              + ",\"fps\":" + g_fps + "}";
-  server.send(200, "application/json", json);
+static void handleStatus(){
+  String json = String("{\"playing\":")+(g_playing?"true":"false")
+    +",\"paused\":"+(g_paused?"true":"false")
+    +",\"path\":\""+htmlEscape(g_currentPath)+"\""
+    +",\"frame\":"+String(g_frameIndex)
+    +",\"fps\":"+String(g_fps)
+    +",\"startChArm1\":"+String(g_startChArm1)
+    +",\"spokes\":"+String(g_spokesTotal)
+    +",\"pitch\":"+String(g_pitchSpokes)
+    +",\"arm1off\":"+String(g_arm1LedOffset)
+    +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
+    +"}";
+  server.send(200,"application/json",json);
 }
 
 static void handleRoot() {
@@ -307,12 +700,13 @@ static void handleRoot() {
     "<title>POV Spinner</title>"
     "<style>"
     "body{font:16px system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
-    ".card{max-width:760px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px;box-shadow:0 1px 8px rgba(0,0,0,.2)}"
+    ".card{max-width:960px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px;box-shadow:0 1px 8px rgba(0,0,0,.2)}"
+    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
     "label{display:block;margin:.5rem 0 .2rem}select,input[type=range],input[type=number]{width:100%}"
     ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}"
     "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
     "button:hover{filter:brightness(1.1)}"
-    "input[type=file]{width:100%;padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+    "input[type=file],input[type=number]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
     ".muted{opacity:.75}"
     ".pill{display:inline-block;padding:.2rem .6rem;border-radius:999px;background:#0e1627;margin-left:.5rem}"
     ".sep{height:1px;background:#1b2741;margin:1rem 0}"
@@ -322,12 +716,15 @@ static void handleRoot() {
     ".badge.stop{background:#2a0e12;color:#f09aa6}"
     "</style></head><body>"
     "<div class='card'>"
-      "<h1 style='display:flex;align-items:center;gap:.4rem'>"
-        "POV Spinner"
-        "<span id='status' class='" + String(statusClass()) + "'>" + String(statusText()) + "</span>"
-        "<span id='which' class='pill'>" + cur + "</span>"
-      "</h1>"
-      "<p>AP SSID: <b>POV-Spinner</b> &middot; IP: <b>192.168.4.1</b> &middot; mDNS: <b>pov.local</b></p>"
+      "<div style='display:flex;justify-content:space-between;align-items:center'>"
+        "<h1 style='display:flex;align-items:center;gap:.4rem;margin:0'>"
+          "POV Spinner"
+          "<span id='status' class='" + String(statusClass()) + "'>" + String(statusText()) + "</span>"
+          "<span id='which' class='pill'>" + cur + "</span>"
+        "</h1>"
+        "<a href='/files?path=/'>Files</a>"
+      "</div>"
+      "<p class='muted'>AP SSID: <b>POV-Spinner</b> &middot; IP: <b>192.168.4.1</b> &middot; mDNS: <b>pov.local</b></p>"
 
       "<label>Choose .fseq file</label>"
       "<select id='sel'>" + options + "</select>"
@@ -338,11 +735,22 @@ static void handleRoot() {
       "</div>"
 
       "<div class='sep'></div>"
-      "<h3>Upload a new .fseq to SD</h3>"
+      "<h3>Spinner Layout</h3>"
+      "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
+        "<div><label>Start Channel (Arm 1)</label><input id='startch' type='number' min='1' value='" + String(g_startChArm1) + "'></div>"
+        "<div><label>Total Spokes</label><input id='spokes' type='number' min='4' value='" + String(g_spokesTotal) + "'></div>"
+        "<div><label>Pitch (spokes arm→arm)</label><input id='pitch' type='number' min='1' value='" + String(g_pitchSpokes) + "'></div>"
+        "<div><label>Arm 1 LED Offset</label><input id='arm1off' type='number' min='0' max='" + String(LED_COUNT) + "' value='" + String(g_arm1LedOffset) + "'></div>"
+        "<div><label>Stride</label><select id='stride'><option value='spoke' "+String(g_strideMode==STRIDE_SPOKE?"selected":"")+">SPOKE</option><option value='led' "+String(g_strideMode==STRIDE_LED?"selected":"")+">LED</option></select></div>"
+        "<div style='align-self:end'><button id='applymap'>Apply Layout</button></div>"
+      "</div>"
+
+      "<div class='sep'></div>"
+      "<h3>Upload a new .fseq to SD (root)</h3>"
       "<form id='u' method='POST' action='/upload' enctype='multipart/form-data'>"
         "<input type='file' name='f' accept='.fseq' required>"
-        "<div class='row'><button type='submit'>Upload</button></div>"
-        "<p class='muted'>Uploads go to the SD card root. Large files stream directly to SD.</p>"
+        "<div class='row'><button type='submit'>Upload to /</button></div>"
+        "<p class='muted'>Uploads here go to the SD card root. Use the Files page to upload into a specific folder.</p>"
       "</form>"
 
       "<div class='sep'></div>"
@@ -358,25 +766,12 @@ static void handleRoot() {
       "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
 
       "<div class='sep'></div>"
-      "<h3>Debug</h3>"
+      "<h3>Diagnostics</h3>"
       "<div class='row'>"
-        "<button id='pause'>Pause</button>"
-        "<button id='stepb'>Step −</button>"
-        "<button id='stepf'>Step +</button>"
-        "<button id='resume'>Resume</button>"
-        "<button onclick=\"post('/order?m='+prompt('Order RGB/RBG/GBR/GRB/BRG/BGR','RGB'))\">Color Order…</button>"
-      "</div>"
-      "<div class='row' style='margin-top:.5rem'>"
-        "<button onclick=\"post('/rev?a=0&on='+(prompt('Reverse arm 0? 0/1','1')||'1'))\">Toggle Arm0 Rev</button>"
-        "<button onclick=\"post('/rev?a=1&on='+(prompt('Reverse arm 1? 0/1','1')||'1'))\">Toggle Arm1 Rev</button>"
-        "<button onclick=\"post('/rev?a=2&on='+(prompt('Reverse arm 2? 0/1','1')||'1'))\">Toggle Arm2 Rev</button>"
-        "<button onclick=\"post('/rev?a=3&on='+(prompt('Reverse arm 3? 0/1','1')||'1'))\">Toggle Arm3 Rev</button>"
-      "</div>"
-      "<div class='row' style='margin-top:.5rem'>"
-        "<button onclick='setMap(0)'>Map Arm0</button>"
-        "<button onclick='setMap(1)'>Map Arm1</button>"
-        "<button onclick='setMap(2)'>Map Arm2</button>"
-        "<button onclick='setMap(3)'>Map Arm3</button>"
+        "<button id='hdr'>FSEQ Header</button>"
+        "<button id='cblocks'>Compression Blocks</button>"
+        "<button id='sdre'>SD Reinit</button>"
+        "<button id='stat'>Status JSON</button>"
       "</div>"
 
       "<div class='sep'></div>"
@@ -384,7 +779,6 @@ static void handleRoot() {
     "</div>"
 
     "<script>"
-    "const LEDS=" + String(LED_COUNT) + ";"
     "const fps=document.getElementById('fps'), fpsv=document.getElementById('fpsv');"
     "fps.oninput=()=>fpsv.textContent=fps.value;"
     "const r=document.getElementById('rng'),v=document.getElementById('v');"
@@ -394,130 +788,63 @@ static void handleRoot() {
     "document.getElementById('fps10').onclick=()=>post('/speed?fps=10');"
     "document.getElementById('fps40').onclick=()=>post('/speed?fps=40');"
     "document.getElementById('fps60').onclick=()=>post('/speed?fps=60');"
-
-    "document.getElementById('set').onclick=()=>post('/b?pct='+r.value);"
-    "document.getElementById('low').onclick=()=>post('/b?pct=10');"
-    "document.getElementById('med').onclick=()=>post('/b?pct=40');"
-    "document.getElementById('hi').onclick=()=>post('/b?pct=100');"
+    "document.getElementById('set').onclick=()=>post('/b?value='+r.value);"
+    "document.getElementById('low').onclick=()=>post('/b?value=10');"
+    "document.getElementById('med').onclick=()=>post('/b?value=40');"
+    "document.getElementById('hi').onclick=()=>post('/b?value=100');"
     "document.getElementById('start').onclick=()=>{const p=document.getElementById('sel').value;fetch('/start?path='+encodeURIComponent(p)).then(()=>location.reload());};"
     "document.getElementById('stop').onclick =()=>post('/stop');"
     "document.getElementById('refresh').onclick=()=>location.reload();"
-    "document.getElementById('pause').onclick =()=>post('/pause');"
-    "document.getElementById('resume').onclick=()=>post('/resume');"
-    "document.getElementById('stepf').onclick=()=>post('/step?dir=1');"
-    "document.getElementById('stepb').onclick=()=>post('/step?dir=-1');"
-
-    // Split mapper helper
-    "function setMap(a){"
-      "const s = prompt('Arm '+a+' split index (0..'+LEDS+')',''+(LEDS-16));"
-      "if (s===null) return;"
-      "const ra = prompt('Segment A reversed? 0/1','0');"
-      "if (ra===null) return;"
-      "const rb = prompt('Segment B reversed? 0/1','1');"
-      "if (rb===null) return;"
-      "fetch('/armmap?a='+a+'&split='+encodeURIComponent(s)+'&ra='+encodeURIComponent(ra)+'&rb='+encodeURIComponent(rb),{method:'POST'})"
-        ".then(()=>location.reload());"
-    "}"
-
-    // Live status + which sequence updater every 1s
-    "function upd(){fetch('/status').then(r=>r.json()).then(s=>{"
-      "const el=document.getElementById('status');"
-      "el.textContent=s.text;"
-      "el.className='badge '+(s.paused&&s.playing?'pause':(s.playing?'play':'stop'));"
-      "document.getElementById('which').textContent = s.path && s.path.length ? s.path : '(none)';"
-      "fps.value=s.fps; fpsv.textContent=s.fps;"
-    "});}"
-    "setInterval(upd,1000);"
+    "document.getElementById('applymap').onclick=()=>{"
+      "const sc=+document.getElementById('startch').value||1;"
+      "const sp=+document.getElementById('spokes').value||40;"
+      "const pt=+document.getElementById('pitch').value||10;"
+      "const of=+document.getElementById('arm1off').value||0;"
+      "const st=(document.getElementById('stride').value)||'spoke';"
+      "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&pitch='+pt+'&arm1off='+of+'&stride='+st,{method:'POST'})"
+      ".then(()=>location.reload());"
+    "};"
+    "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
+    "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
+    "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
+    "document.getElementById('stat').onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
     "</script>"
     "</body></html>";
 
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-static void handleSetBrightness() {
-  if (!server.hasArg("pct")) { server.send(400, "text/plain", "missing pct"); return; }
-  int pct = server.arg("pct").toInt();
-  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+static void applyBrightness(uint8_t pct){
+  if (pct>100) pct=100;
+  g_brightnessPercent=pct; g_brightness=(uint8_t)((255*pct)/100);
+  for (int a=0;a<NUM_ARMS;++a){ if (strips[a]){ strips[a]->setBrightness(g_brightness); strips[a]->show(); } }
+  prefs.putUChar("brightness", g_brightnessPercent); // persisted in NVS
+}
+
+static void handleB(){
+  int pct = -1;
+  if (server.hasArg("percent")) pct = server.arg("percent").toInt();
+  else if (server.hasArg("p"))  pct = server.arg("p").toInt();
+  else if (server.hasArg("v"))  pct = server.arg("v").toInt();
+  else if (server.hasArg("value")) pct = server.arg("value").toInt();
+
+  if (pct < 0) { server.send(400, "text/plain", "missing"); return; }
+  if (pct > 100) pct = 100;
   applyBrightness((uint8_t)pct);
   server.send(200, "application/json", String("{\"brightness\":") + pct + "}");
 }
 
-static void handleStart() {
-  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
-  String path = server.arg("path");
-  if (!path.startsWith("/")) path = "/" + path;
-  if (!SD_MMC.exists(path)) { server.send(404, "text/plain", "file not found"); return; }
-  if (!isFseqName(path))    { server.send(415, "text/plain", "unsupported (need .fseq)"); return; }
-  if (!openFseq(path)) { server.send(500, "text/plain", "open failed"); return; }
-  server.send(200, "application/json", String("{\"started\":\"") + path + "\"}");
-}
-
-static void handleStop() { stopPlayback(); server.send(200, "application/json", "{\"stopped\":true}"); }
-
-// --- Upload: data stream handler (called repeatedly during POST) ---
-static void handleUploadData() {
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    g_uploadBytes = 0;
-    g_uploadFilename = up.filename;
-    if (!g_uploadFilename.length()) g_uploadFilename = "upload.fseq";
-    int slash = g_uploadFilename.lastIndexOf('/');
-    if (slash >= 0) g_uploadFilename = g_uploadFilename.substring(slash + 1);
-    if (!g_uploadFilename.startsWith("/")) g_uploadFilename = "/" + g_uploadFilename;
-
-    if (!isFseqName(g_uploadFilename)) {
-      Serial.printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
-    } else {
-      if (SD_MMC.exists(g_uploadFilename)) SD_MMC.remove(g_uploadFilename);
-      g_uploadFile = SD_MMC.open(g_uploadFilename, FILE_WRITE);
-      Serial.printf("[UPLOAD] START %s\n", g_uploadFilename.c_str());
-    }
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_uploadFile) { g_uploadFile.write(up.buf, up.currentSize); g_uploadBytes += up.currentSize; }
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (g_uploadFile) { g_uploadFile.close(); Serial.printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes); }
-    else { Serial.println("[UPLOAD] Aborted/invalid file"); }
+static void handleStart(){ // GET /start?path=/file.fseq
+  if (server.hasArg("path")){
+    String p = server.arg("path"); if (!p.startsWith("/")) p="/"+p;
+    String why;
+    if (!openFseq(p, why)){ server.send(500,"text/plain",String("FSEQ open failed: ")+why); return; }
   }
+  g_playing=true; g_paused=false; g_lastTickMs=millis();
+  server.send(200,"application/json","{\"playing\":true}");
 }
+static void handleStop(){ g_playing=false; blackoutAll(); server.send(200,"application/json","{\"playing\":false}"); }
 
-// --- Upload: finalizer (called once after upload completes) ---
-static void handleUploadDone() {
-  if (!isFseqName(g_uploadFilename)) {
-    server.send(415, "text/html", "<meta http-equiv='refresh' content='2;url=/'><body style='font-family:system-ui'><p>Upload rejected. Only <b>.fseq</b> files are allowed.</p><p>Returning…</p></body>");
-    return;
-  }
-  if (!SD_MMC.exists(g_uploadFilename)) {
-    server.send(500, "text/html", "<meta http-equiv='refresh' content='3;url=/'><body style='font-family:system-ui'><p>Upload failed.</p><p>Returning…</p></body>");
-    return;
-  }
-  server.send(200, "text/html", "<meta http-equiv='refresh' content='1;url=/'><body style='font-family:system-ui'><p>Uploaded <b>" + g_uploadFilename + "</b> (" + String(g_uploadBytes) + " bytes).</p><p>Refreshing…</p></body>");
-}
-
-// --- Playback control: pause/resume/step/speed ---
-static void handlePause()  { g_paused = true;  server.send(200, "application/json", "{\"paused\":true}"); }
-static void handleResume() { g_paused = false; g_lastTickMs = millis(); server.send(200, "application/json", "{\"paused\":false}"); }
-
-// /step?dir=1  (forward)  or /step?dir=-1 (backward)
-static void handleStep() {
-  int dir = 1;
-  if (server.hasArg("dir")) dir = server.arg("dir").toInt();
-  if (frames == 0 || !fseqFile) { server.send(409, "application/json", "{\"ok\":false}"); return; }
-
-  g_paused = true; // step is meaningful in paused mode
-  if (dir >= 0) {
-    // Render the frame pointed by g_frameIndex, then advance
-    if (!renderFrame(g_frameIndex)) { server.send(500, "application/json", "{\"ok\":false}"); return; }
-    g_frameIndex = (g_frameIndex + 1) % frames;
-  } else {
-    // Render previous frame, then leave g_frameIndex pointing to the original "next"
-    uint32_t prev = (g_frameIndex + frames - 1) % frames;
-    if (!renderFrame(prev)) { server.send(500, "application/json", "{\"ok\":false}"); return; }
-    // Keep g_frameIndex unchanged, so another step+ shows the “current” again
-  }
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-// /speed?fps=NN
 static void handleSpeed() {
   if (!server.hasArg("fps")) { server.send(400, "text/plain", "missing fps"); return; }
   int val = server.arg("fps").toInt();
@@ -526,173 +853,143 @@ static void handleSpeed() {
   g_fps = (uint16_t)val;
   g_framePeriodMs = (uint32_t) (1000UL / g_fps);
   prefs.putUShort("fps", g_fps);
-  g_lastTickMs = millis(); // reset scheduler
+  g_lastTickMs = millis();
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
-// --- Reverse per arm /rev?a=0..3&on=0/1 ---
-static void handleReverseArm() {
-  if (!server.hasArg("a") || !server.hasArg("on")) { server.send(400, "text/plain", "args"); return; }
-  int a = server.arg("a").toInt(); int on = server.arg("on").toInt();
-  if (a < 0 || a >= NUM_ARMS) { server.send(400, "text/plain", "bad arm"); return; }
-  g_armReverse[a] = (on != 0);
-  server.send(200, "application/json", String("{\"arm\":") + a + ",\"reverse\":" + (g_armReverse[a]?"true":"false") + "}");
-}
-
-// --- Color order /order?m=RGB|RBG|GBR|GRB|BRG|BGR ---
-static void handleOrder() {
-  if (!server.hasArg("m")) { server.send(400, "text/plain", "missing m"); return; }
-  String m = server.arg("m"); m.toUpperCase();
-  if      (m=="RGB") g_colorMap = MAP_RGB;
-  else if (m=="RBG") g_colorMap = MAP_RBG;
-  else if (m=="GBR") g_colorMap = MAP_GBR;
-  else if (m=="GRB") g_colorMap = MAP_GRB;
-  else if (m=="BRG") g_colorMap = MAP_BRG;
-  else if (m=="BGR") g_colorMap = MAP_BGR;
-  else { server.send(400, "text/plain", "bad map"); return; }
-  server.send(200, "application/json", String("{\"order\":\"") + m + "\"}");
-}
-
-// --- Peek raw bytes for a given arm/index in CURRENT "next" frame ---
-static void handlePeek() {
-  if (!server.hasArg("arm") || !server.hasArg("i")) { server.send(400, "text/plain", "args"); return; }
-  int arm = server.arg("arm").toInt(); int i = server.arg("i").toInt();
-  if (arm < 0 || arm >= NUM_ARMS || i < 0 || i >= LED_COUNT) { server.send(400, "text/plain", "range"); return; }
-
-  const uint32_t armSize   = LED_COUNT * 3;
-  const uint32_t totalArms = bytesPerFrame / armSize;
-  if (!totalArms) { server.send(500, "text/plain", "totalArms=0"); return; }
-  const uint32_t quarter = totalArms / 4;
-  const uint32_t srcIdx[NUM_ARMS] = { 0, quarter % totalArms, (2*quarter)%totalArms, (3*quarter)%totalArms };
-
-  uint32_t armOff = srcIdx[arm] * armSize;
-  uint32_t p = armOff + (uint32_t)i * 3;
-
-  if (!fseqFile) { server.send(409, "text/plain", "no file"); return; }
-  const uint32_t idx = (g_frameIndex % frames);
-  const uint32_t offset = chanOffset + idx * bytesPerFrame + p;
-  if (!fseqFile.seek(offset, fs::SeekSet)) { server.send(500, "text/plain", "seek fail"); return; }
-
-  uint8_t raw[3] = {0,0,0};
-  size_t n = fseqFile.read(raw, 3);
-  if (n != 3) { server.send(500, "text/plain", "read fail"); return; }
-
-  uint8_t R,G,B; mapChannels(raw, R,G,B);
-  String json = String("{\"nextFrame\":") + idx +
-    ",\"arm\":" + arm + ",\"i\":" + i +
-    ",\"raw\":[" + raw[0] + "," + raw[1] + "," + raw[2] + "]," +
-    "\"mapped\":[" + R + "," + G + "," + B + "]," +
-    "\"reverse\":" + (g_armReverse[arm]?"true":"false") + "}";
-  server.send(200, "application/json", json);
-}
-
-// --- Split remap endpoints ---
-// GET /armmap?a=0  -> {split, ra, rb, armrev}
-static void handleGetArmMap() {
-  if (!server.hasArg("a")) { server.send(400, "text/plain", "need a"); return; }
-  int a = server.arg("a").toInt();
-  if (a < 0 || a >= NUM_ARMS) { server.send(400, "text/plain", "bad arm"); return; }
-
-  String json = String("{\"arm\":") + a +
-    ",\"split\":" + g_armSplit[a] +
-    ",\"ra\":" + (g_segRevA[a] ? "true" : "false") +
-    ",\"rb\":" + (g_segRevB[a] ? "true" : "false") +
-    ",\"armrev\":" + (g_armReverse[a] ? "true" : "false") +
-    "}";
-  server.send(200, "application/json", json);
-}
-
-// POST /armmap?a=0&split=130&ra=0&rb=1
-static void handleSetArmMap() {
-  if (!server.hasArg("a")) { server.send(400, "text/plain", "need a"); return; }
-  int a = server.arg("a").toInt();
-  if (a < 0 || a >= NUM_ARMS) { server.send(400, "text/plain", "bad arm"); return; }
-
-  if (server.hasArg("split")) {
-    int s = server.arg("split").toInt();
-    if (s < 0) s = 0; if (s > (int)LED_COUNT) s = LED_COUNT;
-    g_armSplit[a] = (uint16_t)s;
+// POST /mapcfg?start=1&spokes=40&pitch=10&arm1off=0&stride=spoke|led
+static void handleMapCfg(){
+  if (server.hasArg("start"))  { uint32_t v=strtoul(server.arg("start").c_str(),nullptr,10); g_startChArm1=(v<1)?1:v; prefs.putULong("startch", g_startChArm1); }
+  if (server.hasArg("spokes")) { int v=server.arg("spokes").toInt(); if (v<4) v=4; g_spokesTotal=(uint16_t)v; prefs.putUShort("spokes", g_spokesTotal); }
+  if (server.hasArg("pitch"))  { int v=server.arg("pitch").toInt(); if (v<1) v=1; g_pitchSpokes=(uint16_t)v; prefs.putUShort("pitch", g_pitchSpokes); }
+  if (server.hasArg("arm1off")){ g_arm1LedOffset = server.arg("arm1off").toInt(); g_arm1LedOffset = clampI32(g_arm1LedOffset,0,(int32_t)LED_COUNT); prefs.putShort("arm1off", g_arm1LedOffset); }
+  if (server.hasArg("stride")) {
+    String s = server.arg("stride"); s.toLowerCase();
+    g_strideMode = (s=="led") ? STRIDE_LED : STRIDE_SPOKE;
+    prefs.putUChar("stride", (uint8_t)g_strideMode);
   }
-  if (server.hasArg("ra")) g_segRevA[a] = (server.arg("ra").toInt() != 0);
-  if (server.hasArg("rb")) g_segRevB[a] = (server.arg("rb").toInt() != 0);
-
-  handleGetArmMap();
+  server.send(200,"application/json",
+    String("{\"start\":")+g_startChArm1+",\"spokes\":"+g_spokesTotal+",\"pitch\":"+g_pitchSpokes+
+    ",\"arm1off\":"+g_arm1LedOffset+",\"stride\":\""+(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"}");
 }
 
-static void handleNotFound() { server.send(404, "text/plain", "Not found"); }
+// Diagnostics
+static void handleFseqHeader(){
+  String j="{\"ok\":false}";
+  if (g_currentPath.length()) {
+    j = String("{\"ok\":true,\"path\":\"")+htmlEscape(g_currentPath)+"\",\"frames\":"+g_fh.frameCount+
+        ",\"channels\":"+g_fh.channelCount+",\"stepMs\":"+(int)g_fh.stepTimeMs+
+        ",\"comp\":"+(int)g_fh.compType+",\"blocks\":"+g_compCount+
+        ",\"sparse\":"+(int)g_fh.sparseCnt+",\"cdo\":"+g_fh.chanDataOffset+
+        ",\"perFrame\":"+(g_compPerFrame?"true":"false")+"}";
+  }
+  server.send(200,"application/json",j);
+}
 
-static void startWifiAP() {
+static void handleCBlocks(){
+  if (!g_compCount){ server.send(200,"application/json","{\"blocks\":0}"); return; }
+  uint32_t show = (g_compCount <= 12) ? g_compCount : 12;
+  String s = "{\"blocks\":"+String(g_compCount)+",\"items\":[";
+  for (uint32_t i=0;i<show;++i){
+    if (i) s+=",";
+    s+="{\"i\":"+String(i)+",\"u\":"+String(g_cblocks[i].uSize)+",\"c\":"+String(g_cblocks[i].cSize)+"}";
+  }
+  if (g_compCount>show) s+=",{\"more\":" + String(g_compCount-show) + "}";
+  s+="]}";
+  server.send(200,"application/json",s);
+}
+
+static void handleSdReinit(){
+  bool ok=false;
+  if (SD_MMC.cardType()!=CARD_NONE) ok=true;
+  else ok = mountSdmmc();
+  if (!ok) { server.send(500,"text/plain","SD not present"); return; }
+  if (!g_currentPath.length()) { server.send(200,"text/plain","SD OK; no file"); return; }
+  String why;
+  if (openFseq(g_currentPath, why)) server.send(200,"text/plain","SD OK; file reopened");
+  else server.send(500,"text/plain", String("reopen fail: ")+why);
+}
+
+/* -------------------- Server, Setup, Loop -------------------- */
+static void startWifiAP(){
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
-  bool ok = WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
-  Serial.printf("[AP] softAP %s (%s)\n", ok ? "started" : "FAILED", AP_SSID);
-  Serial.printf("[AP] IP: %s\n", WiFi.softAPIP().toString().c_str());
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
+  if (MDNS.begin("pov")) MDNS.addService("http","tcp",80);
 
-  if (MDNS.begin("pov")) { MDNS.addService("http", "tcp", 80); Serial.println("[mDNS] pov.local advertised"); }
-  else { Serial.println("[mDNS] start failed"); }
-
-  // Routes
+  // Control + status
   server.on("/",        HTTP_GET,  handleRoot);
+  server.on("/index.html", HTTP_GET, handleRoot);
   server.on("/status",  HTTP_GET,  handleStatus);
-  server.on("/b",       HTTP_POST, handleSetBrightness);
+
+  // Playback & settings
+  server.on("/b",       HTTP_POST, handleB);
   server.on("/start",   HTTP_GET,  handleStart);
   server.on("/stop",    HTTP_POST, handleStop);
+  server.on("/speed",   HTTP_POST, handleSpeed);
+  server.on("/mapcfg",  HTTP_POST, handleMapCfg);
+
+  // Diagnostics
+  server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
+  server.on("/fseq/cblocks",HTTP_GET,  handleCBlocks);
+  server.on("/sd/reinit",   HTTP_POST, handleSdReinit);
+
+  // Files
+  server.on("/files",   HTTP_GET,  handleFiles);
+  server.on("/dl",      HTTP_GET,  handleDownload);
+  server.on("/rm",      HTTP_GET,  handleDelete);
+  server.on("/mkdir",   HTTP_GET,  handleMkdir);
+  server.on("/ren",     HTTP_GET,  handleRename);
+
+  // Upload (works for both control & files pages)
   server.on("/upload",  HTTP_POST, handleUploadDone, handleUploadData);
 
-  // Playback control
-  server.on("/pause",   HTTP_POST, handlePause);
-  server.on("/resume",  HTTP_POST, handleResume);
-  server.on("/step",    HTTP_POST, handleStep);
-  server.on("/speed",   HTTP_POST, handleSpeed);
+  server.onNotFound([](){
+    server.send(404, "text/plain", String("404 Not Found: ") + server.uri());
+  });
 
-  // Debug routes
-  server.on("/rev",     HTTP_POST, handleReverseArm);
-  server.on("/order",   HTTP_POST, handleOrder);
-  server.on("/peek",    HTTP_GET,  handlePeek);
-
-  // Split remap routes
-  server.on("/armmap",  HTTP_GET,  handleGetArmMap);
-  server.on("/armmap",  HTTP_POST, handleSetArmMap);
-
-  server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("[HTTP] WebServer listening on :80");
 }
 
-// ---------------- setup ----------------
-void setup() {
+void setup(){
   Serial.begin(115200);
-  delay(1200);
-  Serial.println("\n[POV] FSEQ→APA102 (4 arms, static spokes @ 0/90/180/270)");
+  delay(800);
+  Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
 
   // Restore settings
   prefs.begin("display", false);
   g_brightnessPercent = prefs.getUChar("brightness", 25);
-  g_brightness        = (255 * g_brightnessPercent) / 100;
-  g_fps               = prefs.getUShort("fps", 40);
-  if (g_fps < 1) g_fps = 1; if (g_fps > 120) g_fps = 120;
+  g_brightness        = (uint8_t)((255 * g_brightnessPercent) / 100);
+  g_fps               = prefs.getUShort("fps", 40); if (!g_fps) g_fps=40;
   g_framePeriodMs     = 1000UL / g_fps;
+
+  g_startChArm1       = prefs.getULong("startch", 1);
+  g_spokesTotal       = prefs.getUShort("spokes", 40);
+  g_pitchSpokes       = prefs.getUShort("pitch", 10);
+  g_arm1LedOffset     = prefs.getShort("arm1off", 0);
+  g_strideMode        = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
 
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u pitch=%u arm1off=%d stride=%s\n",
+                (unsigned long)g_startChArm1, g_spokesTotal, g_pitchSpokes,
+                (int)g_arm1LedOffset, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
 
-  // Bring up AP early
   startWifiAP();
 
-  // SD card
   if (!cardPresent()) {
-    Serial.printf("[SD_MMC] Card-detect indicates no card on GPIO%d; continuing for UI/diag\n", PIN_SD_CD);
+    Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
   }
   if (!mountSdmmc()) {
-    Serial.println("[SD_MMC] Mount failed; UI still available for diagnostics");
+    Serial.println("[SD] Mount failed; UI still available for diagnostics.");
   } else {
     uint8_t type = SD_MMC.cardType();
-    Serial.printf("[SD_MMC] Type=%u  Size=%llu MB\n",
+    Serial.printf("[SD] Type=%u  Size=%llu MB\n",
                   (unsigned)type, (unsigned long long)(SD_MMC.cardSize() / (1024ULL*1024ULL)));
   }
 
-  // LEDs
   for (int a = 0; a < NUM_ARMS; ++a) {
     strips[a] = new Adafruit_DotStar(LED_COUNT, ARM_DATA[a], ARM_CLK[a], DOTSTAR_BGR);
     strips[a]->begin();
@@ -702,86 +999,37 @@ void setup() {
   blackoutAll();
 
   g_bootMs   = millis();
-  g_playing  = false; // wait for user; timeout will auto-play test2
+  g_playing  = false;
   g_currentPath = "";
   Serial.println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
 }
 
-// ---------------- main loop ----------------
-void loop() {
+void loop(){
   server.handleClient();
 
-  // Auto-timeout: if not playing within 5 min, start /test2.fseq
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
-    Serial.println("[TIMEOUT] No selection made; auto-starting /test2.fseq");
-    openFseq("/test2.fseq");
-  }
-
-  // Serial control shortcuts
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n'); cmd.trim();
-    if (!cmd.length()) { /* no-op */ }
-    else if (cmd[0] == 'B' || cmd[0] == 'b') {
-      int pct = cmd.substring(1).toInt();
-      if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-      applyBrightness((uint8_t)pct);
-    } else if (cmd.equalsIgnoreCase("STOP")) {
-      stopPlayback();
-    } else if (cmd.equalsIgnoreCase("PLAY")) {
-      if (!g_currentPath.length()) g_currentPath = "/test2.fseq";
-      openFseq(g_currentPath);
-    } else if (cmd.equalsIgnoreCase("PAUSE")) {
-      g_paused = true;  Serial.println("[DBG] paused");
-    } else if (cmd.equalsIgnoreCase("RESUME")) {
-      g_paused = false; g_lastTickMs = millis(); Serial.println("[DBG] resumed");
-    } else if (cmd.startsWith("STEP")) {
-      // STEP or STEP -1
-      int dir = 1; int tmp;
-      if (sscanf(cmd.c_str(), "STEP %d", &tmp) == 1) dir = tmp;
-      // mimic /step behavior
-      g_paused = true;
-      if (dir >= 0) { renderFrame(g_frameIndex); g_frameIndex = (g_frameIndex + 1) % frames; }
-      else { uint32_t prev = (g_frameIndex + frames - 1) % frames; renderFrame(prev); }
-      Serial.printf("[DBG] step dir=%d next=%lu\n", dir, (unsigned long)g_frameIndex);
-    } else if (cmd.startsWith("SPEED")) {
-      int val = 0; if (sscanf(cmd.c_str(), "SPEED %d", &val) == 1) {
-        if (val < 1) val = 1; if (val > 120) val = 120;
-        g_fps = (uint16_t)val; g_framePeriodMs = 1000UL / g_fps; prefs.putUShort("fps", g_fps);
-        g_lastTickMs = millis();
-        Serial.printf("[DBG] FPS=%u period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
-      } else {
-        Serial.println("Usage: SPEED <fps 1..120>");
-      }
-    } else if (cmd.startsWith("REV")) {
-      int a=-1,on=-1; sscanf(cmd.c_str(), "REV %d %d", &a, &on);
-      if (a>=0 && a<NUM_ARMS && (on==0 || on==1)) {
-        g_armReverse[a]=(on==1); Serial.printf("[DBG] arm %d reverse=%d\n", a,on);
-      }
-    } else if (cmd.startsWith("ORDER")) {
-      char m[4]={0}; sscanf(cmd.c_str(), "ORDER %3s", m);
-      String M = String(m); M.toUpperCase();
-      if      (M=="RGB") g_colorMap=MAP_RGB;
-      else if (M=="RBG") g_colorMap=MAP_RBG;
-      else if (M=="GBR") g_colorMap=MAP_GBR;
-      else if (M=="GRB") g_colorMap=MAP_GRB;
-      else if (M=="BRG") g_colorMap=MAP_BRG;
-      else if (M=="BGR") g_colorMap=MAP_BGR;
-      Serial.printf("[DBG] color order=%s\n", M.c_str());
-    } else if (cmd.startsWith("MAP")) {
-      // MAP <arm> <split> <ra> <rb>
-      int a=-1,s=-1,ra=-1,rb=-1;
-      if (sscanf(cmd.c_str(), "MAP %d %d %d %d", &a, &s, &ra, &rb)==4) {
-        if (a>=0 && a<NUM_ARMS) {
-          if (s<0) s=0; if (s>(int)LED_COUNT) s=LED_COUNT;
-          g_armSplit[a]=(uint16_t)s; g_segRevA[a]=(ra!=0); g_segRevB[a]=(rb!=0);
-          Serial.printf("[MAP] arm=%d split=%d ra=%d rb=%d\n", a, s, ra, rb);
-        }
-      } else {
-        Serial.println("Usage: MAP <arm> <split> <ra> <rb>");
-      }
+    String why; 
+    if (openFseq("/test2.fseq", why)) {
+      Serial.println("[TIMEOUT] Auto-start /test2.fseq");
+    } else {
+      Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str());
+      g_bootMs = millis(); // try again later
     }
   }
 
-  // Scheduler tick (auto-advance if playing and not paused)
-  tickPlayer();
+  if (!g_playing || g_paused) { delay(1); return; }
+
+  const uint32_t now = millis();
+  if (now - g_lastTickMs < g_framePeriodMs) return;
+  g_lastTickMs = now;
+
+  if (!renderFrame(g_frameIndex)) {
+    Serial.println("[PLAY] frame read failed — attempting SD reinit + reopen");
+    if (SD_MMC.cardType()==CARD_NONE) mountSdmmc();
+    if (g_currentPath.length()){
+      String why; openFseq(g_currentPath, why);
+    }
+    return;
+  }
+  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
 }
