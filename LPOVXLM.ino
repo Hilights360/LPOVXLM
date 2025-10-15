@@ -7,6 +7,7 @@
 #include <ESPmDNS.h>
 #include <stdlib.h>
 #include <string.h>
+//This was inserted for future use if there are skewing issues
 #include "QuadMap.h"
 
 #include "WebPages.h"
