@@ -39,7 +39,10 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 bool strideIsSpoke,
                 uint16_t fps,
-                uint8_t brightnessPercent);
+                uint8_t brightnessPercent,
+                const String &wifiStatusEscaped,
+                const String &wifiSsidEscaped,
+                bool wifiConfigured);
 
 }  // namespace WebPages
 

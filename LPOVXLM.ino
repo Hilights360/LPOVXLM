@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <stdlib.h>
 #include <string.h>
 #include "QuadMap.h"
@@ -53,6 +54,7 @@ static const int PIN_SD_CD  = 14;  // LOW = inserted
 // SD dynamic timing & fail tracking
 static uint32_t g_sdFreqKHz   = 8000;  // start conservative; raise after stable
 static int      g_sdFailStreak = 0;    // consecutive read failures
+static bool     g_sdMounted    = false;
 
 // Persistent scratch for zlib frames
 static uint8_t* s_ctmp = nullptr;
@@ -68,6 +70,16 @@ static const char* AP_SSID  = "POV-Spinner";
 static const char* AP_PASS  = "POV123456";
 static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
 WebServer server(80);
+
+static const char* WIFI_PREF_SSID = "wifi_ssid";
+static const char* WIFI_PREF_PASS = "wifi_pass";
+static const char* WIFI_SD_BACKUP = "/wifi.txt"; // optional SD backup (root)
+
+String     g_wifiSsid;
+String     g_wifiPass;
+IPAddress  g_wifiIp;
+bool       g_wifiConnected = false;
+uint32_t   g_wifiLastAttempt = 0;
 
 // ---------- Persisted settings (NVS = flash) ----------
 Preferences prefs;
@@ -116,6 +128,8 @@ static void handleMapCfg();
 static void handleFseqHeader();
 static void handleCBlocks();
 static void handleSdReinit();
+static void handleWifiSave();
+static void handleWifiForget();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -221,6 +235,7 @@ static bool mountSdmmc(){
     Serial.printf("[SD] Mounted (1b) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
   } while(0);
   SD_UNLOCK();
+  g_sdMounted = ok;
   return ok;
 }
 
@@ -395,6 +410,149 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
     case MAP_GRB: g=p[0]; r=p[1]; b=p[2]; break;
     case MAP_BRG: b=p[0]; r=p[1]; g=p[2]; break;
     case MAP_BGR: b=p[0]; g=p[1]; r=p[2]; break;
+  }
+}
+
+/* -------------------- OTA + Wi-Fi helpers -------------------- */
+static void showOtaIndicator(bool active) {
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (!strips[a]) continue;
+    uint16_t count = strips[a]->numPixels();
+    if (!count) continue;
+    strips[a]->setPixelColor(0, 0, active ? 255 : 0, 0);
+    strips[a]->show();
+  }
+}
+
+static void showOtaProgress(unsigned int progress, unsigned int total) {
+  if (!total) return;
+  uint32_t level = ((uint32_t)progress * 255UL) / (uint32_t)total;
+  if (level > 255UL) level = 255UL;
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (!strips[a]) continue;
+    strips[a]->setPixelColor(0, 0, (uint8_t)level, 0);
+    strips[a]->show();
+  }
+}
+
+static void loadWifiFromPrefs() {
+  g_wifiSsid = prefs.getString(WIFI_PREF_SSID, "");
+  g_wifiPass = prefs.getString(WIFI_PREF_PASS, "");
+}
+
+static void saveWifiCredentials(const String &ssid, const String &pass, bool mirrorToSd = true) {
+  g_wifiSsid = ssid;
+  g_wifiPass = pass;
+  prefs.putString(WIFI_PREF_SSID, g_wifiSsid);
+  prefs.putString(WIFI_PREF_PASS, g_wifiPass);
+  Serial.printf("[WIFI] Credentials saved for '%s'\n", g_wifiSsid.c_str());
+
+  if (mirrorToSd && g_sdMounted) {
+    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+      if (SD_MMC.exists(WIFI_SD_BACKUP)) SD_MMC.remove(WIFI_SD_BACKUP);
+      File f = SD_MMC.open(WIFI_SD_BACKUP, FILE_WRITE);
+      if (f) {
+        f.println(g_wifiSsid);
+        f.println(g_wifiPass);
+        f.close();
+        Serial.printf("[WIFI] Backup written to %s\n", WIFI_SD_BACKUP);
+      }
+      SD_UNLOCK();
+    }
+  }
+}
+
+static void forgetWifiCredentials() {
+  g_wifiSsid = "";
+  g_wifiPass = "";
+  prefs.remove(WIFI_PREF_SSID);
+  prefs.remove(WIFI_PREF_PASS);
+  if (g_sdMounted && SD_LOCK(pdMS_TO_TICKS(2000))) {
+    if (SD_MMC.exists(WIFI_SD_BACKUP)) SD_MMC.remove(WIFI_SD_BACKUP);
+    SD_UNLOCK();
+  }
+  WiFi.disconnect(false, true);
+  g_wifiConnected = false;
+  g_wifiIp = IPAddress();
+  g_wifiLastAttempt = 0;
+}
+
+static void attemptStationConnect(bool force = false) {
+  if (!g_wifiSsid.length()) return;
+
+  wl_status_t st = WiFi.status();
+  if (!force && st == WL_CONNECTED && WiFi.SSID() == g_wifiSsid) return;
+
+  Serial.printf("[WIFI] Connecting to '%s'\n", g_wifiSsid.c_str());
+  WiFi.disconnect(false, false);
+  delay(50);
+  g_wifiConnected = false;
+  g_wifiIp = IPAddress();
+  WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str());
+  g_wifiLastAttempt = millis();
+}
+
+static void maintainWifiStation() {
+  wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    if (!g_wifiConnected) {
+      g_wifiConnected = true;
+      g_wifiIp = WiFi.localIP();
+      Serial.printf("[WIFI] STA connected: %s (%s)\n", g_wifiSsid.c_str(), g_wifiIp.toString().c_str());
+    }
+  } else {
+    if (g_wifiConnected) {
+      g_wifiConnected = false;
+      g_wifiIp = IPAddress();
+      Serial.printf("[WIFI] STA disconnected (status=%d)\n", (int)status);
+    }
+    if (g_wifiSsid.length()) {
+      uint32_t now = millis();
+      if (now - g_wifiLastAttempt > 15000UL) {
+        attemptStationConnect(true);
+      }
+    }
+  }
+}
+
+static bool loadWifiFromSdBackup() {
+  if (!g_sdMounted) return false;
+  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+
+  File f = SD_MMC.open(WIFI_SD_BACKUP, FILE_READ);
+  if (!f) {
+    SD_UNLOCK();
+    return false;
+  }
+
+  String ssid = f.readStringUntil('\n'); ssid.trim();
+  String pass = f.readStringUntil('\n'); pass.trim();
+  f.close();
+  SD_UNLOCK();
+
+  if (!ssid.length()) return false;
+
+  saveWifiCredentials(ssid, pass, false);
+  Serial.printf("[WIFI] Loaded credentials from SD backup for SSID '%s'\n", ssid.c_str());
+  return true;
+}
+
+static String wifiStatusText() {
+  if (g_wifiConnected) {
+    return String("Connected to ") + g_wifiSsid + " (" + g_wifiIp.toString() + ")";
+  }
+  if (!g_wifiSsid.length()) return "Not configured";
+
+  wl_status_t st = WiFi.status();
+  switch (st) {
+    case WL_IDLE_STATUS:      return String("Connecting to ") + g_wifiSsid + "…";
+    case WL_NO_SSID_AVAIL:    return "SSID not found";
+    case WL_CONNECT_FAILED:   return "Authentication failed";
+    case WL_CONNECTION_LOST:  return "Connection lost";
+    case WL_DISCONNECTED:     return "Disconnected";
+    default:                  return "Connecting";
   }
 }
 
@@ -714,11 +872,15 @@ static void handleRoot() {
   String cur = g_currentPath.length() ? g_currentPath : "(none)";
   String curEsc = htmlEscape(cur);
   String apIp = AP_IP.toString();
+  String wifiStatusEsc = htmlEscape(wifiStatusText());
+  String wifiSsidEsc = htmlEscape(g_wifiSsid);
+  bool wifiConfigured = g_wifiSsid.length();
   String html = WebPages::rootPage(String(statusClass()), String(statusText()), curEsc, options,
                                    String(AP_SSID), apIp, String("pov.local"),
                                    g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent);
+                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
+                                   wifiStatusEsc, wifiSsidEsc, wifiConfigured);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -857,6 +1019,24 @@ static void handleSdReinit(){
   else server.send(500,"text/plain", String("reopen fail: ")+why);
 }
 
+static void handleWifiSave() {
+  if (!server.hasArg("ssid")) { server.send(400, "text/plain", "missing ssid"); return; }
+  String ssid = server.arg("ssid"); ssid.trim();
+  String pass = server.hasArg("pass") ? server.arg("pass") : "";
+  pass.trim();
+
+  if (!ssid.length()) { server.send(400, "text/plain", "ssid required"); return; }
+
+  saveWifiCredentials(ssid, pass);
+  attemptStationConnect(true);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleWifiForget() {
+  forgetWifiCredentials();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
   Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d\n",
@@ -882,6 +1062,7 @@ static bool recoverSd(const char* reason) {
 
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
   SD_MMC.end();
+  g_sdMounted = false;
   pinMode(PIN_SD_CLK, OUTPUT); digitalWrite(PIN_SD_CLK, LOW); delay(5);
   pinMode(PIN_SD_CLK, INPUT);
   SD_UNLOCK();
@@ -905,11 +1086,43 @@ static bool recoverSd(const char* reason) {
 
 /* -------------------- Server, Setup, Loop -------------------- */
 static void startWifiAP(){
-  WiFi.mode(WIFI_AP);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
   WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
   WiFi.setSleep(false); // keep AP awake during SD I/O
+  WiFi.setHostname("pov-spinner");
+
+  if (g_wifiSsid.length()) {
+    attemptStationConnect(true);
+  } else {
+    WiFi.disconnect(false, false);
+  }
+
   if (MDNS.begin("pov")) MDNS.addService("http","tcp",80);
+
+  ArduinoOTA.setHostname("pov-spinner");
+  ArduinoOTA.onStart([](){
+    Serial.println("[OTA] Begin");
+    g_playing = false;
+    g_paused = false;
+    blackoutAll();
+    showOtaIndicator(true);
+  });
+  ArduinoOTA.onEnd([](){
+    Serial.println("[OTA] End");
+    blackoutAll();
+    showOtaIndicator(false);
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total){
+    showOtaProgress(progress, total);
+  });
+  ArduinoOTA.onError([](ota_error_t error){
+    Serial.printf("[OTA] Error %u\n", (unsigned)error);
+    blackoutAll();
+    showOtaIndicator(false);
+  });
+  ArduinoOTA.begin();
 
   // Control + status
   server.on("/",        HTTP_GET,  handleRoot);
@@ -923,6 +1136,8 @@ static void startWifiAP(){
   server.on("/stop",    HTTP_POST, handleStop);
   server.on("/speed",   HTTP_POST, handleSpeed);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
+  server.on("/wifi",    HTTP_POST, handleWifiSave);
+  server.on("/wifi/forget", HTTP_POST, handleWifiForget);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -957,6 +1172,7 @@ void setup(){
 
   // Restore settings
   prefs.begin("display", false);
+  loadWifiFromPrefs();
   g_brightnessPercent = prefs.getUChar("brightness", 25);
   g_brightness        = (uint8_t)((255 * g_brightnessPercent) / 100);
   g_fps               = prefs.getUShort("fps", 40); if (!g_fps) g_fps=40;
@@ -991,6 +1207,9 @@ void setup(){
       SD_UNLOCK();
       Serial.printf("[SD] Type=%u  Size=%llu MB\n", (unsigned)type, (unsigned long long)sizeMB);
     }
+    if (!g_wifiSsid.length() && loadWifiFromSdBackup()) {
+      attemptStationConnect(true);
+    }
   }
 
   rebuildStrips();
@@ -1003,7 +1222,9 @@ void setup(){
 }
 
 void loop(){
+  ArduinoOTA.handle();
   server.handleClient();
+  maintainWifiStation();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;

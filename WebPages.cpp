@@ -92,9 +92,13 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 bool strideIsSpoke,
                 uint16_t fps,
-                uint8_t brightnessPercent) {
+                uint8_t brightnessPercent,
+                const String &wifiStatusEscaped,
+                const String &wifiSsidEscaped,
+                bool wifiConfigured) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
+  const char *forgetDisabled = wifiConfigured ? "" : " disabled";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -108,6 +112,7 @@ String rootPage(const String &statusClass,
       ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}"
       "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
       "button:hover{filter:brightness(1.1)}"
+      "button:disabled{opacity:.4;cursor:not-allowed}"
       "input[type=file],input[type=number]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
       ".muted{opacity:.75}"
       ".pill{display:inline-block;padding:.2rem .6rem;border-radius:999px;background:#0e1627;margin-left:.5rem}"
@@ -162,6 +167,14 @@ String rootPage(const String &statusClass,
       "<input id='rng' type='range' min='0' max='100' value='" + String(brightnessPercent) + "'>"
       "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
       "<div class='sep'></div>"
+      "<h3>Wi-Fi Station</h3>"
+      "<p class='muted'>Status: <b>" + wifiStatusEscaped + "</b></p>"
+      "<form id='wifiform'>"
+      "<label>SSID</label><input id='wifi-ssid' name='ssid' type='text' value='" + wifiSsidEscaped + "'>"
+      "<label>Password</label><input id='wifi-pass' name='pass' type='password' placeholder='Enter password'>"
+      "<div class='row'><button type='submit'>Save Wi-Fi</button><button type='button' id='forgetwifi'" + String(forgetDisabled) + ">Forget</button></div>"
+      "</form>"
+      "<div class='sep'></div>"
       "<h3>Diagnostics</h3>"
       "<div class='row'>"
       "<button id='hdr'>FSEQ Header</button>"
@@ -198,6 +211,10 @@ String rootPage(const String &statusClass,
       "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
       "};"
+      "const wf=document.getElementById('wifiform');"
+      "if(wf){wf.addEventListener('submit',e=>{e.preventDefault();const fd=new FormData(wf);fetch('/wifi',{method:'POST',body:new URLSearchParams(fd)}).then(()=>location.reload());});}"
+      "const forget=document.getElementById('forgetwifi');"
+      "if(forget){forget.onclick=()=>{if(forget.disabled)return;if(confirm('Forget stored Wi-Fi credentials?'))fetch('/wifi/forget',{method:'POST'}).then(()=>location.reload());};}"
       "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
