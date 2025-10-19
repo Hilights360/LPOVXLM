@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <stdlib.h>
 #include <string.h>
 #include "QuadMap.h"
@@ -63,11 +64,21 @@ static int START_SPOKE_1BASED = 1;
 static SpokeLabelMode gLabelMode = FLOOR_TO_BOUNDARY; // used for logging
 static const int SPOKES = 40;
 
-// ---------- Wi-Fi AP ----------
-static const char* AP_SSID  = "POV-Spinner";
-static const char* AP_PASS  = "POV123456";
+// ---------- Wi-Fi + OTA ----------
+static const char* AP_SSID       = "POV-Spinner";
+static const char* AP_PASS       = "POV123456";
 static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
+static const char* STA_SD_PATH   = "/wifi.txt";
+static const char* OTA_HOSTNAME  = "pov-spinner";
+static const char* OTA_SERVICE   = "green-oids";
 WebServer server(80);
+
+String   g_staSsid;
+String   g_staPass;
+String   g_staStatus = "Not configured";
+String   g_staIp      = "—";
+bool     g_staConnected = false;
+bool     g_staCredsFromSd = false;
 
 // ---------- Persisted settings (NVS = flash) ----------
 Preferences prefs;
@@ -116,6 +127,11 @@ static void handleMapCfg();
 static void handleFseqHeader();
 static void handleCBlocks();
 static void handleSdReinit();
+static void handleWifi();
+
+static void startNetworking();
+static bool attemptStationConnect(uint32_t timeoutMs = 15000);
+static bool loadWifiCredsFromSd();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -198,6 +214,102 @@ static String joinPath(const String& dir, const String& name){
   int slash = base.lastIndexOf('/');
   if (slash >= 0) base = base.substring(slash+1);
   return (d == "/") ? ("/" + base) : (d + "/" + base);
+}
+
+static bool loadWifiCredsFromSd(){
+  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  File f = SD_MMC.open(STA_SD_PATH, FILE_READ);
+  if (!f) {
+    SD_UNLOCK();
+    return false;
+  }
+  String content = f.readString();
+  f.close();
+  SD_UNLOCK();
+
+  content.replace('\r', '\n');
+  String ssidLine;
+  String passLine;
+  int idx = 0;
+  while (idx <= content.length()) {
+    int end = content.indexOf('\n', idx);
+    if (end < 0) end = content.length();
+    String line = content.substring(idx, end);
+    line.trim();
+    if (line.length()) {
+      int eq = line.indexOf('=');
+      String key = (eq >= 0) ? line.substring(0, eq) : String();
+      String value = (eq >= 0) ? line.substring(eq + 1) : line;
+      key.trim(); value.trim();
+      if (!key.length() && !ssidLine.length()) {
+        ssidLine = value;
+      } else if (!key.length() && !passLine.length() && ssidLine.length()) {
+        passLine = value;
+      } else if (key.equalsIgnoreCase("ssid")) {
+        ssidLine = value;
+      } else if (key.equalsIgnoreCase("pass") || key.equalsIgnoreCase("pwd") || key.equalsIgnoreCase("password")) {
+        passLine = value;
+      }
+    }
+    idx = end + 1;
+    if (idx >= content.length()) break;
+  }
+
+  ssidLine.trim();
+  passLine.trim();
+  if (!ssidLine.length()) {
+    return false;
+  }
+
+  g_staSsid = ssidLine;
+  g_staPass = passLine;
+  g_staCredsFromSd = true;
+  prefs.putString("sta_ssid", g_staSsid);
+  prefs.putString("sta_pass", g_staPass);
+  Serial.printf("[WIFI] Loaded STA credentials from %s\n", STA_SD_PATH);
+  return true;
+}
+
+static bool attemptStationConnect(uint32_t timeoutMs){
+  if (!g_staSsid.length()) {
+    g_staConnected = false;
+    g_staStatus = "Not configured";
+    g_staIp = "—";
+    return false;
+  }
+
+  Serial.printf("[WIFI] Connecting to '%s'...\n", g_staSsid.c_str());
+  g_staStatus = "Connecting";
+  g_staConnected = false;
+  g_staIp = "—";
+  WiFi.disconnect(false, false);
+  WiFi.setHostname(OTA_HOSTNAME);
+  if (g_staPass.length()) {
+    WiFi.begin(g_staSsid.c_str(), g_staPass.c_str());
+  } else {
+    WiFi.begin(g_staSsid.c_str());
+  }
+
+  uint32_t start = millis();
+  wl_status_t status;
+  while ((status = WiFi.status()) != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(200);
+  }
+
+  if (status == WL_CONNECTED) {
+    g_staConnected = true;
+    g_staStatus = "Connected";
+    g_staIp = WiFi.localIP().toString();
+    Serial.printf("[WIFI] STA connected, IP=%s\n", g_staIp.c_str());
+    return true;
+  }
+
+  g_staConnected = false;
+  g_staIp = "—";
+  g_staStatus = String("Failed (status=") + (int)status + ")";
+  Serial.printf("[WIFI] STA connection failed (status=%d)\n", (int)status);
+  WiFi.disconnect(false, false);
+  return false;
 }
 
 /* -------------------- SD helpers (strict 1-bit + mutex) -------------------- */
@@ -705,6 +817,12 @@ static void handleStatus(){
     +",\"pixels\":"+String(g_pixelsPerArm)
     +",\"index\":"+String(g_indexPosition)
     +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
+    +",\"staSsid\":\""+htmlEscape(g_staSsid)+"\""
+    +",\"staStatus\":\""+htmlEscape(g_staStatus)+"\""
+    +",\"staIp\":\""+htmlEscape(g_staIp)+"\""
+    +",\"staConnected\":"+(g_staConnected?"true":"false")
+    +",\"staFromSd\":"+(g_staCredsFromSd?"true":"false")
+    +",\"staHasPassword\":"+(g_staPass.length()?"true":"false")
     +"}";
   server.send(200,"application/json",json);
 }
@@ -714,11 +832,17 @@ static void handleRoot() {
   String cur = g_currentPath.length() ? g_currentPath : "(none)";
   String curEsc = htmlEscape(cur);
   String apIp = AP_IP.toString();
+  String staSsidEsc = htmlEscape(g_staSsid);
+  String staStatusEsc = htmlEscape(g_staStatus);
+  String staIpEsc = htmlEscape(g_staIp);
   String html = WebPages::rootPage(String(statusClass()), String(statusText()), curEsc, options,
                                    String(AP_SSID), apIp, String("pov.local"),
                                    g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent);
+                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
+                                   staSsidEsc, staStatusEsc, staIpEsc,
+                                   g_staConnected, g_staCredsFromSd,
+                                   g_staPass.length() > 0);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -857,6 +981,72 @@ static void handleSdReinit(){
   else server.send(500,"text/plain", String("reopen fail: ")+why);
 }
 
+static void handleWifi(){
+  if (server.hasArg("forget")) {
+    g_staSsid = "";
+    g_staPass = "";
+    g_staConnected = false;
+    g_staCredsFromSd = false;
+    g_staIp = "—";
+    g_staStatus = "Not configured";
+    prefs.putString("sta_ssid", "");
+    prefs.putString("sta_pass", "");
+    WiFi.disconnect(false, false);
+    attemptStationConnect();
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "");
+    return;
+  }
+
+  if (!server.hasArg("ssid")) {
+    server.send(400, "text/plain", "missing ssid");
+    return;
+  }
+
+  String ssid = server.arg("ssid");
+  String pass = server.hasArg("pass") ? server.arg("pass") : String();
+  ssid.trim();
+  pass.trim();
+
+  String prevSsid = g_staSsid;
+  String prevPass = g_staPass;
+  bool open = server.hasArg("open");
+  bool sameSsid = (ssid == prevSsid);
+
+  if (!ssid.length()) {
+    pass = "";
+  } else if (open) {
+    pass = "";
+  } else if (!pass.length()) {
+    if (sameSsid && prevPass.length()) {
+      pass = prevPass;
+    } else if (sameSsid && !prevPass.length()) {
+      pass = "";
+    } else {
+      server.send(400, "text/plain", "password required or mark open");
+      return;
+    }
+  }
+
+  g_staSsid = ssid;
+  g_staPass = pass;
+  g_staCredsFromSd = false;
+
+  prefs.putString("sta_ssid", g_staSsid);
+  prefs.putString("sta_pass", g_staPass);
+
+  if (g_staSsid.length()) {
+    attemptStationConnect();
+  } else {
+    g_staConnected = false;
+    g_staStatus = "Not configured";
+    g_staIp = "—";
+  }
+
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "");
+}
+
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
   Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d\n",
@@ -904,12 +1094,30 @@ static bool recoverSd(const char* reason) {
 }
 
 /* -------------------- Server, Setup, Loop -------------------- */
-static void startWifiAP(){
-  WiFi.mode(WIFI_AP);
+static void startNetworking(){
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
   WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
   WiFi.setSleep(false); // keep AP awake during SD I/O
-  if (MDNS.begin("pov")) MDNS.addService("http","tcp",80);
+  WiFi.setHostname(OTA_HOSTNAME);
+
+  if (MDNS.begin("pov")) {
+    MDNS.addService("http","tcp",80);
+  }
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setMdnsService(OTA_SERVICE, "tcp", 3232);
+  ArduinoOTA.onStart([](){ Serial.println("[OTA] Start"); });
+  ArduinoOTA.onEnd([](){ Serial.println("\n[OTA] End"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total){
+    if (total) {
+      Serial.printf("[OTA] Progress: %u%%\r", (progress * 100U) / total);
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error){
+    Serial.printf("[OTA] Error[%u]\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();
 
   // Control + status
   server.on("/",        HTTP_GET,  handleRoot);
@@ -939,9 +1147,16 @@ static void startWifiAP(){
   // Upload
   server.on("/upload",  HTTP_POST, handleUploadDone, handleUploadData);
 
+  // Wi-Fi configuration
+  server.on("/wifi",    HTTP_POST, handleWifi);
+
   server.onNotFound([](){ server.send(404, "text/plain", String("404 Not Found: ") + server.uri()); });
   server.begin();
   Serial.println("[HTTP] WebServer listening on :80");
+
+  if (g_staSsid.length()) {
+    attemptStationConnect();
+  }
 }
 
 void setup(){
@@ -968,6 +1183,13 @@ void setup(){
   g_pixelsPerArm      = clampPixelsPerArm(prefs.getUShort("pixels", DEFAULT_PIXELS_PER_ARM));
   g_strideMode        = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
 
+  g_staSsid           = prefs.getString("sta_ssid", "");
+  g_staPass           = prefs.getString("sta_pass", "");
+  g_staConnected      = false;
+  g_staCredsFromSd    = false;
+  g_staIp             = "—";
+  g_staStatus         = g_staSsid.length() ? "Stored" : "Not configured";
+
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u stride=%s\n",
@@ -977,7 +1199,7 @@ void setup(){
   // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
-  startWifiAP();
+  startNetworking();
 
   if (!cardPresent()) {
     Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
@@ -991,6 +1213,9 @@ void setup(){
       SD_UNLOCK();
       Serial.printf("[SD] Type=%u  Size=%llu MB\n", (unsigned)type, (unsigned long long)sizeMB);
     }
+    if (!g_staSsid.length() && loadWifiCredsFromSd()) {
+      attemptStationConnect();
+    }
   }
 
   rebuildStrips();
@@ -1003,6 +1228,7 @@ void setup(){
 }
 
 void loop(){
+  ArduinoOTA.handle();
   server.handleClient();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {

@@ -92,9 +92,22 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 bool strideIsSpoke,
                 uint16_t fps,
-                uint8_t brightnessPercent) {
+                uint8_t brightnessPercent,
+                const String &staSsid,
+                const String &staStatus,
+                const String &staIp,
+                bool staConnected,
+                bool staFromSd,
+                bool staHasPassword) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
+  bool haveCreds = staSsid.length();
+  bool statusFailed = (!staConnected && haveCreds && staStatus.startsWith("Failed"));
+  String wifiBadgeClass = String("badge ") + (staConnected ? "wifi-ok" : (statusFailed ? "wifi-fail" : "wifi-idle"));
+  String sdBadgeHtml = staFromSd ? String(" <span class='badge sd'>SD backup</span>") : String();
+  String staSsidDisplay = staSsid.length() ? (String("<b>") + staSsid + "</b>") : String("<span class='muted'>(none)</span>");
+  String staStatusBadge = String("<span class='") + wifiBadgeClass + "'>" + staStatus + "</span>" + sdBadgeHtml;
+  const char *openChecked = staHasPassword ? "" : "checked";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -116,6 +129,10 @@ String rootPage(const String &statusClass,
       ".badge.play{background:#0e2a19;color:#9af0b7}"
       ".badge.pause{background:#2a1f0e;color:#f0d49a}"
       ".badge.stop{background:#2a0e12;color:#f09aa6}"
+      ".badge.wifi-ok{background:#0e2a19;color:#9af0b7}"
+      ".badge.wifi-fail{background:#2a0e12;color:#f09aa6}"
+      ".badge.wifi-idle{background:#1c2b4a;color:#a7c3ff}"
+      ".badge.sd{background:#2a1f0e;color:#f0d49a}"
       "</style></head><body>"
       "<div class='card'>"
       "<div style='display:flex;justify-content:space-between;align-items:center'>"
@@ -134,6 +151,16 @@ String rootPage(const String &statusClass,
       "<button id='stop'>Stop</button>"
       "<button id='refresh'>Refresh</button>"
       "</div>"
+      "<div class='sep'></div>"
+      "<h3>Wi-Fi Station Access</h3>"
+      "<p class='muted'>Status: " + staStatusBadge + " &middot; SSID: " + staSsidDisplay + " &middot; Station IP: <b>" + staIp + "</b></p>"
+      "<form id='wf' method='POST' action='/wifi'>"
+      "<label>Station SSID</label><input name='ssid' type='text' value='" + staSsid + "' placeholder='Network name'>"
+      "<label>Password</label><input name='pass' type='password' placeholder='Leave blank to keep saved password'>"
+      "<label style='display:flex;align-items:center;gap:.4rem'><input type='checkbox' name='open' id='wfopen' " + String(openChecked) + ">Open network (no password)</label>"
+      "<div class='row'><button type='submit'>Save &amp; Connect</button><button type='button' id='forgetwifi'>Forget</button></div>"
+      "<p class='muted'>Credentials are stored in flash; if absent, they will be loaded from <b>/wifi.txt</b> on the SD card.</p>"
+      "</form>"
       "<div class='sep'></div>"
       "<h3>Spinner Layout</h3>"
       "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
@@ -198,6 +225,11 @@ String rootPage(const String &statusClass,
       "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
       "};"
+      "const wfopen=document.getElementById('wfopen');"
+      "const wfpass=document.querySelector('form#wf input[name=\\'pass\\']');"
+      "if(wfopen&&wfpass){wfopen.onchange=()=>{if(wfopen.checked) wfpass.value='';};wfpass.addEventListener('input',()=>{if(wfpass.value.length) wfopen.checked=false;});}"
+      "const fw=document.getElementById('forgetwifi');"
+      "if(fw){fw.onclick=()=>{fetch('/wifi?forget=1',{method:'POST'}).then(()=>location.reload());};}"
       "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
