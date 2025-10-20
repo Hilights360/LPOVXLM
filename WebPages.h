@@ -52,7 +52,8 @@ String rootPage(const String &statusClass,
                 bool playing,
                 bool paused,
                 bool autoplayEnabled,
-                bool hallDiagEnabled);
+                bool hallDiagEnabled,
+                bool watchdogEnabled);
 
 }  // namespace WebPages
 
