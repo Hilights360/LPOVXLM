@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
+#include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -37,6 +38,16 @@ static inline void SD_UNLOCK() { if (g_sdMutex) xSemaphoreGive(g_sdMutex); }
 static const uint8_t  MAX_ARMS               = 4;
 static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
+
+// ---------- Hall effect + status pixel ----------
+static const int      PIN_HALL_SENSOR        = 5;
+static const int      PIN_STATUS_PIXEL       = 48;
+static const uint32_t HALL_BLINK_DURATION_MS = 100;
+
+static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800);
+static bool              g_hallPrevActive   = false;
+static bool              g_hallBlinkActive  = false;
+static uint32_t          g_hallBlinkStartMs = 0;
 
 // Latest arm pin map (CLK and DATA per arm)
 static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
@@ -117,6 +128,26 @@ uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
+
+/* -------------------- Hall effect handling -------------------- */
+static void updateHallSensor() {
+  const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
+
+  if (hallActive && !g_hallPrevActive) {
+    g_hallBlinkActive = true;
+    g_hallBlinkStartMs = millis();
+    g_statusPixel.setPixelColor(0, g_statusPixel.Color(255, 255, 255));
+    g_statusPixel.show();
+  }
+
+  g_hallPrevActive = hallActive;
+
+  if (g_hallBlinkActive && (millis() - g_hallBlinkStartMs >= HALL_BLINK_DURATION_MS)) {
+    g_statusPixel.setPixelColor(0, 0);
+    g_statusPixel.show();
+    g_hallBlinkActive = false;
+  }
+}
 
 /* -------------------- Prototypes for all web handlers -------------------- */
 static void handleFiles();
@@ -1440,6 +1471,12 @@ void setup(){
   Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
+  pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
+  g_statusPixel.begin();
+  g_statusPixel.setBrightness(64);
+  g_statusPixel.clear();
+  g_statusPixel.show();
+
   // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
@@ -1538,6 +1575,7 @@ void setup(){
 void loop(){
   pollWifiStation();
   server.handleClient();
+  updateHallSensor();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
