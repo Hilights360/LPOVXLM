@@ -1,3 +1,4 @@
+#include "ConfigTypes.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <Adafruit_DotStar.h>
@@ -38,8 +39,8 @@ static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
 // Latest arm pin map (CLK and DATA per arm)
-static const int ARM_CLK[MAX_ARMS]  = { 48, 35, 38,  2 };
-static const int ARM_DATA[MAX_ARMS] = { 45, 36, 39, 42 };
+static const int ARM_CLK[MAX_ARMS]  = { 48, 2, 38, 35 };
+static const int ARM_DATA[MAX_ARMS] = { 45, 42, 39, 36 };
 
 
 // ---------- SD-MMC pins (your new map) ----------
@@ -173,32 +174,6 @@ static bool isFseqName(const String& n) {
   String ext = n.substring(dot + 1); ext.toLowerCase();
   return ext == "fseq";
 }
-
-struct PrefPresence {
-  bool brightness=false;
-  bool fps=false;
-  bool startCh=false;
-  bool spokes=false;
-  bool arms=false;
-  bool pixels=false;
-  bool stride=false;
-  bool staSsid=false;
-  bool staPass=false;
-  bool station=false;
-};
-
-struct SettingsData {
-  bool hasBrightness=false; uint8_t brightness=0;
-  bool hasFps=false;        uint16_t fps=0;
-  bool hasStartCh=false;    uint32_t startCh=0;
-  bool hasSpokes=false;     uint16_t spokes=0;
-  bool hasArms=false;       uint8_t arms=0;
-  bool hasPixels=false;     uint16_t pixels=0;
-  bool hasStride=false;     uint8_t stride=0;
-  bool hasStaSsid=false;    String staSsid;
-  bool hasStaPass=false;    String staPass;
-  bool hasStation=false;    String stationId;
-};
 
 static String defaultStationId() {
   char buf[16];
