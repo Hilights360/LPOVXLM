@@ -111,6 +111,7 @@ uint8_t  g_brightnessPercent = 25;
 uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
+bool     g_autoplayEnabled   = true;
 
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
@@ -188,6 +189,7 @@ static void handleRoot();
 static void handleB();
 static void handleStart();
 static void handleStop();
+static void handlePause();
 static void handleHallDiag();
 static void handleSpeed();
 static void handleMapCfg();
@@ -196,6 +198,7 @@ static void handleFseqHeader();
 static void handleCBlocks();
 static void handleSdReinit();
 static void handleSdConfig();
+static void handleAutoplay();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -295,6 +298,7 @@ static bool saveSettingsBackupLocked() {
   f.print("station=");    f.println(g_stationId);
   f.print("sdmode=");     f.println((unsigned int)g_sdPreferredBusWidth);
   f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
+  f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
   f.close();
   return true;
 }
@@ -322,6 +326,7 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "station") { out.hasStation = true; out.stationId = value; }
     else if (key == "sdmode") { out.hasSdMode = true; out.sdMode = (uint8_t)clampU32(value.toInt(),0,4); }
     else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
+    else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
   }
   f.close();
   return true;
@@ -383,6 +388,10 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   if ((!present.station || !g_stationId.length()) && data.hasStation) {
     g_stationId = data.stationId;
     prefs.putString("station", g_stationId);
+  }
+  if (!present.autoplay && data.hasAutoplay) {
+    g_autoplayEnabled = data.autoplay;
+    prefs.putBool("autoplay", g_autoplayEnabled);
   }
   if (!present.sdMode && data.hasSdMode) {
     g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
@@ -1084,6 +1093,7 @@ static void handleStatus(){
   json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
   json += "}";
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
+  json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1107,7 +1117,7 @@ static void handleRoot() {
                                    g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
-                                   g_playing, g_hallDiagEnabled);
+                                   g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1141,9 +1151,64 @@ static void handleStart(){ // GET /start?path=/file.fseq
     if (!openFseq(p, why)){ server.send(500,"text/plain",String("FSEQ open failed: ")+why); return; }
   }
   g_playing=true; g_paused=false; g_lastTickMs=millis();
+  g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
 }
-static void handleStop(){ g_playing=false; blackoutAll(); server.send(200,"application/json","{\"playing\":false}"); }
+static void handleStop(){
+  g_playing=false;
+  g_paused=false;
+  g_bootMs = millis();
+  blackoutAll();
+  server.send(200,"application/json","{\"playing\":false}");
+}
+
+static bool parseBoolArg(const String& v) {
+  String s = v; s.toLowerCase();
+  return (s == "1" || s == "true" || s == "yes" || s == "on");
+}
+
+static void handlePause(){
+  bool toggle = true;
+  bool wantPause = !g_paused;
+  if (server.hasArg("pause")) {
+    wantPause = parseBoolArg(server.arg("pause"));
+    toggle = false;
+  } else if (server.hasArg("resume")) {
+    wantPause = !parseBoolArg(server.arg("resume"));
+    toggle = false;
+  } else if (server.hasArg("enable")) {
+    wantPause = parseBoolArg(server.arg("enable"));
+    toggle = false;
+  } else if (server.hasArg("disable")) {
+    wantPause = !parseBoolArg(server.arg("disable"));
+    toggle = false;
+  }
+
+  if (!toggle && wantPause && !g_playing) {
+    g_paused = false;
+    server.send(409, "application/json", "{\"error\":\"not playing\"}");
+    return;
+  }
+
+  if (toggle && !g_playing) {
+    server.send(409, "application/json", "{\"error\":\"not playing\"}");
+    return;
+  }
+
+  if (!toggle) {
+    g_paused = wantPause && g_playing;
+  } else {
+    g_paused = !g_paused && g_playing;
+  }
+
+  if (!g_paused) {
+    g_lastTickMs = millis();
+  }
+
+  server.send(200,"application/json",
+              String("{\"paused\":") + (g_paused ? "true" : "false") +
+              ",\"playing\":" + (g_playing ? "true" : "false") + "}");
+}
 
 static void handleHallDiag(){
   if (!server.hasArg("enable")) {
@@ -1297,6 +1362,22 @@ static void handleWifiCfg(){
   }
 
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleAutoplay(){
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    return;
+  }
+
+  bool enable = parseBoolArg(server.arg("enable"));
+  g_autoplayEnabled = enable;
+  prefs.putBool("autoplay", g_autoplayEnabled);
+  persistSettingsToSd();
+  g_bootMs = millis();
+
+  server.send(200, "application/json",
+              String("{\"autoplay\":") + (g_autoplayEnabled ? "true" : "false") + "}");
 }
 
 // Diagnostics
@@ -1501,10 +1582,12 @@ static void startWifiAP(){
   server.on("/b",       HTTP_POST, handleB);
   server.on("/start",   HTTP_GET,  handleStart);
   server.on("/stop",    HTTP_POST, handleStop);
+  server.on("/pause",   HTTP_POST, handlePause);
   server.on("/halldiag", HTTP_POST, handleHallDiag);
   server.on("/speed",   HTTP_POST, handleSpeed);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
+  server.on("/autoplay",HTTP_POST, handleAutoplay);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -1570,6 +1653,8 @@ void setup(){
   g_staPass = prefs.getString("sta_pass", "");
   present.station = prefs.isKey("station");
   g_stationId = prefs.getString("station", "");
+  present.autoplay = prefs.isKey("autoplay");
+  g_autoplayEnabled = prefs.getBool("autoplay", true);
 
   bool card = cardPresent();
   if (!card) {
@@ -1639,7 +1724,7 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
-  if (!g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  if (g_autoplayEnabled && !g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     if (openFseq("/test2.fseq", why)) {
       Serial.println("[TIMEOUT] Auto-start /test2.fseq");

@@ -17,6 +17,7 @@ struct PrefPresence {
   bool station=false;
   bool sdMode=false;
   bool sdFreq=false;
+  bool autoplay=false;
 };
 
 struct SettingsData {
@@ -32,4 +33,5 @@ struct SettingsData {
   bool hasStation=false;    String   stationId;
   bool hasSdMode=false;     uint8_t  sdMode=0;
   bool hasSdFreq=false;     uint32_t sdFreq=0;
+  bool hasAutoplay=false;   bool     autoplay=false;
 };
