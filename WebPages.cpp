@@ -84,6 +84,11 @@ String rootPage(const String &statusClass,
                 const String &apSsid,
                 const String &apIp,
                 const String &mdnsName,
+                const String &staSsid,
+                const String &staStatus,
+                const String &staIp,
+                const String &stationId,
+                const String &staPass,
                 uint32_t startChannel,
                 uint16_t spokes,
                 uint8_t arms,
@@ -95,6 +100,8 @@ String rootPage(const String &statusClass,
                 uint8_t brightnessPercent) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
+  String wifiStatus = "Status: <b>" + staStatus + "</b>";
+  if (staIp.length()) wifiStatus += " &middot; IP: <b>" + staIp + "</b>";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -162,6 +169,18 @@ String rootPage(const String &statusClass,
       "<input id='rng' type='range' min='0' max='100' value='" + String(brightnessPercent) + "'>"
       "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
       "<div class='sep'></div>"
+      "<h3>Wi-Fi Station</h3>"
+      "<p class='muted'>" + wifiStatus + "</p>"
+      "<label>Station SSID</label><input id='sta-ssid' type='text' value='" + staSsid + "'>"
+      "<label>Station Password</label><input id='sta-pass' type='password' value='" + staPass + "'>"
+      "<label>Station ID</label><input id='sta-id' type='text' value='" + stationId + "'>"
+      "<div class='row'><button id='savewifi'>Save Wi-Fi</button></div>"
+      "<div class='sep'></div>"
+      "<h3>Firmware Update</h3>"
+      "<p class='muted'>Provide the SD card path to a firmware .bin file and the spinner will update and reboot.</p>"
+      "<div class='row'><input id='ota-path' type='text' placeholder='/firmware.bin' style='flex:1' value=''>"
+      "<button id='applyota'>Apply Update</button></div>"
+      "<div class='sep'></div>"
       "<h3>Diagnostics</h3>"
       "<div class='row'>"
       "<button id='hdr'>FSEQ Header</button>"
@@ -197,6 +216,16 @@ String rootPage(const String &statusClass,
       "const st=(document.getElementById('stride').value)||'spoke';"
       "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
+      "};"
+      "document.getElementById('savewifi').onclick=()=>{"
+      "const body='ssid='+encodeURIComponent(document.getElementById('sta-ssid').value)"
+      "+'&pass='+encodeURIComponent(document.getElementById('sta-pass').value)"
+      "+'&id='+encodeURIComponent(document.getElementById('sta-id').value);"
+      "fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}).then(r=>{if(r.ok){alert('Wi-Fi settings saved. Reconnect may take a few seconds.');}else{r.text().then(t=>alert('Wi-Fi save failed: '+t));}});"
+      "};"
+      "document.getElementById('applyota').onclick=()=>{"
+      "const path=document.getElementById('ota-path').value||'/firmware.bin';"
+      "fetch('/ota?path='+encodeURIComponent(path),{method:'POST'}).then(r=>{if(r.ok){alert('Update started. Device will reboot when complete.');}else{r.text().then(t=>alert('OTA failed: '+t));}});"
       "};"
       "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"

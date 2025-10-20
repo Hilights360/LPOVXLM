@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <Update.h>
 #include <stdlib.h>
 #include <string.h>
 #include "QuadMap.h"
@@ -63,10 +64,24 @@ static int START_SPOKE_1BASED = 1;
 static SpokeLabelMode gLabelMode = FLOOR_TO_BOUNDARY; // used for logging
 static const int SPOKES = 40;
 
-// ---------- Wi-Fi AP ----------
+// ---------- Wi-Fi AP / STA ----------
 static const char* AP_SSID  = "POV-Spinner";
 static const char* AP_PASS  = "POV123456";
 static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
+static const char* DEFAULT_STATION_ID = "pov-spinner";
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+static const uint32_t WIFI_RETRY_DELAY_MS     = 5000;
+
+String     g_wifiSsid;
+String     g_wifiPass;
+String     g_stationId = DEFAULT_STATION_ID;
+bool       g_stationConnected = false;
+IPAddress  g_stationIp;
+bool       g_stationConnectPending = false;
+bool       g_stationReconnectScheduled = false;
+uint32_t   g_stationConnectStartMs = 0;
+uint32_t   g_stationReconnectAtMs  = 0;
+
 WebServer server(80);
 
 // ---------- Persisted settings (NVS = flash) ----------
@@ -75,6 +90,21 @@ uint8_t  g_brightnessPercent = 25;
 uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
+
+struct PrefMissingFlags {
+  bool brightness = false;
+  bool fps = false;
+  bool startCh = false;
+  bool spokes = false;
+  bool arms = false;
+  bool pixels = false;
+  bool stride = false;
+  bool wifiSsid = false;
+  bool wifiPass = false;
+  bool stationId = false;
+};
+
+PrefMissingFlags g_missing;
 
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
@@ -116,6 +146,8 @@ static void handleMapCfg();
 static void handleFseqHeader();
 static void handleCBlocks();
 static void handleSdReinit();
+static void handleWifiConfig();
+static void handleOtaApply();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -184,6 +216,42 @@ static String urlEncode(const String& in){
   }
   return s;
 }
+static int fromHex(char c){ if(c>='0'&&c<='9') return c-'0'; if(c>='A'&&c<='F') return 10+c-'A'; if(c>='a'&&c<='f') return 10+c-'a'; return -1; }
+static String urlDecode(const String& in){
+  String s; s.reserve(in.length());
+  for (size_t i=0;i<in.length();++i){
+    char c=in[i];
+    if(c=='%'){
+      if(i+2<in.length()){
+        int hi=fromHex(in[i+1]);
+        int lo=fromHex(in[i+2]);
+        if(hi>=0&&lo>=0){ s+=(char)((hi<<4)|lo); i+=2; continue; }
+      }
+      s+=c;
+    } else if(c=='+'){
+      s+=' ';
+    } else {
+      s+=c;
+    }
+  }
+  return s;
+}
+static String jsonEscape(const String& in){
+  String out; out.reserve(in.length()+8);
+  for(size_t i=0;i<in.length();++i){
+    char c=in[i];
+    if(c=='"') out+="\\\"";
+    else if(c=='\\') out+="\\\\";
+    else if((uint8_t)c<0x20){
+      char buf[7];
+      snprintf(buf,sizeof(buf),"\\u%04X", (unsigned)(uint8_t)c);
+      out+=buf;
+    } else {
+      out+=c;
+    }
+  }
+  return out;
+}
 static String dirnameOf(const String& path){
   if(path=="/") return "/";
   int slash = path.lastIndexOf('/');
@@ -198,6 +266,300 @@ static String joinPath(const String& dir, const String& name){
   int slash = base.lastIndexOf('/');
   if (slash >= 0) base = base.substring(slash+1);
   return (d == "/") ? ("/" + base) : (d + "/" + base);
+}
+
+/* -------------------- Settings backup helpers -------------------- */
+static const char* SETTINGS_DIR        = "/config";
+static const char* SETTINGS_PATH       = "/config/settings.cfg";
+static const char* SETTINGS_TMP_PATH   = "/config/settings.tmp";
+
+struct SettingsBackupData {
+  bool hasBrightness = false; uint8_t brightness = 25;
+  bool hasFps = false;        uint16_t fps = 40;
+  bool hasStartCh = false;    uint32_t startCh = 1;
+  bool hasSpokes = false;     uint16_t spokes = 40;
+  bool hasArms = false;       uint8_t arms = MAX_ARMS;
+  bool hasPixels = false;     uint16_t pixels = DEFAULT_PIXELS_PER_ARM;
+  bool hasStride = false;     uint8_t stride = (uint8_t)STRIDE_SPOKE;
+  bool hasWifiSsid = false;   String wifiSsid;
+  bool hasWifiPass = false;   String wifiPass;
+  bool hasStationId = false;  String stationId;
+};
+
+static SettingsBackupData currentSettingsForBackup(){
+  SettingsBackupData data;
+  data.hasBrightness = true; data.brightness = g_brightnessPercent;
+  data.hasFps = true;        data.fps = g_fps;
+  data.hasStartCh = true;    data.startCh = g_startChArm1;
+  data.hasSpokes = true;     data.spokes = g_spokesTotal;
+  data.hasArms = true;       data.arms = g_armCount;
+  data.hasPixels = true;     data.pixels = g_pixelsPerArm;
+  data.hasStride = true;     data.stride = (uint8_t)g_strideMode;
+  data.hasWifiSsid = true;   data.wifiSsid = g_wifiSsid;
+  data.hasWifiPass = true;   data.wifiPass = g_wifiPass;
+  data.hasStationId = true;  data.stationId = g_stationId;
+  return data;
+}
+
+static bool ensureSettingsDirLocked(){
+  if (!SD_MMC.exists(SETTINGS_DIR)) {
+    if (!SD_MMC.mkdir(SETTINGS_DIR)) {
+      Serial.printf("[SETTINGS] mkdir %s failed\n", SETTINGS_DIR);
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool saveSettingsBackup(){
+  if (!g_sdMutex) return false;
+  if (!cardPresent()) return false;
+  SettingsBackupData data = currentSettingsForBackup();
+  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  bool ok = false;
+  do {
+    if (!ensureSettingsDirLocked()) break;
+    if (SD_MMC.exists(SETTINGS_TMP_PATH)) SD_MMC.remove(SETTINGS_TMP_PATH);
+    File f = SD_MMC.open(SETTINGS_TMP_PATH, FILE_WRITE);
+    if (!f) { Serial.println("[SETTINGS] open tmp fail"); break; }
+    f.print("version=1\n");
+    f.printf("brightness=%u\n", (unsigned)data.brightness);
+    f.printf("fps=%u\n", (unsigned)data.fps);
+    f.printf("startCh=%lu\n", (unsigned long)data.startCh);
+    f.printf("spokes=%u\n", (unsigned)data.spokes);
+    f.printf("arms=%u\n", (unsigned)data.arms);
+    f.printf("pixels=%u\n", (unsigned)data.pixels);
+    f.printf("stride=%u\n", (unsigned)data.stride);
+    f.print("wifiSsid=" + urlEncode(data.wifiSsid) + "\n");
+    f.print("wifiPass=" + urlEncode(data.wifiPass) + "\n");
+    f.print("stationId=" + urlEncode(data.stationId) + "\n");
+    f.close();
+    if (SD_MMC.exists(SETTINGS_PATH)) SD_MMC.remove(SETTINGS_PATH);
+    if (!SD_MMC.rename(SETTINGS_TMP_PATH, SETTINGS_PATH)) {
+      Serial.println("[SETTINGS] rename tmp->cfg fail");
+      break;
+    }
+    ok = true;
+  } while(false);
+  if (!ok && SD_MMC.exists(SETTINGS_TMP_PATH)) SD_MMC.remove(SETTINGS_TMP_PATH);
+  SD_UNLOCK();
+  return ok;
+}
+
+static bool loadSettingsBackup(SettingsBackupData& out){
+  if (!g_sdMutex) return false;
+  if (!cardPresent()) return false;
+  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  bool ok = false;
+  do {
+    if (!SD_MMC.exists(SETTINGS_PATH)) break;
+    File f = SD_MMC.open(SETTINGS_PATH, FILE_READ);
+    if (!f) { Serial.println("[SETTINGS] open cfg fail"); break; }
+    while (f.available()) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (!line.length() || line[0]=='#') continue;
+      int eq = line.indexOf('=');
+      if (eq < 0) continue;
+      String key = line.substring(0, eq);
+      String val = line.substring(eq+1);
+      if (key == "brightness") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 0) v = 0; if (v > 100) v = 100;
+        out.brightness = (uint8_t)v; out.hasBrightness = true;
+      } else if (key == "fps") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 1) v = 1; if (v > 120) v = 120;
+        out.fps = (uint16_t)v; out.hasFps = true;
+      } else if (key == "startCh") {
+        unsigned long v = strtoul(val.c_str(), nullptr, 10);
+        if (v < 1) v = 1;
+        out.startCh = v; out.hasStartCh = true;
+      } else if (key == "spokes") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 1) v = 1;
+        out.spokes = (uint16_t)v; out.hasSpokes = true;
+      } else if (key == "arms") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 1) v = 1; if (v > MAX_ARMS) v = MAX_ARMS;
+        out.arms = (uint8_t)v; out.hasArms = true;
+      } else if (key == "pixels") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 1) v = 1; if (v > MAX_PIXELS_PER_ARM) v = MAX_PIXELS_PER_ARM;
+        out.pixels = (uint16_t)v; out.hasPixels = true;
+      } else if (key == "stride") {
+        long v = strtol(val.c_str(), nullptr, 10);
+        if (v < 0) v = 0; if (v > 1) v = 1;
+        out.stride = (uint8_t)v; out.hasStride = true;
+      } else if (key == "wifiSsid") {
+        out.wifiSsid = urlDecode(val); out.hasWifiSsid = true;
+      } else if (key == "wifiPass") {
+        out.wifiPass = urlDecode(val); out.hasWifiPass = true;
+      } else if (key == "stationId") {
+        out.stationId = urlDecode(val); out.hasStationId = true;
+      }
+    }
+    f.close();
+    ok = true;
+  } while(false);
+  SD_UNLOCK();
+  return ok;
+}
+
+static void computeDerivedSettings(){
+  g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
+  if (!g_fps) g_fps = 1;
+  g_framePeriodMs = 1000UL / g_fps;
+}
+
+static bool anyMissingPrefs(){
+  return g_missing.brightness || g_missing.fps || g_missing.startCh ||
+         g_missing.spokes || g_missing.arms || g_missing.pixels ||
+         g_missing.stride || g_missing.wifiSsid || g_missing.wifiPass ||
+         g_missing.stationId;
+}
+
+static void restoreSettingsFromBackupIfNeeded(){
+  if (!anyMissingPrefs()) return;
+  SettingsBackupData data;
+  if (!loadSettingsBackup(data)) return;
+  bool updated = false;
+  if (g_missing.brightness && data.hasBrightness) {
+    g_brightnessPercent = data.brightness;
+    prefs.putUChar("brightness", g_brightnessPercent);
+    g_missing.brightness = false;
+    updated = true;
+  }
+  if (g_missing.fps && data.hasFps) {
+    g_fps = data.fps;
+    prefs.putUShort("fps", g_fps);
+    g_missing.fps = false;
+    updated = true;
+  }
+  if (g_missing.startCh && data.hasStartCh) {
+    g_startChArm1 = data.startCh;
+    prefs.putULong("startch", g_startChArm1);
+    g_missing.startCh = false;
+    updated = true;
+  }
+  if (g_missing.spokes && data.hasSpokes) {
+    g_spokesTotal = data.spokes;
+    prefs.putUShort("spokes", g_spokesTotal);
+    g_missing.spokes = false;
+    updated = true;
+  }
+  if (g_missing.arms && data.hasArms) {
+    g_armCount = data.arms;
+    prefs.putUChar("arms", g_armCount);
+    g_missing.arms = false;
+    updated = true;
+  }
+  if (g_missing.pixels && data.hasPixels) {
+    g_pixelsPerArm = data.pixels;
+    prefs.putUShort("pixels", g_pixelsPerArm);
+    g_missing.pixels = false;
+    updated = true;
+  }
+  if (g_missing.stride && data.hasStride) {
+    g_strideMode = (StrideMode)data.stride;
+    prefs.putUChar("stride", (uint8_t)g_strideMode);
+    g_missing.stride = false;
+    updated = true;
+  }
+  if (g_missing.wifiSsid && data.hasWifiSsid) {
+    g_wifiSsid = data.wifiSsid;
+    prefs.putString("wssid", g_wifiSsid);
+    g_missing.wifiSsid = false;
+    updated = true;
+  }
+  if (g_missing.wifiPass && data.hasWifiPass) {
+    g_wifiPass = data.wifiPass;
+    prefs.putString("wpass", g_wifiPass);
+    g_missing.wifiPass = false;
+    updated = true;
+  }
+  if (g_missing.stationId && data.hasStationId) {
+    g_stationId = data.stationId.length() ? data.stationId : DEFAULT_STATION_ID;
+    prefs.putString("wsid", g_stationId);
+    g_missing.stationId = false;
+    updated = true;
+  }
+  if (updated) {
+    computeDerivedSettings();
+    saveSettingsBackup();
+  }
+}
+
+static void updateHostname(){
+  String host = g_stationId.length() ? g_stationId : String(DEFAULT_STATION_ID);
+  g_stationId = host;
+  WiFi.setHostname(host.c_str());
+}
+
+static void startStationConnection(){
+  if (!g_wifiSsid.length()) {
+    WiFi.disconnect(false);
+    g_stationConnected = false;
+    g_stationConnectPending = false;
+    return;
+  }
+  Serial.printf("[WIFI] Connecting to STA SSID '%s'\n", g_wifiSsid.c_str());
+  updateHostname();
+  WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str());
+  g_stationConnectPending = true;
+  g_stationConnectStartMs = millis();
+}
+
+static void scheduleStationReconnect(uint32_t delayMs){
+  g_stationReconnectScheduled = true;
+  g_stationReconnectAtMs = millis() + delayMs;
+  g_stationConnectPending = false;
+}
+
+static void manageWifiStation(){
+  if (!g_wifiSsid.length()) {
+    g_stationConnected = false;
+    g_stationConnectPending = false;
+    g_stationReconnectScheduled = false;
+    g_stationIp = IPAddress();
+    return;
+  }
+
+  wl_status_t st = WiFi.status();
+  if (g_stationConnectPending) {
+    if (st == WL_CONNECTED) {
+      g_stationConnected = true;
+      g_stationConnectPending = false;
+      g_stationIp = WiFi.localIP();
+      Serial.printf("[WIFI] STA connected, IP=%s\n", g_stationIp.toString().c_str());
+    } else if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) {
+      Serial.println("[WIFI] STA connect failed");
+      WiFi.disconnect(false);
+      g_stationConnectPending = false;
+      g_stationConnected = false;
+      g_stationIp = IPAddress();
+      scheduleStationReconnect(WIFI_RETRY_DELAY_MS);
+    } else if (millis() - g_stationConnectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("[WIFI] STA connect timeout");
+      WiFi.disconnect(false);
+      g_stationConnectPending = false;
+      g_stationConnected = false;
+      g_stationIp = IPAddress();
+      scheduleStationReconnect(WIFI_RETRY_DELAY_MS);
+    }
+  } else {
+    if (g_stationConnected) {
+      if (st != WL_CONNECTED) {
+        Serial.println("[WIFI] STA lost connection");
+        g_stationConnected = false;
+        g_stationIp = IPAddress();
+        scheduleStationReconnect(WIFI_RETRY_DELAY_MS);
+      }
+    } else if (g_stationReconnectScheduled && millis() >= g_stationReconnectAtMs) {
+      g_stationReconnectScheduled = false;
+      startStationConnection();
+    }
+  }
 }
 
 /* -------------------- SD helpers (strict 1-bit + mutex) -------------------- */
@@ -694,9 +1056,10 @@ static inline const char* statusText() { if (g_paused && g_playing) return "Paus
 static inline const char* statusClass(){ if (g_paused && g_playing) return "badge pause"; if (g_playing) return "badge play"; return "badge stop"; }
 
 static void handleStatus(){
+  String staIpJson = g_stationConnected ? g_stationIp.toString() : String("");
   String json = String("{\"playing\":")+(g_playing?"true":"false")
     +",\"paused\":"+(g_paused?"true":"false")
-    +",\"path\":\""+htmlEscape(g_currentPath)+"\""
+    +",\"path\":\""+jsonEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
     +",\"fps\":"+String(g_fps)
     +",\"startChArm1\":"+String(g_startChArm1)
@@ -705,8 +1068,110 @@ static void handleStatus(){
     +",\"pixels\":"+String(g_pixelsPerArm)
     +",\"index\":"+String(g_indexPosition)
     +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
+    +",\"wifiStaSsid\":\""+jsonEscape(g_wifiSsid)+"\""
+    +",\"wifiStaConnected\":"+(g_stationConnected?"true":"false")
+    +",\"wifiStaIp\":\""+ jsonEscape(staIpJson) +"\""
+    +",\"stationId\":\""+jsonEscape(g_stationId)+"\""
     +"}";
   server.send(200,"application/json",json);
+}
+
+static void handleWifiConfig(){
+  String ssid = server.hasArg("ssid") ? server.arg("ssid") : "";
+  String pass = server.hasArg("pass") ? server.arg("pass") : "";
+  String sid  = server.hasArg("id")   ? server.arg("id")   : "";
+
+  ssid.trim();
+  sid.trim();
+  if (ssid.length() > 63) ssid = ssid.substring(0, 63);
+  if (sid.length() > 31)  sid  = sid.substring(0, 31);
+
+  g_wifiSsid = ssid;
+  g_wifiPass = pass;
+  g_stationId = sid.length() ? sid : String(DEFAULT_STATION_ID);
+
+  prefs.putString("wssid", g_wifiSsid);
+  prefs.putString("wpass", g_wifiPass);
+  prefs.putString("wsid", g_stationId);
+  saveSettingsBackup();
+
+  g_stationConnected = false;
+  g_stationIp = IPAddress();
+  g_stationReconnectScheduled = false;
+  g_stationConnectPending = false;
+
+  updateHostname();
+  MDNS.end();
+  if (MDNS.begin(g_stationId.c_str())) MDNS.addService("http","tcp",80);
+
+  if (g_wifiSsid.length()) {
+    startStationConnection();
+  } else {
+    WiFi.disconnect(false);
+  }
+
+  server.send(200, "application/json", "{\"wifi\":\"saved\"}");
+}
+
+static void handleOtaApply(){
+  if (!server.hasArg("path")) {
+    server.send(400, "text/plain", "missing path");
+    return;
+  }
+  String path = server.arg("path");
+  if (!path.startsWith("/")) path = "/" + path;
+  if (!cardPresent()) {
+    server.send(503, "text/plain", "sd missing");
+    return;
+  }
+
+  String message;
+  bool ok = false;
+  File f;
+  if (!SD_LOCK(pdMS_TO_TICKS(5000))) {
+    server.send(503, "text/plain", "sd busy");
+    return;
+  }
+  do {
+    if (!SD_MMC.exists(path)) { message = "file not found"; break; }
+    f = SD_MMC.open(path, FILE_READ);
+    if (!f) { message = "open fail"; break; }
+    size_t size = f.size();
+    if (!size) { message = "empty file"; break; }
+    Serial.printf("[OTA] Applying update from %s (%u bytes)\n", path.c_str(), (unsigned)size);
+    if (!Update.begin(size)) {
+      message = String("begin fail ") + Update.getError();
+      break;
+    }
+    size_t written = Update.writeStream(f);
+    if (written != size) {
+      message = String("write mismatch ") + written;
+      Update.abort();
+      break;
+    }
+    if (!Update.end()) {
+      message = String("end fail ") + Update.getError();
+      break;
+    }
+    if (!Update.isFinished()) {
+      message = "incomplete";
+      break;
+    }
+    ok = true;
+  } while(false);
+  if (f) f.close();
+  SD_UNLOCK();
+
+  if (!ok) {
+    Serial.printf("[OTA] Failed: %s\n", message.c_str());
+    server.send(500, "text/plain", String("OTA failed: ") + message);
+    return;
+  }
+
+  server.send(200, "application/json", "{\"ota\":\"rebooting\"}");
+  Serial.println("[OTA] Success, rebooting");
+  delay(250);
+  ESP.restart();
 }
 
 static void handleRoot() {
@@ -714,11 +1179,19 @@ static void handleRoot() {
   String cur = g_currentPath.length() ? g_currentPath : "(none)";
   String curEsc = htmlEscape(cur);
   String apIp = AP_IP.toString();
+  String staStatus = g_stationConnected ? "Connected" : "Not connected";
+  String staIp = g_stationConnected ? g_stationIp.toString() : String("");
+  String wifiSsidEsc = htmlEscape(g_wifiSsid);
+  String wifiPassEsc = htmlEscape(g_wifiPass);
+  String stationIdEsc = htmlEscape(g_stationId);
+  String mdnsName = g_stationId.length() ? g_stationId + String(".local") : String("pov.local");
+  String mdnsEsc = htmlEscape(mdnsName);
   String html = WebPages::rootPage(String(statusClass()), String(statusText()), curEsc, options,
-                                   String(AP_SSID), apIp, String("pov.local"),
-                                   g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
-                                   MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent);
+                                   String(AP_SSID), apIp, mdnsEsc,
+                                   wifiSsidEsc, staStatus, staIp, stationIdEsc, wifiPassEsc,
+                                    g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
+                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
+                                    g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -729,6 +1202,7 @@ static void applyBrightness(uint8_t pct){
   const uint8_t arms = activeArmCount();
   for (uint8_t a=0; a<arms; ++a){ if (strips[a]){ strips[a]->setBrightness(g_brightness); strips[a]->show(); } }
   prefs.putUChar("brightness", g_brightnessPercent);
+  saveSettingsBackup();
 }
 
 static void handleB(){
@@ -764,6 +1238,7 @@ static void handleSpeed() {
   g_framePeriodMs = (uint32_t) (1000UL / g_fps);
   prefs.putUShort("fps", g_fps);
   g_lastTickMs = millis();
+  saveSettingsBackup();
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
@@ -807,6 +1282,8 @@ static void handleMapCfg(){
   }
 
   if (needRebuild) rebuildStrips();
+
+  saveSettingsBackup();
 
   server.send(200, "application/json",
     String("{\"start\":") + g_startChArm1 +
@@ -905,11 +1382,20 @@ static bool recoverSd(const char* reason) {
 
 /* -------------------- Server, Setup, Loop -------------------- */
 static void startWifiAP(){
-  WiFi.mode(WIFI_AP);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  updateHostname();
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
   WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
   WiFi.setSleep(false); // keep AP awake during SD I/O
-  if (MDNS.begin("pov")) MDNS.addService("http","tcp",80);
+  g_stationReconnectScheduled = false;
+  if (g_wifiSsid.length()) {
+    startStationConnection();
+  } else {
+    g_stationConnected = false;
+    g_stationConnectPending = false;
+  }
+  if (MDNS.begin(g_stationId.c_str())) MDNS.addService("http","tcp",80);
 
   // Control + status
   server.on("/",        HTTP_GET,  handleRoot);
@@ -923,6 +1409,7 @@ static void startWifiAP(){
   server.on("/stop",    HTTP_POST, handleStop);
   server.on("/speed",   HTTP_POST, handleSpeed);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
+  server.on("/wifi",    HTTP_POST, handleWifiConfig);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -938,6 +1425,7 @@ static void startWifiAP(){
 
   // Upload
   server.on("/upload",  HTTP_POST, handleUploadDone, handleUploadData);
+  server.on("/ota",     HTTP_POST, handleOtaApply);
 
   server.onNotFound([](){ server.send(404, "text/plain", String("404 Not Found: ") + server.uri()); });
   server.begin();
@@ -957,16 +1445,89 @@ void setup(){
 
   // Restore settings
   prefs.begin("display", false);
-  g_brightnessPercent = prefs.getUChar("brightness", 25);
-  g_brightness        = (uint8_t)((255 * g_brightnessPercent) / 100);
-  g_fps               = prefs.getUShort("fps", 40); if (!g_fps) g_fps=40;
-  g_framePeriodMs     = 1000UL / g_fps;
 
-  g_startChArm1       = prefs.getULong("startch", 1);
-  g_spokesTotal       = prefs.getUShort("spokes", 40); if (!g_spokesTotal) g_spokesTotal = 1;
-  g_armCount          = clampArmCount(prefs.getUChar("arms", MAX_ARMS));
-  g_pixelsPerArm      = clampPixelsPerArm(prefs.getUShort("pixels", DEFAULT_PIXELS_PER_ARM));
-  g_strideMode        = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
+  if (prefs.isKey("brightness")) {
+    g_brightnessPercent = prefs.getUChar("brightness");
+  } else {
+    g_missing.brightness = true;
+    g_brightnessPercent = 25;
+  }
+
+  if (prefs.isKey("fps")) {
+    g_fps = prefs.getUShort("fps");
+    if (!g_fps) g_fps = 40;
+  } else {
+    g_missing.fps = true;
+    g_fps = 40;
+  }
+
+  if (prefs.isKey("startch")) {
+    g_startChArm1 = prefs.getULong("startch");
+  } else {
+    g_missing.startCh = true;
+    g_startChArm1 = 1;
+  }
+
+  if (prefs.isKey("spokes")) {
+    g_spokesTotal = prefs.getUShort("spokes");
+    if (!g_spokesTotal) g_spokesTotal = 1;
+  } else {
+    g_missing.spokes = true;
+    g_spokesTotal = 40;
+  }
+
+  if (prefs.isKey("arms")) {
+    g_armCount = clampArmCount(prefs.getUChar("arms"));
+  } else {
+    g_missing.arms = true;
+    g_armCount = MAX_ARMS;
+  }
+
+  if (prefs.isKey("pixels")) {
+    g_pixelsPerArm = clampPixelsPerArm(prefs.getUShort("pixels"));
+  } else {
+    g_missing.pixels = true;
+    g_pixelsPerArm = DEFAULT_PIXELS_PER_ARM;
+  }
+
+  if (prefs.isKey("stride")) {
+    g_strideMode = (StrideMode)prefs.getUChar("stride");
+  } else {
+    g_missing.stride = true;
+    g_strideMode = STRIDE_SPOKE;
+  }
+
+  if (prefs.isKey("wssid")) {
+    char buf[65]; size_t len = prefs.getString("wssid", buf, sizeof(buf));
+    g_wifiSsid = String(buf);
+    if (len == 0) g_missing.wifiSsid = true;
+  } else {
+    g_missing.wifiSsid = true;
+    g_wifiSsid = "";
+  }
+
+  if (prefs.isKey("wpass")) {
+    char buf[97]; prefs.getString("wpass", buf, sizeof(buf));
+    g_wifiPass = String(buf);
+  } else {
+    g_missing.wifiPass = true;
+    g_wifiPass = "";
+  }
+
+  if (prefs.isKey("wsid")) {
+    char buf[65]; size_t len = prefs.getString("wsid", buf, sizeof(buf));
+    if (len == 0) {
+      g_stationId = DEFAULT_STATION_ID;
+      g_missing.stationId = true;
+    } else {
+      g_stationId = String(buf);
+    }
+  } else {
+    g_missing.stationId = true;
+    g_stationId = DEFAULT_STATION_ID;
+  }
+
+  computeDerivedSettings();
 
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
@@ -982,15 +1543,18 @@ void setup(){
   if (!cardPresent()) {
     Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
   }
-  if (!mountSdmmc()) {
+  bool sdOk = mountSdmmc();
+  if (!sdOk) {
     Serial.println("[SD] Mount failed; UI still available for diagnostics.");
   } else {
+    restoreSettingsFromBackupIfNeeded();
     if (SD_LOCK(pdMS_TO_TICKS(2000))) {
       uint8_t type = SD_MMC.cardType();
       uint64_t sizeMB = (type==CARD_NONE) ? 0 : (SD_MMC.cardSize() / (1024ULL*1024ULL));
       SD_UNLOCK();
       Serial.printf("[SD] Type=%u  Size=%llu MB\n", (unsigned)type, (unsigned long long)sizeMB);
     }
+    saveSettingsBackup();
   }
 
   rebuildStrips();
@@ -1004,6 +1568,7 @@ void setup(){
 
 void loop(){
   server.handleClient();
+  manageWifiStation();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
