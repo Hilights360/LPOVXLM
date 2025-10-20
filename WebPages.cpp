@@ -1,5 +1,21 @@
 #include "WebPages.h"
 
+namespace {
+String htmlEscape(const String &in) {
+  String s; s.reserve(in.length()+8);
+  for (size_t i=0;i<in.length();++i) {
+    char c = in[i];
+    if (c=='&') s += "&amp;";
+    else if (c=='<') s += "&lt;";
+    else if (c=='>') s += "&gt;";
+    else if (c=='\"') s += "&quot;";
+    else if (c=='\'') s += "&#39;";
+    else s += c;
+  }
+  return s;
+}
+}
+
 namespace WebPages {
 
 String filesPageHeader(const String &pathEscaped,
@@ -84,6 +100,10 @@ String rootPage(const String &statusClass,
                 const String &apSsid,
                 const String &apIp,
                 const String &mdnsName,
+                const String &staSsid,
+                const String &staStatus,
+                const String &staIp,
+                const String &stationId,
                 uint32_t startChannel,
                 uint16_t spokes,
                 uint8_t arms,
@@ -134,6 +154,14 @@ String rootPage(const String &statusClass,
       "<button id='stop'>Stop</button>"
       "<button id='refresh'>Refresh</button>"
       "</div>"
+      "<div class='sep'></div>"
+      "<h3>Wi-Fi Station</h3>"
+      "<p class='muted'>Status: <b>" + htmlEscape(staStatus) + "</b> &middot; IP: <b>" + htmlEscape(staIp) + "</b></p>"
+      "<label>Station SSID</label><input id='wssid' type='text' value='" + htmlEscape(staSsid) + "'>"
+      "<label>Station Password</label><input id='wpass' type='password' placeholder='Leave blank to keep current'>"
+      "<label>Station ID / Hostname</label><input id='wstation' type='text' value='" + htmlEscape(stationId) + "'>"
+      "<div class='row'><button id='applywifi'>Save Wi-Fi</button><button id='wforget'>Forget Wi-Fi</button></div>"
+      "<p class='muted'>Password is optional; leave blank to keep the stored value.</p>"
       "<div class='sep'></div>"
       "<h3>Spinner Layout</h3>"
       "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
@@ -197,6 +225,17 @@ String rootPage(const String &statusClass,
       "const st=(document.getElementById('stride').value)||'spoke';"
       "fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'})"
       ".then(()=>location.reload());"
+      "};"
+      "document.getElementById('applywifi').onclick=()=>{"
+      "const ss=document.getElementById('wssid').value;"
+      "const pw=document.getElementById('wpass').value;"
+      "const hn=document.getElementById('wstation').value;"
+      "let url='/wifi?ssid='+encodeURIComponent(ss)+'&station='+encodeURIComponent(hn);"
+      "if(pw.length) url+='&pass='+encodeURIComponent(pw);"
+      "fetch(url,{method:'POST'}).then(()=>location.reload());"
+      "};"
+      "document.getElementById('wforget').onclick=()=>{"
+      "fetch('/wifi?forget=1',{method:'POST'}).then(()=>location.reload());"
       "};"
       "document.getElementById('hdr').onclick=()=>fetch('/fseq/header').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
