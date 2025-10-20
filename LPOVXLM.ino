@@ -63,14 +63,30 @@ bool     g_watchdogEnabled   = false;
 static bool g_watchdogAttached = false;
 
 static void applyWatchdogSetting() {
+  // Bitmask for all cores' idle tasks (S3 is dual-core)
+  const uint32_t ALL_CORES_MASK = (1U << portNUM_PROCESSORS) - 1U;
+
   if (g_watchdogEnabled) {
+    // New IDF 5.x config struct
+    esp_task_wdt_config_t cfg = {
+      .timeout_ms    = WATCHDOG_TIMEOUT_SECONDS * 1000U,
+      .idle_core_mask= ALL_CORES_MASK,   // also subscribes idle tasks
+      .trigger_panic = true              // panic+backtrace on WDT
+    };
+
+    // Init (or reconfigure if already inited)
+    esp_err_t err = esp_task_wdt_init(&cfg);
+    if (err == ESP_ERR_INVALID_STATE) {
+      err = esp_task_wdt_reconfigure(&cfg);
+    }
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      Serial.printf("[WDT] init/reconfig failed: %d\n", (int)err);
+      return;
+    }
+
+    // Subscribe the current task once
     if (!g_watchdogAttached) {
-      esp_err_t err = esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
-      if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        Serial.printf("[WDT] init failed: %d\n", (int)err);
-        return;
-      }
-      err = esp_task_wdt_add(nullptr);
+      err = esp_task_wdt_add(nullptr); // current task
       if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
         g_watchdogAttached = true;
         esp_task_wdt_reset();
@@ -80,12 +96,14 @@ static void applyWatchdogSetting() {
       }
     }
   } else if (g_watchdogAttached) {
+    // Unsubscribe and deinit (order matters)
     esp_task_wdt_delete(nullptr);
     esp_task_wdt_deinit();
     g_watchdogAttached = false;
     Serial.println("[WDT] Disabled");
   }
 }
+
 
 static inline void feedWatchdog() {
   if (g_watchdogAttached) {
