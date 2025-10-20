@@ -9,6 +9,7 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <stdlib.h>
 #include <string.h>
 #include "QuadMap.h"
@@ -56,6 +57,41 @@ static uint32_t          g_hallDiagBlinkStartMs = 0;
 // Latest arm pin map (CLK and DATA per arm)
 static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
 static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
+
+static const uint32_t WATCHDOG_TIMEOUT_SECONDS = 8;
+bool     g_watchdogEnabled   = false;
+static bool g_watchdogAttached = false;
+
+static void applyWatchdogSetting() {
+  if (g_watchdogEnabled) {
+    if (!g_watchdogAttached) {
+      esp_err_t err = esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+      if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.printf("[WDT] init failed: %d\n", (int)err);
+        return;
+      }
+      err = esp_task_wdt_add(nullptr);
+      if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        g_watchdogAttached = true;
+        esp_task_wdt_reset();
+        Serial.printf("[WDT] Enabled (timeout %us)\n", (unsigned)WATCHDOG_TIMEOUT_SECONDS);
+      } else {
+        Serial.printf("[WDT] add failed: %d\n", (int)err);
+      }
+    }
+  } else if (g_watchdogAttached) {
+    esp_task_wdt_delete(nullptr);
+    esp_task_wdt_deinit();
+    g_watchdogAttached = false;
+    Serial.println("[WDT] Disabled");
+  }
+}
+
+static inline void feedWatchdog() {
+  if (g_watchdogAttached) {
+    esp_task_wdt_reset();
+  }
+}
 
 
 // ---------- SD-MMC pins (your new map) ----------
@@ -199,6 +235,7 @@ static void handleCBlocks();
 static void handleSdReinit();
 static void handleSdConfig();
 static void handleAutoplay();
+static void handleWatchdog();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -299,6 +336,7 @@ static bool saveSettingsBackupLocked() {
   f.print("sdmode=");     f.println((unsigned int)g_sdPreferredBusWidth);
   f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
   f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
+  f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
   f.close();
   return true;
 }
@@ -327,6 +365,7 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "sdmode") { out.hasSdMode = true; out.sdMode = (uint8_t)clampU32(value.toInt(),0,4); }
     else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
     else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
+    else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
   }
   f.close();
   return true;
@@ -392,6 +431,10 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   if (!present.autoplay && data.hasAutoplay) {
     g_autoplayEnabled = data.autoplay;
     prefs.putBool("autoplay", g_autoplayEnabled);
+  }
+  if (!present.watchdog && data.hasWatchdog) {
+    g_watchdogEnabled = data.watchdog;
+    prefs.putBool("watchdog", g_watchdogEnabled);
   }
   if (!present.sdMode && data.hasSdMode) {
     g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
@@ -478,6 +521,7 @@ static void checkSdFirmwareUpdate() {
       SD_UNLOCK();
       return;
     }
+    feedWatchdog();
   }
   f.close();
   if (!Update.end()) {
@@ -579,6 +623,7 @@ static bool mountSdmmc(){
   g_sdBusWidth = 0;
 
   for (size_t i=0; i<attemptCount; ++i) {
+    feedWatchdog();
     uint8_t mode = attempts[i];
     if (i > 0) {
       SD_MMC.end();
@@ -1031,6 +1076,7 @@ static void handleUploadData() {
         g_uploadFile.write(up.buf, up.currentSize);
         SD_UNLOCK();
         g_uploadBytes += up.currentSize;
+        feedWatchdog();
       }
     }
   } else if (up.status == UPLOAD_FILE_END) {
@@ -1094,6 +1140,7 @@ static void handleStatus(){
   json += "}";
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
   json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
+  json += ",\"watchdog\":" + String(g_watchdogEnabled ? "true" : "false");
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1117,7 +1164,8 @@ static void handleRoot() {
                                    g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
-                                   g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled);
+                                   g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
+                                   g_watchdogEnabled);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1380,6 +1428,22 @@ static void handleAutoplay(){
               String("{\"autoplay\":") + (g_autoplayEnabled ? "true" : "false") + "}");
 }
 
+static void handleWatchdog(){
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    return;
+  }
+
+  bool enable = parseBoolArg(server.arg("enable"));
+  g_watchdogEnabled = enable;
+  prefs.putBool("watchdog", g_watchdogEnabled);
+  persistSettingsToSd();
+  applyWatchdogSetting();
+
+  server.send(200, "application/json",
+              String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
+}
+
 // Diagnostics
 static void handleFseqHeader(){
   String j="{\"ok\":false}";
@@ -1520,7 +1584,11 @@ static bool recoverSd(const char* reason) {
   if (!cardPresent()) {
     Serial.println("[SD] Card not present (CD HIGH). Waiting...");
     uint32_t t0 = millis();
-    while (!cardPresent() && millis() - t0 < 5000) { delay(50); server.handleClient(); }
+    while (!cardPresent() && millis() - t0 < 5000) {
+      delay(50);
+      server.handleClient();
+      feedWatchdog();
+    }
     if (!cardPresent()) return false;
   }
 
@@ -1530,7 +1598,7 @@ static bool recoverSd(const char* reason) {
     if (g_currentPath.length()) {
       String why; ok = openFseq(g_currentPath, why);
       Serial.printf("[SD] Reopen file: %s\n", ok?"OK": why.c_str());
-      if (ok) return true;
+      if (ok) { feedWatchdog(); return true; }
     }
   }
 
@@ -1542,6 +1610,7 @@ static bool recoverSd(const char* reason) {
   pinMode(PIN_SD_CLK, INPUT);
   SD_UNLOCK();
   delay(50);
+  feedWatchdog();
 
   if (g_sdFailStreak >= 2) {
     uint32_t lowered = nextLowerSdFreq(g_sdFreqKHz);
@@ -1557,6 +1626,7 @@ static bool recoverSd(const char* reason) {
   }
 
   if (ok) g_sdFailStreak = 0;
+  feedWatchdog();
   return ok;
 }
 
@@ -1588,6 +1658,7 @@ static void startWifiAP(){
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
   server.on("/autoplay",HTTP_POST, handleAutoplay);
+  server.on("/watchdog",HTTP_POST, handleWatchdog);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -1655,6 +1726,8 @@ void setup(){
   g_stationId = prefs.getString("station", "");
   present.autoplay = prefs.isKey("autoplay");
   g_autoplayEnabled = prefs.getBool("autoplay", true);
+  present.watchdog = prefs.isKey("watchdog");
+  g_watchdogEnabled = prefs.getBool("watchdog", false);
 
   bool card = cardPresent();
   if (!card) {
@@ -1675,6 +1748,8 @@ void setup(){
   if (g_sdReady) {
     ensureSettingsFromBackup(present);
   }
+
+  applyWatchdogSetting();
 
   if (g_brightnessPercent > 100) g_brightnessPercent = 100;
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
@@ -1724,6 +1799,8 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
+  feedWatchdog();
+
   if (g_autoplayEnabled && !g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     if (openFseq("/test2.fseq", why)) {
@@ -1734,10 +1811,17 @@ void loop(){
     }
   }
 
-  if (!g_playing || g_paused) { delay(1); return; }
+  if (!g_playing || g_paused) {
+    delay(1);
+    feedWatchdog();
+    return;
+  }
 
   const uint32_t now = millis();
-  if (now - g_lastTickMs < g_framePeriodMs) return;
+  if (now - g_lastTickMs < g_framePeriodMs) {
+    feedWatchdog();
+    return;
+  }
   g_lastTickMs = now;
 
   if (!renderFrame(g_frameIndex)) {
@@ -1750,9 +1834,11 @@ void loop(){
         g_sdFailStreak = 0;
       }
     }
+    feedWatchdog();
     return;
   }
 
   g_sdFailStreak = 0; // success resets streak
   g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
+  feedWatchdog();
 }
