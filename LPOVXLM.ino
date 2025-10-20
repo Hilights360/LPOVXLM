@@ -53,6 +53,13 @@ static const int PIN_SD_D2  = 12;
 static const int PIN_SD_D3  = 11;
 static const int PIN_SD_CD  = 14;  // LOW = inserted
 
+// ---------- Hall sensor + status pixel ----------
+static const int PIN_HALL_SENSOR        = 5;
+static const int PIN_STATUS_PIXEL       = 48;
+static const uint32_t HALL_BLINK_MS     = 100;
+static bool g_hallPixelOn               = false;
+static uint32_t g_hallBlinkUntil        = 0;
+
 // SD dynamic timing & fail tracking
 static SdBusPreference g_sdPreferredBusWidth = SD_BUS_AUTO;
 static const uint32_t SD_FREQ_OPTIONS[] = { 8000, 4000, 2000, 1000, 400 };
@@ -734,6 +741,22 @@ static void blackoutAll(){
     uint16_t pix = strips[a]->numPixels();
     for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
     strips[a]->show();
+  }
+}
+
+static void pollHallSensor(){
+  const uint32_t now = millis();
+  const bool active = (digitalRead(PIN_HALL_SENSOR) == LOW);
+
+  if (active){
+    g_hallBlinkUntil = now + HALL_BLINK_MS;
+    if (!g_hallPixelOn){
+      digitalWrite(PIN_STATUS_PIXEL, HIGH);
+      g_hallPixelOn = true;
+    }
+  } else if (g_hallPixelOn && ((int32_t)(now - g_hallBlinkUntil) >= 0)){
+    digitalWrite(PIN_STATUS_PIXEL, LOW);
+    g_hallPixelOn = false;
   }
 }
 
@@ -1440,6 +1463,10 @@ void setup(){
   Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
+  pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
+  pinMode(PIN_STATUS_PIXEL, OUTPUT);
+  digitalWrite(PIN_STATUS_PIXEL, LOW);
+
   // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
@@ -1538,6 +1565,7 @@ void setup(){
 void loop(){
   pollWifiStation();
   server.handleClient();
+  pollHallSensor();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
