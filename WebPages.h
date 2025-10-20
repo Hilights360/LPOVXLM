@@ -50,6 +50,8 @@ String rootPage(const String &statusClass,
                 uint32_t sdActiveFreqKHz,
                 bool sdReady,
                 bool playing,
+                bool paused,
+                bool autoplayEnabled,
                 bool hallDiagEnabled);
 
 }  // namespace WebPages

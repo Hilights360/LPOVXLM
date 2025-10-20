@@ -119,6 +119,8 @@ String rootPage(const String &statusClass,
                 uint32_t sdActiveFreqKHz,
                 bool sdReady,
                 bool playing,
+                bool paused,
+                bool autoplayEnabled,
                 bool hallDiagEnabled) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
@@ -156,6 +158,12 @@ String rootPage(const String &statusClass,
       ? String("Stop playback to enable the hall sensor blink test.")
       : String("Blinks all arms red whenever the hall sensor toggles.");
 
+  const char *pauseLabel = paused ? "Resume" : "Pause";
+  String pauseAttrs;
+  if (!playing) pauseAttrs += " disabled";
+  String autoplayAttrs;
+  if (autoplayEnabled) autoplayAttrs += " checked";
+
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -191,6 +199,7 @@ String rootPage(const String &statusClass,
       "<select id='sel'>" + optionsHtml + "</select>"
       "<div class='row'>"
       "<button id='start'>Start</button>"
+      "<button id='pause'" + pauseAttrs + ">" + pauseLabel + "</button>"
       "<button id='stop'>Stop</button>"
       "<button id='refresh'>Refresh</button>"
       "</div>"
@@ -256,7 +265,11 @@ String rootPage(const String &statusClass,
       "<div class='muted'>" + hallDiagHelp + "</div>"
       "</div>"
       "<div class='sep'></div>"
-      "<p class='muted'>If no file is started within 5 minutes after boot, <b>/test2.fseq</b> will auto-play.</p>"
+      "<h3>Auto-Play</h3>"
+      "<label style='display:flex;align-items:center;gap:.5rem'>"
+      "<input type='checkbox' id='autoplay'" + autoplayAttrs + "> Enable fallback auto-play"
+      "</label>"
+      "<p class='muted'>When enabled, <b>/test2.fseq</b> will start automatically after 5 minutes of inactivity.</p>"
       "</div>"
       "<script>"
       "const fps=document.getElementById('fps'), fpsv=document.getElementById('fpsv');"
@@ -273,6 +286,8 @@ String rootPage(const String &statusClass,
       "document.getElementById('med').onclick=()=>post('/b?value=40');"
       "document.getElementById('hi').onclick=()=>post('/b?value=100');"
       "document.getElementById('start').onclick=()=>{const p=document.getElementById('sel').value;fetch('/start?path='+encodeURIComponent(p)).then(()=>location.reload());};"
+      "const pause=document.getElementById('pause');"
+      "if(pause){pause.onclick=()=>{fetch('/pause?toggle=1',{method:'POST'}).then(()=>location.reload()).catch(()=>location.reload());};}"
       "document.getElementById('stop').onclick =()=>post('/stop');"
       "document.getElementById('refresh').onclick=()=>location.reload();"
       "document.getElementById('applymap').onclick=()=>{"
@@ -301,6 +316,8 @@ String rootPage(const String &statusClass,
       "document.getElementById('stat').onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "const halldiag=document.getElementById('halldiag');"
       "if(halldiag){halldiag.onchange=()=>{const en=halldiag.checked?'1':'0';fetch('/halldiag?enable='+en,{method:'POST'}).then(()=>location.reload());};}"
+      "const autoplay=document.getElementById('autoplay');"
+      "if(autoplay){autoplay.onchange=()=>{const en=autoplay.checked?'1':'0';fetch('/autoplay?enable='+en,{method:'POST'}).catch(()=>{autoplay.checked=!autoplay.checked;});};}"
       "const sdinfo=document.getElementById('sdinfo');"
       "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
       "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"
