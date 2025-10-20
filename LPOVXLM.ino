@@ -43,6 +43,12 @@ static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
 static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
 
 
+// ---------- Hall sensor + indicator pixel ----------
+static const int PIN_HALL_SENSOR        = 5;
+static const int PIN_STATUS_PIXEL       = 48;
+static const uint32_t HALL_BLINK_MS     = 100;
+
+
 // ---------- SD-MMC pins (your new map) ----------
 static const int PIN_SD_CLK = 10;
 static const int PIN_SD_CMD = 9;
@@ -115,6 +121,7 @@ String         g_currentPath;
 uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+static uint32_t g_hallBlinkUntilMs = 0;
 
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
@@ -475,6 +482,26 @@ static String joinPath(const String& dir, const String& name){
   int slash = base.lastIndexOf('/');
   if (slash >= 0) base = base.substring(slash+1);
   return (d == "/") ? ("/" + base) : (d + "/" + base);
+}
+
+/* -------------------- Hall sensor handling -------------------- */
+static void initHallSensor(){
+  pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
+  pinMode(PIN_STATUS_PIXEL, OUTPUT);
+  digitalWrite(PIN_STATUS_PIXEL, LOW);
+  g_hallBlinkUntilMs = 0;
+}
+
+static void updateHallSensor(){
+  const uint32_t now = millis();
+  if (digitalRead(PIN_HALL_SENSOR) == LOW) {
+    g_hallBlinkUntilMs = now + HALL_BLINK_MS;
+  }
+  if ((int32_t)(g_hallBlinkUntilMs - now) > 0) {
+    digitalWrite(PIN_STATUS_PIXEL, HIGH);
+  } else {
+    digitalWrite(PIN_STATUS_PIXEL, LOW);
+  }
 }
 
 /* -------------------- SD helpers (prefer 4-bit + mutex) -------------------- */
@@ -1440,6 +1467,8 @@ void setup(){
   Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
+  initHallSensor();
+
   // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
@@ -1538,6 +1567,8 @@ void setup(){
 void loop(){
   pollWifiStation();
   server.handleClient();
+
+  updateHallSensor();
 
   if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
