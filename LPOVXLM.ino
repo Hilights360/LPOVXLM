@@ -78,6 +78,7 @@ static const char* OTA_FAIL_FILE = "/firmware.failed";
 WebServer server(80);
 
 static bool   g_sdReady             = false;
+static uint8_t g_sdBusWidth         = 0;    // 0=not mounted, 1=1-bit, 4=4-bit
 String        g_staSsid;
 String        g_staPass;
 String        g_stationId;
@@ -446,25 +447,42 @@ static String joinPath(const String& dir, const String& name){
   return (d == "/") ? ("/" + base) : (d + "/" + base);
 }
 
-/* -------------------- SD helpers (strict 1-bit + mutex) -------------------- */
+/* -------------------- SD helpers (prefer 4-bit + mutex) -------------------- */
 static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
 static void sd_preflight() {
   pinMode(PIN_SD_CMD, INPUT_PULLUP);
   pinMode(PIN_SD_D0,  INPUT_PULLUP);
+  pinMode(PIN_SD_D1,  INPUT_PULLUP);
+  pinMode(PIN_SD_D2,  INPUT_PULLUP);
+  pinMode(PIN_SD_D3,  INPUT_PULLUP);
   delay(2);
-  Serial.printf("[SD] Preflight CMD@%d=%d  D0@%d=%d (expect 1,1)\n",
+  Serial.printf("[SD] Preflight CMD@%d=%d  D0@%d=%d  D1@%d=%d  D2@%d=%d  D3@%d=%d (expect 1s)\n",
                 PIN_SD_CMD, digitalRead(PIN_SD_CMD),
-                PIN_SD_D0,  digitalRead(PIN_SD_D0));
+                PIN_SD_D0,  digitalRead(PIN_SD_D0),
+                PIN_SD_D1,  digitalRead(PIN_SD_D1),
+                PIN_SD_D2,  digitalRead(PIN_SD_D2),
+                PIN_SD_D3,  digitalRead(PIN_SD_D3));
 }
 static bool mountSdmmc(){
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] mount lock timeout"); return false; }
   bool ok=false;
   do {
     sd_preflight();
-    // STRICT 1-bit: do not pass D1..D3 here
+    g_sdBusWidth = 0;
+
+    // First try full 4-bit wide bus
+    SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
+    ok = SD_MMC.begin("/sdcard", false /*4-bit*/, false /*no-format*/, g_sdFreqKHz);
+    Serial.printf("[SD] Mounted (4b) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
+    if (ok) { g_sdBusWidth = 4; break; }
+
+    // Fallback to 1-bit mode if 4-bit fails
+    SD_MMC.end();
+    delay(2);
     SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1);
     ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, g_sdFreqKHz);
-    Serial.printf("[SD] Mounted (1b) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
+    Serial.printf("[SD] Mounted (1b fallback) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
+    if (ok) g_sdBusWidth = 1;
   } while(0);
   SD_UNLOCK();
   g_sdReady = ok;
@@ -1161,9 +1179,15 @@ static void handleCBlocks(){
 static void handleSdReinit(){
   bool ok=false;
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
-  if (SD_MMC.cardType()!=CARD_NONE) ok=true;
-  else ok = SD_MMC.begin("/sdcard", true, false, g_sdFreqKHz);
+  bool mounted = (SD_MMC.cardType()!=CARD_NONE);
   SD_UNLOCK();
+
+  if (mounted) {
+    g_sdReady = true;
+    ok = true;
+  } else {
+    ok = mountSdmmc();
+  }
 
   if (!ok) { server.send(500,"text/plain","SD not present"); return; }
   if (!g_currentPath.length()) { server.send(200,"text/plain","SD OK; no file"); return; }
@@ -1174,9 +1198,9 @@ static void handleSdReinit(){
 
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
-  Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d\n",
+  Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
       reason, g_sdFailStreak, (unsigned long)g_sdFreqKHz,
-      (int)digitalRead(PIN_SD_CD));
+      (int)digitalRead(PIN_SD_CD), (unsigned)g_sdBusWidth);
 
   if (!cardPresent()) {
     Serial.println("[SD] Card not present (CD HIGH). Waiting...");
@@ -1197,6 +1221,8 @@ static bool recoverSd(const char* reason) {
 
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
   SD_MMC.end();
+  g_sdBusWidth = 0;
+  g_sdReady = false;
   pinMode(PIN_SD_CLK, OUTPUT); digitalWrite(PIN_SD_CLK, LOW); delay(5);
   pinMode(PIN_SD_CLK, INPUT);
   SD_UNLOCK();
