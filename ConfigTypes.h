@@ -13,6 +13,8 @@ struct PrefPresence {
   bool staSsid=false;
   bool staPass=false;
   bool station=false;
+  bool sdMode=false;
+  bool sdFreq=false;
 };
 
 struct SettingsData {
@@ -26,4 +28,6 @@ struct SettingsData {
   bool hasStaSsid=false;    String   staSsid;
   bool hasStaPass=false;    String   staPass;
   bool hasStation=false;    String   stationId;
+  bool hasSdMode=false;     uint8_t  sdMode=0;
+  bool hasSdFreq=false;     uint32_t sdFreq=0;
 };

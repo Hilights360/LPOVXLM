@@ -54,8 +54,13 @@ static const int PIN_SD_D3  = 11;
 static const int PIN_SD_CD  = 14;  // LOW = inserted
 
 // SD dynamic timing & fail tracking
-static uint32_t g_sdFreqKHz   = 8000;  // start conservative; raise after stable
-static int      g_sdFailStreak = 0;    // consecutive read failures
+enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
+static SdBusPreference g_sdPreferredBusWidth = SD_BUS_AUTO;
+static const uint32_t SD_FREQ_OPTIONS[] = { 8000, 4000, 2000, 1000, 400 };
+static const size_t   SD_FREQ_OPTION_COUNT = sizeof(SD_FREQ_OPTIONS) / sizeof(SD_FREQ_OPTIONS[0]);
+static uint32_t g_sdBaseFreqKHz = 8000;  // persisted target frequency
+static uint32_t g_sdFreqKHz     = 8000;  // current working frequency (may step down)
+static int      g_sdFailStreak  = 0;     // consecutive read failures
 
 // Persistent scratch for zlib frames
 static uint8_t* s_ctmp = nullptr;
@@ -134,6 +139,7 @@ static void handleWifiCfg();
 static void handleFseqHeader();
 static void handleCBlocks();
 static void handleSdReinit();
+static void handleSdConfig();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -168,6 +174,18 @@ static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if(v<lo) ret
 static inline uint8_t  clampArmCount(int32_t v){ if(v<1) return 1; if(v>MAX_ARMS) return MAX_ARMS; return (uint8_t)v; }
 static inline uint16_t clampPixelsPerArm(int32_t v){ if(v<1) return 1; if(v>MAX_PIXELS_PER_ARM) return MAX_PIXELS_PER_ARM; return (uint16_t)v; }
 static inline uint8_t  activeArmCount(){ return (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount); }
+static inline SdBusPreference sanitizeSdMode(uint8_t mode){ if(mode==SD_BUS_1BIT) return SD_BUS_1BIT; if(mode==SD_BUS_4BIT) return SD_BUS_4BIT; return SD_BUS_AUTO; }
+static bool isValidSdFreq(uint32_t freq){ for(size_t i=0;i<SD_FREQ_OPTION_COUNT;++i){ if(SD_FREQ_OPTIONS[i]==freq) return true; } return false; }
+static inline uint32_t sanitizeSdFreq(uint32_t freq){ return isValidSdFreq(freq) ? freq : SD_FREQ_OPTIONS[0]; }
+static uint32_t nextLowerSdFreq(uint32_t freq){
+  for(size_t i=0;i<SD_FREQ_OPTION_COUNT;++i){
+    if(SD_FREQ_OPTIONS[i]==freq){
+      if(i+1 < SD_FREQ_OPTION_COUNT) return SD_FREQ_OPTIONS[i+1];
+      return SD_FREQ_OPTIONS[i];
+    }
+  }
+  return SD_FREQ_OPTIONS[SD_FREQ_OPTION_COUNT-1];
+}
 
 static bool isFseqName(const String& n) {
   int dot = n.lastIndexOf('.');
@@ -219,6 +237,8 @@ static bool saveSettingsBackupLocked() {
   f.print("ssid=");       f.println(g_staSsid);
   f.print("pass=");       f.println(g_staPass);
   f.print("station=");    f.println(g_stationId);
+  f.print("sdmode=");     f.println((unsigned int)g_sdPreferredBusWidth);
+  f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
   f.close();
   return true;
 }
@@ -244,6 +264,8 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "ssid")   { out.hasStaSsid = true; out.staSsid = value; }
     else if (key == "pass")   { out.hasStaPass = true; out.staPass = value; }
     else if (key == "station") { out.hasStation = true; out.stationId = value; }
+    else if (key == "sdmode") { out.hasSdMode = true; out.sdMode = (uint8_t)clampU32(value.toInt(),0,4); }
+    else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
   }
   f.close();
   return true;
@@ -305,6 +327,15 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   if ((!present.station || !g_stationId.length()) && data.hasStation) {
     g_stationId = data.stationId;
     prefs.putString("station", g_stationId);
+  }
+  if (!present.sdMode && data.hasSdMode) {
+    g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
+    prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth);
+  }
+  if (!present.sdFreq && data.hasSdFreq) {
+    g_sdBaseFreqKHz = sanitizeSdFreq(data.sdFreq);
+    g_sdFreqKHz = g_sdBaseFreqKHz;
+    prefs.putUInt("sdfreq", g_sdBaseFreqKHz);
   }
 }
 
@@ -465,25 +496,44 @@ static void sd_preflight() {
 }
 static bool mountSdmmc(){
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] mount lock timeout"); return false; }
-  bool ok=false;
-  do {
-    sd_preflight();
-    g_sdBusWidth = 0;
+  g_sdFreqKHz = sanitizeSdFreq(g_sdFreqKHz);
+  g_sdBaseFreqKHz = sanitizeSdFreq(g_sdBaseFreqKHz);
 
-    // First try full 4-bit wide bus
-    SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
-    ok = SD_MMC.begin("/sdcard", false /*4-bit*/, false /*no-format*/, g_sdFreqKHz);
-    Serial.printf("[SD] Mounted (4b) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
-    if (ok) { g_sdBusWidth = 4; break; }
+  uint8_t attempts[2] = { 4, 1 };
+  size_t attemptCount = 0;
+  if (g_sdPreferredBusWidth == SD_BUS_AUTO) {
+    attempts[0] = 4; attempts[1] = 1; attemptCount = 2;
+  } else if (g_sdPreferredBusWidth == SD_BUS_4BIT) {
+    attempts[0] = 4; attemptCount = 1;
+  } else {
+    attempts[0] = 1; attemptCount = 1;
+  }
 
-    // Fallback to 1-bit mode if 4-bit fails
-    SD_MMC.end();
-    delay(2);
-    SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1);
-    ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, g_sdFreqKHz);
-    Serial.printf("[SD] Mounted (1b fallback) @ %lu kHz: %s\n", (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
-    if (ok) g_sdBusWidth = 1;
-  } while(0);
+  bool ok = false;
+  sd_preflight();
+  g_sdBusWidth = 0;
+
+  for (size_t i=0; i<attemptCount; ++i) {
+    uint8_t mode = attempts[i];
+    if (i > 0) {
+      SD_MMC.end();
+      delay(2);
+    }
+    if (mode == 4) {
+      SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
+      ok = SD_MMC.begin("/sdcard", false /*4-bit*/, false /*no-format*/, g_sdFreqKHz);
+    } else {
+      SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1);
+      ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, g_sdFreqKHz);
+    }
+    Serial.printf("[SD] Mounted (%ubit request=%u) @ %lu kHz: %s\n",
+                  (unsigned)mode, (unsigned)g_sdPreferredBusWidth,
+                  (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
+    if (ok) {
+      g_sdBusWidth = mode;
+      break;
+    }
+  }
   SD_UNLOCK();
   g_sdReady = ok;
   return ok;
@@ -969,8 +1019,14 @@ static void handleStatus(){
     +",\"arms\":"+String(g_armCount)
     +",\"pixels\":"+String(g_pixelsPerArm)
     +",\"index\":"+String(g_indexPosition)
-    +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\""
-    +"}";
+    +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"";
+  json += ",\"sd\":{\"ready\":";
+  json += (g_sdReady?"true":"false");
+  json += ",\"currentWidth\":" + String((unsigned)g_sdBusWidth);
+  json += ",\"desiredMode\":" + String((unsigned)g_sdPreferredBusWidth);
+  json += ",\"baseFreq\":" + String((unsigned long)g_sdBaseFreqKHz);
+  json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
+  json += "}}";
   server.send(200,"application/json",json);
 }
 
@@ -990,7 +1046,9 @@ static void handleRoot() {
                                    g_staSsid, staStatus, staIp, g_stationId,
                                    g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent);
+                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
+                                   (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
+                                   g_sdBusWidth, g_sdFreqKHz, g_sdReady);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1196,6 +1254,91 @@ static void handleSdReinit(){
   else server.send(500,"text/plain", String("reopen fail: ")+why);
 }
 
+static void handleSdConfig(){
+  if (!server.hasArg("mode") || !server.hasArg("freq")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing parameters\"}");
+    return;
+  }
+
+  String modeStr = server.arg("mode");
+  String freqStr = server.arg("freq");
+
+  char *end=nullptr;
+  long modeVal = strtol(modeStr.c_str(), &end, 10);
+  if (end == modeStr.c_str() || *end != '\0') {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}");
+    return;
+  }
+  if (!(modeVal == 0 || modeVal == 1 || modeVal == 4)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported mode\"}");
+    return;
+  }
+  SdBusPreference newMode = sanitizeSdMode((uint8_t)modeVal);
+
+  end = nullptr;
+  uint32_t freqVal = (uint32_t)strtoul(freqStr.c_str(), &end, 10);
+  if (end == freqStr.c_str() || *end != '\0' || !isValidSdFreq(freqVal)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid frequency\"}");
+    return;
+  }
+
+  bool changed = false;
+  if (newMode != g_sdPreferredBusWidth) {
+    g_sdPreferredBusWidth = newMode;
+    prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth);
+    changed = true;
+  }
+  if (freqVal != g_sdBaseFreqKHz) {
+    g_sdBaseFreqKHz = sanitizeSdFreq(freqVal);
+    g_sdFreqKHz = g_sdBaseFreqKHz;
+    prefs.putUInt("sdfreq", g_sdBaseFreqKHz);
+    changed = true;
+  }
+  if (changed) {
+    g_sdFailStreak = 0;
+    persistSettingsToSd();
+  }
+
+  bool card = cardPresent();
+  bool remounted = false;
+  bool reopened = false;
+  if (card) {
+    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+      SD_MMC.end();
+      g_sdBusWidth = 0;
+      g_sdReady = false;
+      SD_UNLOCK();
+    }
+    delay(20);
+    g_sdFreqKHz = g_sdBaseFreqKHz;
+    remounted = mountSdmmc();
+    if (remounted) {
+      g_sdFailStreak = 0;
+      if (g_currentPath.length()) {
+        String why;
+        reopened = openFseq(g_currentPath, why);
+        if (!reopened && why.length()) {
+          Serial.printf("[SD] reopen after config failed: %s\n", why.c_str());
+        }
+      }
+    }
+  } else {
+    g_sdReady = false;
+    g_sdBusWidth = 0;
+  }
+
+  String json = "{\"ok\":true";
+  json += ",\"ready\":" + String(g_sdReady?"true":"false");
+  json += ",\"currentWidth\":" + String((unsigned)g_sdBusWidth);
+  json += ",\"desiredMode\":" + String((unsigned)g_sdPreferredBusWidth);
+  json += ",\"baseFreq\":" + String((unsigned long)g_sdBaseFreqKHz);
+  json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
+  if (remounted) json += ",\"remounted\":true";
+  if (reopened) json += ",\"fileReopened\":true";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
   Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
@@ -1229,9 +1372,10 @@ static bool recoverSd(const char* reason) {
   delay(50);
 
   if (g_sdFailStreak >= 2) {
-    if      (g_sdFreqKHz > 4000) g_sdFreqKHz = 4000;
-    else if (g_sdFreqKHz > 2000) g_sdFreqKHz = 2000;
-    else if (g_sdFreqKHz > 1000) g_sdFreqKHz = 1000;
+    uint32_t lowered = nextLowerSdFreq(g_sdFreqKHz);
+    if (lowered != g_sdFreqKHz) {
+      g_sdFreqKHz = lowered;
+    }
   }
 
   ok = mountSdmmc();
@@ -1274,6 +1418,7 @@ static void startWifiAP(){
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
   server.on("/fseq/cblocks",HTTP_GET,  handleCBlocks);
   server.on("/sd/reinit",   HTTP_POST, handleSdReinit);
+  server.on("/sd/config",   HTTP_POST, handleSdConfig);
 
   // Files
   server.on("/files",   HTTP_GET,  handleFiles);
@@ -1299,25 +1444,14 @@ void setup(){
   // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
-  bool card = cardPresent();
-  if (!card) {
-    Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
-  }
-
-  if (card) {
-    g_sdReady = mountSdmmc();
-    if (!g_sdReady) {
-      Serial.println("[SD] Mount failed; UI still available for diagnostics.");
-    }
-  }
-
-  if (g_sdReady) {
-    checkSdFirmwareUpdate();
-  }
-
-  // Restore settings from NVS
+  // Restore settings from NVS before mounting so SD options apply
   prefs.begin("display", false);
   PrefPresence present;
+  present.sdMode = prefs.isKey("sdmode");
+  g_sdPreferredBusWidth = sanitizeSdMode(prefs.getUChar("sdmode", (uint8_t)SD_BUS_AUTO));
+  present.sdFreq = prefs.isKey("sdfreq");
+  g_sdBaseFreqKHz = sanitizeSdFreq(prefs.getUInt("sdfreq", 8000));
+  g_sdFreqKHz = g_sdBaseFreqKHz;
   present.brightness = prefs.isKey("brightness");
   g_brightnessPercent = prefs.getUChar("brightness", 25);
   present.fps = prefs.isKey("fps");
@@ -1338,6 +1472,22 @@ void setup(){
   g_staPass = prefs.getString("sta_pass", "");
   present.station = prefs.isKey("station");
   g_stationId = prefs.getString("station", "");
+
+  bool card = cardPresent();
+  if (!card) {
+    Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
+  }
+
+  if (card) {
+    g_sdReady = mountSdmmc();
+    if (!g_sdReady) {
+      Serial.println("[SD] Mount failed; UI still available for diagnostics.");
+    }
+  }
+
+  if (g_sdReady) {
+    checkSdFirmwareUpdate();
+  }
 
   if (g_sdReady) {
     ensureSettingsFromBackup(present);
