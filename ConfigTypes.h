@@ -18,6 +18,7 @@ struct PrefPresence {
   bool sdMode=false;
   bool sdFreq=false;
   bool autoplay=false;
+  bool watchdog=false;
 };
 
 struct SettingsData {
@@ -34,4 +35,5 @@ struct SettingsData {
   bool hasSdMode=false;     uint8_t  sdMode=0;
   bool hasSdFreq=false;     uint32_t sdFreq=0;
   bool hasAutoplay=false;   bool     autoplay=false;
+  bool hasWatchdog=false;   bool     watchdog=false;
 };

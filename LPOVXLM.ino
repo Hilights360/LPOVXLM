@@ -9,6 +9,8 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <esp_system.h>
+#include <esp_err.h>
+#include <esp_task_wdt.h>
 #include <stdlib.h>
 #include <string.h>
 #include "QuadMap.h"
@@ -112,6 +114,10 @@ uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
 bool     g_autoplayEnabled   = true;
+bool     g_watchdogEnabled   = false;
+static bool g_watchdogAttached = false;
+static bool g_watchdogInitialized = false;
+static const uint32_t WATCHDOG_TIMEOUT_SECONDS = 12;
 
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
@@ -199,6 +205,7 @@ static void handleCBlocks();
 static void handleSdReinit();
 static void handleSdConfig();
 static void handleAutoplay();
+static void handleWatchdog();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -299,6 +306,7 @@ static bool saveSettingsBackupLocked() {
   f.print("sdmode=");     f.println((unsigned int)g_sdPreferredBusWidth);
   f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
   f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
+  f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
   f.close();
   return true;
 }
@@ -327,6 +335,7 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "sdmode") { out.hasSdMode = true; out.sdMode = (uint8_t)clampU32(value.toInt(),0,4); }
     else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
     else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
+    else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
   }
   f.close();
   return true;
@@ -392,6 +401,10 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   if (!present.autoplay && data.hasAutoplay) {
     g_autoplayEnabled = data.autoplay;
     prefs.putBool("autoplay", g_autoplayEnabled);
+  }
+  if (!present.watchdog && data.hasWatchdog) {
+    g_watchdogEnabled = data.watchdog;
+    prefs.putBool("watchdog", g_watchdogEnabled);
   }
   if (!present.sdMode && data.hasSdMode) {
     g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
@@ -545,6 +558,69 @@ static String joinPath(const String& dir, const String& name){
 
 /* -------------------- SD helpers (prefer 4-bit + mutex) -------------------- */
 static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
+
+/* -------------------- Watchdog control -------------------- */
+static bool configureWatchdog(bool enable) {
+  if (enable) {
+    if (g_watchdogAttached) {
+      esp_task_wdt_reset();
+      g_watchdogEnabled = true;
+      return true;
+    }
+
+    if (!g_watchdogInitialized) {
+      esp_err_t err = esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+      if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        Serial.printf("[WDT] init failed: %d\n", (int)err);
+        g_watchdogEnabled = false;
+        return false;
+      }
+      g_watchdogInitialized = true;
+    }
+
+    esp_err_t err = esp_task_wdt_add(nullptr);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      Serial.printf("[WDT] add failed: %d\n", (int)err);
+      g_watchdogEnabled = false;
+      return false;
+    }
+
+    g_watchdogAttached = true;
+    g_watchdogEnabled  = true;
+    esp_task_wdt_reset();
+    Serial.printf("[WDT] Enabled (%lu s timeout)\n", (unsigned long)WATCHDOG_TIMEOUT_SECONDS);
+    return true;
+  }
+
+  if (g_watchdogAttached) {
+    esp_err_t err = esp_task_wdt_delete(nullptr);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_NOT_FOUND) {
+      Serial.printf("[WDT] delete failed: %d\n", (int)err);
+    }
+    g_watchdogAttached = false;
+  }
+
+  if (g_watchdogInitialized) {
+    esp_err_t err = esp_task_wdt_deinit();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      Serial.printf("[WDT] deinit failed: %d\n", (int)err);
+    } else {
+      g_watchdogInitialized = false;
+    }
+  }
+
+  if (g_watchdogEnabled) {
+    Serial.println("[WDT] Disabled");
+  }
+  g_watchdogEnabled = false;
+  return false;
+}
+
+static inline void kickWatchdog() {
+  if (g_watchdogEnabled && g_watchdogAttached) {
+    esp_task_wdt_reset();
+  }
+}
 static void sd_preflight() {
   pinMode(PIN_SD_CMD, INPUT_PULLUP);
   pinMode(PIN_SD_D0,  INPUT_PULLUP);
@@ -1094,6 +1170,7 @@ static void handleStatus(){
   json += "}";
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
   json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
+  json += ",\"watchdog\":" + String(g_watchdogEnabled ? "true" : "false");
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1117,7 +1194,8 @@ static void handleRoot() {
                                    g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
-                                   g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled);
+                                   g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
+                                   g_watchdogEnabled);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1380,6 +1458,27 @@ static void handleAutoplay(){
               String("{\"autoplay\":") + (g_autoplayEnabled ? "true" : "false") + "}");
 }
 
+static void handleWatchdog(){
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    return;
+  }
+
+  bool wantEnable = parseBoolArg(server.arg("enable"));
+  bool applied = configureWatchdog(wantEnable);
+  g_watchdogEnabled = applied;
+  prefs.putBool("watchdog", g_watchdogEnabled);
+  persistSettingsToSd();
+
+  if (wantEnable && !applied) {
+    server.send(500, "application/json", "{\"watchdog\":false,\"error\":\"enable failed\"}");
+    return;
+  }
+
+  server.send(200, "application/json",
+              String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
+}
+
 // Diagnostics
 static void handleFseqHeader(){
   String j="{\"ok\":false}";
@@ -1588,6 +1687,7 @@ static void startWifiAP(){
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
   server.on("/autoplay",HTTP_POST, handleAutoplay);
+  server.on("/watchdog",HTTP_POST, handleWatchdog);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -1655,6 +1755,8 @@ void setup(){
   g_stationId = prefs.getString("station", "");
   present.autoplay = prefs.isKey("autoplay");
   g_autoplayEnabled = prefs.getBool("autoplay", true);
+  present.watchdog = prefs.isKey("watchdog");
+  g_watchdogEnabled = prefs.getBool("watchdog", false);
 
   bool card = cardPresent();
   if (!card) {
@@ -1713,6 +1815,8 @@ void setup(){
   rebuildStrips();
   blackoutAll();
 
+  configureWatchdog(g_watchdogEnabled);
+
   g_bootMs   = millis();
   g_playing  = false;
   g_currentPath = "";
@@ -1720,6 +1824,7 @@ void setup(){
 }
 
 void loop(){
+  kickWatchdog();
   pollWifiStation();
   server.handleClient();
   updateHallSensor();
