@@ -121,7 +121,8 @@ String rootPage(const String &statusClass,
                 bool playing,
                 bool paused,
                 bool autoplayEnabled,
-                bool hallDiagEnabled) {
+                bool hallDiagEnabled,
+                bool watchdogEnabled) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
 
@@ -157,6 +158,10 @@ String rootPage(const String &statusClass,
   String hallDiagHelp = playing
       ? String("Stop playback to enable the hall sensor blink test.")
       : String("Blinks all arms red whenever the hall sensor toggles.");
+
+  String watchdogAttrs;
+  if (watchdogEnabled) watchdogAttrs += " checked";
+  String watchdogHelp = String("Automatically reboots the controller if the main loop stalls.");
 
   const char *pauseLabel = paused ? "Resume" : "Pause";
   String pauseAttrs;
@@ -264,6 +269,12 @@ String rootPage(const String &statusClass,
       "</label>"
       "<div class='muted'>" + hallDiagHelp + "</div>"
       "</div>"
+      "<div style='margin-top:.75rem'>"
+      "<label style='display:flex;align-items:center;gap:.5rem'>"
+      "<input type='checkbox' id='watchdog'" + watchdogAttrs + "> Enable watchdog auto-reboot"
+      "</label>"
+      "<div class='muted'>" + watchdogHelp + "</div>"
+      "</div>"
       "<div class='sep'></div>"
       "<h3>Auto-Play</h3>"
       "<label style='display:flex;align-items:center;gap:.5rem'>"
@@ -318,6 +329,8 @@ String rootPage(const String &statusClass,
       "if(halldiag){halldiag.onchange=()=>{const en=halldiag.checked?'1':'0';fetch('/halldiag?enable='+en,{method:'POST'}).then(()=>location.reload());};}"
       "const autoplay=document.getElementById('autoplay');"
       "if(autoplay){autoplay.onchange=()=>{const en=autoplay.checked?'1':'0';fetch('/autoplay?enable='+en,{method:'POST'}).catch(()=>{autoplay.checked=!autoplay.checked;});};}"
+      "const watchdog=document.getElementById('watchdog');"
+      "if(watchdog){watchdog.onchange=()=>{const en=watchdog.checked?'1':'0';fetch('/watchdog?enable='+en,{method:'POST'}).catch(()=>{watchdog.checked=!watchdog.checked;});};}"
       "const sdinfo=document.getElementById('sdinfo');"
       "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
       "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"
