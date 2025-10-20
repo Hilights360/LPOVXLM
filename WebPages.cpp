@@ -146,7 +146,7 @@ String rootPage(const String &statusClass,
       "</h1>"
       "<a href='/files?path=/'>Files</a>"
       "</div>"
-      "<p class='muted'>AP SSID: <b>" + apSsid + "</b> &middot; IP: <b>" + apIp + "</b> &middot; mDNS: <b>" + mdnsName + "</b></p>"
+      "<p class='muted'>AP SSID: <b>" + apSsid + "</b> &middot; AP IP: <b>" + apIp + "</b> &middot; Wi-Fi IP: <b>" + htmlEscape(staIp) + "</b> &middot; mDNS: <b>" + mdnsName + "</b></p>"
       "<label>Choose .fseq file</label>"
       "<select id='sel'>" + optionsHtml + "</select>"
       "<div class='row'>"

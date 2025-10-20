@@ -39,8 +39,8 @@ static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
 // Latest arm pin map (CLK and DATA per arm)
-static const int ARM_CLK[MAX_ARMS]  = { 48, 2, 38, 35 };
-static const int ARM_DATA[MAX_ARMS] = { 45, 42, 39, 36 };
+static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
+static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
 
 
 // ---------- SD-MMC pins (your new map) ----------
