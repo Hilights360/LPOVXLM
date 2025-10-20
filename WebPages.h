@@ -48,7 +48,9 @@ String rootPage(const String &statusClass,
                 uint32_t sdBaseFreqKHz,
                 uint8_t sdActiveWidth,
                 uint32_t sdActiveFreqKHz,
-                bool sdReady);
+                bool sdReady,
+                bool playing,
+                bool hallDiagEnabled);
 
 }  // namespace WebPages
 

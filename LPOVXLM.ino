@@ -43,11 +43,15 @@ static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 static const int      PIN_HALL_SENSOR        = 5;
 static const int      PIN_STATUS_PIXEL       = 48;
 static const uint32_t HALL_BLINK_DURATION_MS = 100;
+static const uint32_t HALL_DIAG_BLINK_DURATION_MS = 200;
 
 static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800);
 static bool              g_hallPrevActive   = false;
 static bool              g_hallBlinkActive  = false;
 static uint32_t          g_hallBlinkStartMs = 0;
+static bool              g_hallDiagEnabled  = false;
+static bool              g_hallDiagBlinkActive = false;
+static uint32_t          g_hallDiagBlinkStartMs = 0;
 
 // Latest arm pin map (CLK and DATA per arm)
 static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
@@ -133,6 +137,22 @@ Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
 
+  if (g_hallDiagEnabled) {
+    if ((hallActive && !g_hallPrevActive) || (!hallActive && g_hallPrevActive)) {
+      g_hallDiagBlinkActive = true;
+      g_hallDiagBlinkStartMs = millis();
+      const uint8_t arms = activeArmCount();
+      for (uint8_t a = 0; a < arms; ++a) {
+        if (!strips[a]) continue;
+        uint16_t pix = strips[a]->numPixels();
+        for (uint16_t i = 0; i < pix; ++i) {
+          strips[a]->setPixelColor(i, 255, 0, 0);
+        }
+        strips[a]->show();
+      }
+    }
+  }
+
   if (hallActive && !g_hallPrevActive) {
     g_hallBlinkActive = true;
     g_hallBlinkStartMs = millis();
@@ -146,6 +166,11 @@ static void updateHallSensor() {
     g_statusPixel.setPixelColor(0, 0);
     g_statusPixel.show();
     g_hallBlinkActive = false;
+  }
+
+  if (g_hallDiagBlinkActive && (millis() - g_hallDiagBlinkStartMs >= HALL_DIAG_BLINK_DURATION_MS)) {
+    blackoutAll();
+    g_hallDiagBlinkActive = false;
   }
 }
 
@@ -163,6 +188,7 @@ static void handleRoot();
 static void handleB();
 static void handleStart();
 static void handleStop();
+static void handleHallDiag();
 static void handleSpeed();
 static void handleMapCfg();
 static void handleWifiCfg();
@@ -1056,7 +1082,9 @@ static void handleStatus(){
   json += ",\"desiredMode\":" + String((unsigned)g_sdPreferredBusWidth);
   json += ",\"baseFreq\":" + String((unsigned long)g_sdBaseFreqKHz);
   json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
-  json += "}}";
+  json += "}";
+  json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
+  json += "}";
   server.send(200,"application/json",json);
 }
 
@@ -1078,7 +1106,8 @@ static void handleRoot() {
                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
                                    g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
-                                   g_sdBusWidth, g_sdFreqKHz, g_sdReady);
+                                   g_sdBusWidth, g_sdFreqKHz, g_sdReady,
+                                   g_playing, g_hallDiagEnabled);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1115,6 +1144,38 @@ static void handleStart(){ // GET /start?path=/file.fseq
   server.send(200,"application/json","{\"playing\":true}");
 }
 static void handleStop(){ g_playing=false; blackoutAll(); server.send(200,"application/json","{\"playing\":false}"); }
+
+static void handleHallDiag(){
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    return;
+  }
+  String v = server.arg("enable");
+  v.toLowerCase();
+  bool enable = (v == "1" || v == "true" || v == "on" || v == "yes");
+
+  if (enable) {
+    if (!g_hallDiagEnabled) {
+      g_hallDiagEnabled = true;
+      g_playing = false;
+      g_paused = false;
+      g_bootMs = millis();
+      g_hallDiagBlinkActive = false;
+      blackoutAll();
+    }
+  } else {
+    if (g_hallDiagEnabled) {
+      g_hallDiagEnabled = false;
+      g_hallDiagBlinkActive = false;
+      g_bootMs = millis();
+      blackoutAll();
+    }
+  }
+
+  server.send(200, "application/json",
+              String("{\"hallDiag\":") + (g_hallDiagEnabled ? "true" : "false") +
+              ",\"playing\":" + (g_playing ? "true" : "false") + "}");
+}
 
 static void handleSpeed() {
   if (!server.hasArg("fps")) { server.send(400, "text/plain", "missing fps"); return; }
@@ -1440,6 +1501,7 @@ static void startWifiAP(){
   server.on("/b",       HTTP_POST, handleB);
   server.on("/start",   HTTP_GET,  handleStart);
   server.on("/stop",    HTTP_POST, handleStop);
+  server.on("/halldiag", HTTP_POST, handleHallDiag);
   server.on("/speed",   HTTP_POST, handleSpeed);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
@@ -1577,7 +1639,7 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
-  if (!g_playing && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  if (!g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     if (openFseq("/test2.fseq", why)) {
       Serial.println("[TIMEOUT] Auto-start /test2.fseq");
