@@ -112,9 +112,40 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 bool strideIsSpoke,
                 uint16_t fps,
-                uint8_t brightnessPercent) {
+                uint8_t brightnessPercent,
+                uint8_t sdPreferredMode,
+                uint32_t sdBaseFreqKHz,
+                uint8_t sdActiveWidth,
+                uint32_t sdActiveFreqKHz,
+                bool sdReady) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
+
+  const char *sdAutoSel = (sdPreferredMode == 0) ? "selected" : "";
+  const char *sd4Sel   = (sdPreferredMode == 4) ? "selected" : "";
+  const char *sd1Sel   = (sdPreferredMode == 1) ? "selected" : "";
+
+  const char *freq8Sel = (sdBaseFreqKHz == 8000) ? "selected" : "";
+  const char *freq4Sel = (sdBaseFreqKHz == 4000) ? "selected" : "";
+  const char *freq2Sel = (sdBaseFreqKHz == 2000) ? "selected" : "";
+  const char *freq1Sel = (sdBaseFreqKHz == 1000) ? "selected" : "";
+  const char *freq0Sel = (sdBaseFreqKHz == 400)  ? "selected" : "";
+
+  String sdCurrent = "Current: ";
+  if (!sdReady) {
+    sdCurrent += "Card not mounted";
+  } else {
+    if (sdActiveWidth == 0) {
+      sdCurrent += "Mounted (width unknown)";
+    } else {
+      sdCurrent += String((unsigned int)sdActiveWidth) + "-bit";
+    }
+    sdCurrent += " @ " + String((unsigned long)sdActiveFreqKHz) + " kHz";
+  }
+  sdCurrent += " • Target: ";
+  if (sdPreferredMode == 0) sdCurrent += "Auto";
+  else sdCurrent += String((unsigned int)sdPreferredMode) + "-bit";
+  sdCurrent += " @ " + String((unsigned long)sdBaseFreqKHz) + " kHz";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -183,6 +214,25 @@ String rootPage(const String &statusClass,
       "<input id='rng' type='range' min='0' max='100' value='" + String(brightnessPercent) + "'>"
       "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
       "<div class='sep'></div>"
+      "<h3>SD Card</h3>"
+      "<div class='row' style='gap:1rem;flex-wrap:wrap'>"
+      "<div style='min-width:140px'><label>Bus Mode</label><select id='sdmode'>"
+      "<option value='0' " + String(sdAutoSel) + ">Auto (try 4-bit then 1-bit)</option>"
+      "<option value='4' " + String(sd4Sel) + ">Force 4-bit</option>"
+      "<option value='1' " + String(sd1Sel) + ">Force 1-bit</option>"
+      "</select></div>"
+      "<div style='min-width:140px'><label>Clock Frequency</label><select id='sdfreq'>"
+      "<option value='8000' " + String(freq8Sel) + ">8 MHz</option>"
+      "<option value='4000' " + String(freq4Sel) + ">4 MHz</option>"
+      "<option value='2000' " + String(freq2Sel) + ">2 MHz</option>"
+      "<option value='1000' " + String(freq1Sel) + ">1 MHz</option>"
+      "<option value='400' " + String(freq0Sel) + ">400 kHz</option>"
+      "</select></div>"
+      "<div style='align-self:end'><button id='applysd'>Apply SD Settings</button></div>"
+      "<div style='align-self:end'><button id='sdrefresh'>Refresh SD Status</button></div>"
+      "</div>"
+      "<div id='sdinfo' class='muted' style='margin-top:.4rem'>" + sdCurrent + "</div>"
+      "<div class='sep'></div>"
       "<h3>Diagnostics</h3>"
       "<div class='row'>"
       "<button id='hdr'>FSEQ Header</button>"
@@ -234,6 +284,18 @@ String rootPage(const String &statusClass,
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
       "document.getElementById('stat').onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
+      "const sdinfo=document.getElementById('sdinfo');"
+      "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
+      "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"
+      "updateSd();"
+      "document.getElementById('sdrefresh').onclick=()=>updateSd();"
+      "document.getElementById('applysd').onclick=()=>{"
+      "const mode=document.getElementById('sdmode').value;"
+      "const freq=document.getElementById('sdfreq').value;"
+      "fetch('/sd/config?mode='+mode+'&freq='+freq,{method:'POST'}).then(r=>r.json()).then(j=>{"
+      "if(sdinfo){if(j.ok){sdinfo.textContent=formatSd({sd:j});}else if(j.error){sdinfo.textContent='Error: '+j.error;}else{sdinfo.textContent='Error applying SD settings';}}"
+      "}).catch(()=>{if(sdinfo) sdinfo.textContent='Error applying SD settings';});"
+      "};"
       "</script>"
       "</body></html>";
   return html;

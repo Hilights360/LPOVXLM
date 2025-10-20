@@ -2,6 +2,8 @@
 #pragma once
 #include <Arduino.h>
 
+enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
+
 struct PrefPresence {
   bool brightness=false;
   bool fps=false;
@@ -13,6 +15,8 @@ struct PrefPresence {
   bool staSsid=false;
   bool staPass=false;
   bool station=false;
+  bool sdMode=false;
+  bool sdFreq=false;
 };
 
 struct SettingsData {
@@ -26,4 +30,6 @@ struct SettingsData {
   bool hasStaSsid=false;    String   staSsid;
   bool hasStaPass=false;    String   staPass;
   bool hasStation=false;    String   stationId;
+  bool hasSdMode=false;     uint8_t  sdMode=0;
+  bool hasSdFreq=false;     uint32_t sdFreq=0;
 };

@@ -43,7 +43,12 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 bool strideIsSpoke,
                 uint16_t fps,
-                uint8_t brightnessPercent);
+                uint8_t brightnessPercent,
+                uint8_t sdPreferredMode,
+                uint32_t sdBaseFreqKHz,
+                uint8_t sdActiveWidth,
+                uint32_t sdActiveFreqKHz,
+                bool sdReady);
 
 }  // namespace WebPages
 
