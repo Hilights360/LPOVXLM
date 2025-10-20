@@ -2,6 +2,8 @@
 #pragma once
 #include <Arduino.h>
 
+enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
+
 struct PrefPresence {
   bool brightness=false;
   bool fps=false;

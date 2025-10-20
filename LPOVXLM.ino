@@ -54,7 +54,6 @@ static const int PIN_SD_D3  = 11;
 static const int PIN_SD_CD  = 14;  // LOW = inserted
 
 // SD dynamic timing & fail tracking
-enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
 static SdBusPreference g_sdPreferredBusWidth = SD_BUS_AUTO;
 static const uint32_t SD_FREQ_OPTIONS[] = { 8000, 4000, 2000, 1000, 400 };
 static const size_t   SD_FREQ_OPTION_COUNT = sizeof(SD_FREQ_OPTIONS) / sizeof(SD_FREQ_OPTIONS[0]);
