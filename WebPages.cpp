@@ -117,7 +117,9 @@ String rootPage(const String &statusClass,
                 uint32_t sdBaseFreqKHz,
                 uint8_t sdActiveWidth,
                 uint32_t sdActiveFreqKHz,
-                bool sdReady) {
+                bool sdReady,
+                bool playing,
+                bool hallDiagEnabled) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
 
@@ -146,6 +148,13 @@ String rootPage(const String &statusClass,
   if (sdPreferredMode == 0) sdCurrent += "Auto";
   else sdCurrent += String((unsigned int)sdPreferredMode) + "-bit";
   sdCurrent += " @ " + String((unsigned long)sdBaseFreqKHz) + " kHz";
+
+  String hallDiagAttrs;
+  if (hallDiagEnabled) hallDiagAttrs += " checked";
+  if (playing) hallDiagAttrs += " disabled";
+  String hallDiagHelp = playing
+      ? String("Stop playback to enable the hall sensor blink test.")
+      : String("Blinks all arms red whenever the hall sensor toggles.");
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -240,6 +249,12 @@ String rootPage(const String &statusClass,
       "<button id='sdre'>SD Reinit</button>"
       "<button id='stat'>Status JSON</button>"
       "</div>"
+      "<div style='margin-top:.75rem'>"
+      "<label style='display:flex;align-items:center;gap:.5rem'>"
+      "<input type='checkbox' id='halldiag'" + hallDiagAttrs + "> Hall Sensor Blink Test"
+      "</label>"
+      "<div class='muted'>" + hallDiagHelp + "</div>"
+      "</div>"
       "<div class='sep'></div>"
       "<p class='muted'>If no file is started within 5 minutes after boot, <b>/test2.fseq</b> will auto-play.</p>"
       "</div>"
@@ -284,6 +299,8 @@ String rootPage(const String &statusClass,
       "document.getElementById('cblocks').onclick=()=>fetch('/fseq/cblocks').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
       "document.getElementById('sdre').onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).then(t=>alert(t));"
       "document.getElementById('stat').onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));"
+      "const halldiag=document.getElementById('halldiag');"
+      "if(halldiag){halldiag.onchange=()=>{const en=halldiag.checked?'1':'0';fetch('/halldiag?enable='+en,{method:'POST'}).then(()=>location.reload());};}"
       "const sdinfo=document.getElementById('sdinfo');"
       "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
       "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"
