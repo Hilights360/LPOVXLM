@@ -36,18 +36,20 @@ String filesPageHeader(const String &pathEscaped,
       "button{padding:.4rem .7rem;border:0;border-radius:8px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
       "button:hover{filter:brightness(1.1)}"
       "input{padding:.45rem .5rem;border-radius:8px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+      ".muted{opacity:.75}"
       "</style></head><body><div class='card'>"
       "<div style='display:flex;justify-content:space-between;align-items:center'>"
       "<h2 style='margin:0'>Files</h2>"
+      "<div style='display:flex;gap:.75rem;align-items:center'>"
+      "<a href='/updates'>Updates</a>"
       "<a href='/'>Back to Control</a>"
+      "</div>"
       "</div>"
       "<p>Path: <b>" + pathEscaped + "</b> &middot; "
       "<a href='/files?path=" + parentEncoded + "'>Up</a></p>"
-      "<form method='POST' action='/upload?dir=" + currentPathEncoded + "&back=" + backEncoded + "' enctype='multipart/form-data'>"
-      "<input type='file' name='f' accept='.fseq' required> "
-      "<button type='submit'>Upload here</button>"
-      "<div class='muted' style='margin-top:.25rem'>Only <b>.fseq</b> files are accepted.</div>"
-      "</form>"
+
+      // NOTE: Firmware upload moved to /updates
+
       "<div class='row' style='margin-top:.75rem'>"
       "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + currentPathEncoded + "&name='+encodeURIComponent(n);\">New Folder</button>"
       "<button onclick=\"location.reload()\">Refresh</button>"
@@ -122,7 +124,11 @@ String rootPage(const String &statusClass,
                 bool paused,
                 bool autoplayEnabled,
                 bool hallDiagEnabled,
-                bool watchdogEnabled) {
+                bool watchdogEnabled,
+                bool bgEffectEnabled,
+                bool bgEffectActive,
+                const String &bgEffectCurrentEscaped,
+                const String &bgEffectOptionsHtml) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
 
@@ -168,6 +174,9 @@ String rootPage(const String &statusClass,
   if (!playing) pauseAttrs += " disabled";
   String autoplayAttrs;
   if (autoplayEnabled) autoplayAttrs += " checked";
+  String bgAttrs;
+  if (bgEffectEnabled) bgAttrs += " checked";
+  String bgStatus = bgEffectActive ? "<span class='badge play'>Active</span>" : "<span class='badge stop'>Idle</span>";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -196,8 +205,12 @@ String rootPage(const String &statusClass,
       "POV Spinner"
       "<span id='status' class='" + statusClass + "'>" + statusText + "</span>"
       "<span id='which' class='pill'>" + currentFileEscaped + "</span>"
+      "<span id='rpm' class='pill' title='Rotations per minute'>RPM: …</span>"
       "</h1>"
+      "<div style='display:flex;gap:.75rem;align-items:center'>"
+      "<a href='/updates'>Updates</a>"
       "<a href='/files?path=/'>Files</a>"
+      "</div>"
       "</div>"
       "<p class='muted'>AP SSID: <b>" + apSsid + "</b> &middot; AP IP: <b>" + apIp + "</b> &middot; Wi-Fi IP: <b>" + htmlEscape(staIp) + "</b> &middot; mDNS: <b>" + mdnsName + "</b></p>"
       "<label>Choose .fseq file</label>"
@@ -207,6 +220,7 @@ String rootPage(const String &statusClass,
       "<button id='pause'" + pauseAttrs + ">" + pauseLabel + "</button>"
       "<button id='stop'>Stop</button>"
       "<button id='refresh'>Refresh</button>"
+      "<button onclick=\"location='/ota'\">Direct OTA</button>"
       "</div>"
       "<div class='sep'></div>"
       "<h3>Wi-Fi Station</h3>"
@@ -251,8 +265,8 @@ String rootPage(const String &statusClass,
       "<option value='1000' " + String(freq1Sel) + ">1 MHz</option>"
       "<option value='400' " + String(freq0Sel) + ">400 kHz</option>"
       "</select></div>"
-      "<div style='align-self:end'><button id='applysd'>Apply SD Settings</button></div>"
-      "<div style='align-self:end'><button id='sdrefresh'>Refresh SD Status</button></div>"
+      "<div style='align-self=end'><button id='applysd'>Apply SD Settings</button></div>"
+      "<div style='align-self=end'><button id='sdrefresh'>Refresh SD Status</button></div>"
       "</div>"
       "<div id='sdinfo' class='muted' style='margin-top:.4rem'>" + sdCurrent + "</div>"
       "<div class='sep'></div>"
@@ -276,9 +290,17 @@ String rootPage(const String &statusClass,
       "<div class='muted'>" + watchdogHelp + "</div>"
       "</div>"
       "<div class='sep'></div>"
+      "<h3>Background Effect</h3>"
+      "<label style='display:flex;align-items:center;gap:.5rem'>"
+      "<input type='checkbox' id='bgenable'" + bgAttrs + "> Run Background Effect"
+      "</label>"
+      "<select id='bgepath'>" + bgEffectOptionsHtml + "</select>"
+      "<div class='muted'>Current: <b>" + bgEffectCurrentEscaped + "</b> • Status: " + (bgEffectActive ? "<span class='badge play'>Active</span>" : "<span class='badge stop'>Idle</span>") + "</div>"
+      "<div class='muted'>Files sourced from <b>/BGEffects</b> on the SD card.</div>"
+      "<div class='sep'></div>"
       "<h3>Auto-Play</h3>"
       "<label style='display:flex;align-items:center;gap:.5rem'>"
-      "<input type='checkbox' id='autoplay'" + autoplayAttrs + "> Enable fallback auto-play"
+      "<input type='checkbox' id='autoplay'" + autoplayEnabled + "> Enable fallback auto-play"
       "</label>"
       "<p class='muted'>When enabled, <b>/test2.fseq</b> will start automatically after 5 minutes of inactivity.</p>"
       "</div>"
@@ -331,6 +353,10 @@ String rootPage(const String &statusClass,
       "if(autoplay){autoplay.onchange=()=>{const en=autoplay.checked?'1':'0';fetch('/autoplay?enable='+en,{method:'POST'}).catch(()=>{autoplay.checked=!autoplay.checked;});};}"
       "const watchdog=document.getElementById('watchdog');"
       "if(watchdog){watchdog.onchange=()=>{const en=watchdog.checked?'1':'0';fetch('/watchdog?enable='+en,{method:'POST'}).catch(()=>{watchdog.checked=!watchdog.checked;});};}"
+      "const bgenable=document.getElementById('bgenable');"
+      "const bgepath=document.getElementById('bgepath');"
+      "if(bgenable){bgenable.onchange=()=>{const en=bgenable.checked?'1':'0';const path=bgepath?bgepath.value:'';fetch('/bgeffect?enable='+en+'&path='+encodeURIComponent(path),{method:'POST'}).then(()=>location.reload()).catch(()=>{bgenable.checked=!bgenable.checked;});};}"
+      "if(bgepath){bgepath.onchange=()=>{const path=bgepath.value;let url='/bgeffect?path='+encodeURIComponent(path);if(bgenable) url+='&enable='+(bgenable.checked?'1':'0');fetch(url,{method:'POST'}).then(()=>location.reload()).catch(()=>location.reload());};}"
       "const sdinfo=document.getElementById('sdinfo');"
       "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
       "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"
@@ -343,10 +369,79 @@ String rootPage(const String &statusClass,
       "if(sdinfo){if(j.ok){sdinfo.textContent=formatSd({sd:j});}else if(j.error){sdinfo.textContent='Error: '+j.error;}else{sdinfo.textContent='Error applying SD settings';}}"
       "}).catch(()=>{if(sdinfo) sdinfo.textContent='Error applying SD settings';});"
       "};"
+      "const rpmEl=document.getElementById('rpm');"
+      "function pollStatus(){fetch('/status').then(r=>r.json()).then(j=>{"
+      "  if(rpmEl && typeof j.rpm!=='undefined'){rpmEl.textContent='RPM: '+j.rpm;}"
+      "  const st=document.getElementById('status');"
+      "  if(st){st.textContent=j.playing?(j.paused?'Paused':'Playing'):'Stopped';"
+      "    st.className=j.playing?(j.paused?'badge pause':'badge play'):'badge stop';}"
+      "}).catch(()=>{});}"
+      "pollStatus();"
+      "setInterval(pollStatus,1000);"
       "</script>"
       "</body></html>";
   return html;
 }
 
-}  // namespace WebPages
+// === New standalone Updates page (Upload + conditional Reboot button)
+String updatesPage(bool canReboot) {
+  String disabled = canReboot ? "" : " disabled";
+  String dim = canReboot ? "" : " style='opacity:.5;cursor:not-allowed'";
 
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Updates</title>"
+    "<style>"
+    "body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
+    ".card{max-width:860px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}"
+    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
+    ".row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.75rem}"
+    "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
+    "button:hover{filter:brightness(1.1)}"
+    "input[type=file]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+    ".muted{opacity:.75}"
+    ".sep{height:1px;background:#1b2741;margin:1rem 0}"
+    "</style></head><body>"
+    "<div class='card'>"
+    "<div style='display:flex;justify-content:space-between;align-items:center'>"
+    "<h2 style='margin:0'>Updates</h2>"
+    "<div style='display:flex;gap:.75rem;align-items:center'>"
+    "<a href='/'>Back</a>"
+    "<a href='/files?path=/'>Files</a>"
+    "</div>"
+    "</div>"
+
+    "<h3>Upload firmware.bin to SD</h3>"
+    "<form id='sdform' method='POST' action='/fw/upload' enctype='multipart/form-data'>"
+    "<input type='file' name='fw' accept='.bin' required> "
+    "<button type='submit'>Upload to SD</button>"
+    "</form>"
+    "<div class='muted' style='margin-top:.25rem'>Place a file named <b>firmware.bin</b>. After upload, you can reboot to apply.</div>"
+    "<div class='row'>"
+    "<button id='rebootBtn'" + disabled + dim + ">Reboot & Install</button>"
+    "</div>"
+
+    "<div class='sep'></div>"
+
+    "<h3>Direct OTA (flash now)</h3>"
+    "<form method='POST' action='/ota' enctype='multipart/form-data'>"
+    "<input type='file' name='fw' accept='.bin' required> "
+    "<button type='submit'>Flash Immediately</button>"
+    "</form>"
+    "<div class='muted' style='margin-top:.25rem'>This will flash and reboot immediately after the upload completes.</div>"
+
+    "</div>"
+    "<script>"
+    "document.getElementById('rebootBtn')?.addEventListener('click',()=>{"
+    "  fetch('/reboot',{method:'POST'}).then(()=>{"
+    "    alert('Rebooting…');"
+    "  }).catch(()=>{});"
+    "});"
+    // When SD upload completes, server redirects to /updates?uploaded=1; nothing else needed
+    "</script>"
+    "</body></html>";
+  return html;
+}
+
+} // namespace WebPages

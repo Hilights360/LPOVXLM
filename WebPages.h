@@ -53,7 +53,14 @@ String rootPage(const String &statusClass,
                 bool paused,
                 bool autoplayEnabled,
                 bool hallDiagEnabled,
-                bool watchdogEnabled);
+                bool watchdogEnabled,
+                bool bgEffectEnabled,
+                bool bgEffectActive,
+                const String &bgEffectCurrentEscaped,
+                const String &bgEffectOptionsHtml);
+
+// NEW: Standalone Updates page (Upload + Reboot UI)
+// Pass canReboot=true to enable the Reboot button (e.g., after successful upload)
+String updatesPage(bool canReboot);
 
 }  // namespace WebPages
-

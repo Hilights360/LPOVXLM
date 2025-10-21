@@ -1,3 +1,7 @@
+// Flag Sentry / POV Spinner — full sketch with RPM counter, OTA, and Updates page
+// Board: ESP32-S3
+// Tim Nash (Inventor) — forward-thinking build with traditional robustness
+
 #include "ConfigTypes.h"
 #include <Arduino.h>
 #include <SD_MMC.h>
@@ -34,14 +38,13 @@ static inline bool SD_LOCK(TickType_t to = portMAX_DELAY) {
 }
 static inline void SD_UNLOCK() { if (g_sdMutex) xSemaphoreGive(g_sdMutex); }
 
-
 // ---------- SK9822 / APA102 ----------
 static const uint8_t  MAX_ARMS               = 4;
 static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
 // ---------- Hall effect + status pixel ----------
-static const int      PIN_HALL_SENSOR        = 5;
+static const int      PIN_HALL_SENSOR        = 5;   // A3144 on this pin (LOW when magnet present)
 static const int      PIN_STATUS_PIXEL       = 48;
 static const uint32_t HALL_BLINK_DURATION_MS = 100;
 static const uint32_t HALL_DIAG_BLINK_DURATION_MS = 200;
@@ -54,6 +57,26 @@ static bool              g_hallDiagEnabled  = false;
 static bool              g_hallDiagBlinkActive = false;
 static uint32_t          g_hallDiagBlinkStartMs = 0;
 
+// RPM measurement (A3144)
+static const uint8_t     PULSES_PER_REV      = 1;   // change if you have multiple magnets
+volatile uint32_t        g_lastPeriodUs      = 0;   // last valid pulse period (us)
+volatile uint32_t        g_pulseCount        = 0;   // total pulses seen
+volatile uint32_t        g_lastPulseUsIsr    = 0;   // last pulse timestamp (us) in ISR
+static uint32_t          g_rpmUi             = 0;   // filtered RPM for UI/status
+static uint32_t          g_lastRpmUpdateMs   = 0;
+
+static void IRAM_ATTR hallIsr() {
+  uint32_t now = micros();
+  uint32_t last = g_lastPulseUsIsr;
+  g_lastPulseUsIsr = now;
+  // crude debounce: ignore pulses < 1ms apart (spurious)
+  uint32_t dt = now - last;
+  if (dt > 1000) {
+    g_lastPeriodUs = dt;
+    g_pulseCount++;
+  }
+}
+
 // Latest arm pin map (CLK and DATA per arm)
 static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
 static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
@@ -63,18 +86,14 @@ bool     g_watchdogEnabled   = false;
 static bool g_watchdogAttached = false;
 
 static void applyWatchdogSetting() {
-  // Bitmask for all cores' idle tasks (S3 is dual-core)
   const uint32_t ALL_CORES_MASK = (1U << portNUM_PROCESSORS) - 1U;
 
   if (g_watchdogEnabled) {
-    // New IDF 5.x config struct
     esp_task_wdt_config_t cfg = {
       .timeout_ms    = WATCHDOG_TIMEOUT_SECONDS * 1000U,
-      .idle_core_mask= ALL_CORES_MASK,   // also subscribes idle tasks
-      .trigger_panic = true              // panic+backtrace on WDT
+      .idle_core_mask= ALL_CORES_MASK,
+      .trigger_panic = true
     };
-
-    // Init (or reconfigure if already inited)
     esp_err_t err = esp_task_wdt_init(&cfg);
     if (err == ESP_ERR_INVALID_STATE) {
       err = esp_task_wdt_reconfigure(&cfg);
@@ -83,10 +102,8 @@ static void applyWatchdogSetting() {
       Serial.printf("[WDT] init/reconfig failed: %d\n", (int)err);
       return;
     }
-
-    // Subscribe the current task once
     if (!g_watchdogAttached) {
-      err = esp_task_wdt_add(nullptr); // current task
+      err = esp_task_wdt_add(nullptr);
       if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
         g_watchdogAttached = true;
         esp_task_wdt_reset();
@@ -96,7 +113,6 @@ static void applyWatchdogSetting() {
       }
     }
   } else if (g_watchdogAttached) {
-    // Unsubscribe and deinit (order matters)
     esp_task_wdt_delete(nullptr);
     esp_task_wdt_deinit();
     g_watchdogAttached = false;
@@ -104,19 +120,12 @@ static void applyWatchdogSetting() {
   }
 }
 
+static inline void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
 
-static inline void feedWatchdog() {
-  if (g_watchdogAttached) {
-    esp_task_wdt_reset();
-  }
-}
-
-
-// ---------- SD-MMC pins (your new map) ----------
+// ---------- SD-MMC pins ----------
 static const int PIN_SD_CLK = 10;
 static const int PIN_SD_CMD = 9;
 static const int PIN_SD_D0  = 8;
-// keep defined for later 4-bit
 static const int PIN_SD_D1  = 13;
 static const int PIN_SD_D2  = 12;
 static const int PIN_SD_D3  = 11;
@@ -126,9 +135,9 @@ static const int PIN_SD_CD  = 14;  // LOW = inserted
 static SdBusPreference g_sdPreferredBusWidth = SD_BUS_AUTO;
 static const uint32_t SD_FREQ_OPTIONS[] = { 8000, 4000, 2000, 1000, 400 };
 static const size_t   SD_FREQ_OPTION_COUNT = sizeof(SD_FREQ_OPTIONS) / sizeof(SD_FREQ_OPTIONS[0]);
-static uint32_t g_sdBaseFreqKHz = 8000;  // persisted target frequency
-static uint32_t g_sdFreqKHz     = 8000;  // current working frequency (may step down)
-static int      g_sdFailStreak  = 0;     // consecutive read failures
+static uint32_t g_sdBaseFreqKHz = 8000;
+static uint32_t g_sdFreqKHz     = 8000;
+static int      g_sdFailStreak  = 0;
 
 // Persistent scratch for zlib frames
 static uint8_t* s_ctmp = nullptr;
@@ -147,6 +156,7 @@ static const char* SETTINGS_DIR  = "/config";
 static const char* SETTINGS_FILE = "/config/settings.ini";
 static const char* OTA_FILE      = "/firmware.bin";
 static const char* OTA_FAIL_FILE = "/firmware.failed";
+static const char* BG_EFFECTS_DIR = "/BGEffects";
 
 WebServer server(80);
 
@@ -166,6 +176,10 @@ uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
 bool     g_autoplayEnabled   = true;
+bool     g_bgEffectEnabled   = false;
+bool     g_bgEffectActive    = false;
+String   g_bgEffectPath;
+uint32_t g_bgEffectNextAttemptMs = 0;
 
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
@@ -188,7 +202,7 @@ const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
-/* -------------------- Hall effect handling -------------------- */
+/* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
 
@@ -196,7 +210,7 @@ static void updateHallSensor() {
     if ((hallActive && !g_hallPrevActive) || (!hallActive && g_hallPrevActive)) {
       g_hallDiagBlinkActive = true;
       g_hallDiagBlinkStartMs = millis();
-      const uint8_t arms = activeArmCount();
+      const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
       for (uint8_t a = 0; a < arms; ++a) {
         if (!strips[a]) continue;
         uint16_t pix = strips[a]->numPixels();
@@ -224,7 +238,13 @@ static void updateHallSensor() {
   }
 
   if (g_hallDiagBlinkActive && (millis() - g_hallDiagBlinkStartMs >= HALL_DIAG_BLINK_DURATION_MS)) {
-    blackoutAll();
+    const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
+    for (uint8_t a=0; a<arms; ++a){
+      if (!strips[a]) continue;
+      uint16_t pix = strips[a]->numPixels();
+      for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
+      strips[a]->show();
+    }
     g_hallDiagBlinkActive = false;
   }
 }
@@ -254,6 +274,17 @@ static void handleSdReinit();
 static void handleSdConfig();
 static void handleAutoplay();
 static void handleWatchdog();
+static void handleBgEffect();
+
+// New: Updates hub, OTA, FW to SD, Reboot
+static void handleUpdatesPage();
+static void handleReboot();
+static void handleOtaPage();
+static void handleOtaData();
+static void handleOtaFinish();
+static void handleFwUploadData();
+static void handleFwUploadDone();
+static bool otaAuthOK() { return true; } // stub (add auth if desired)
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -308,6 +339,37 @@ static bool isFseqName(const String& n) {
   return ext == "fseq";
 }
 
+static bool isBgEffectPath(const String& path) {
+  const size_t prefixLen = strlen(BG_EFFECTS_DIR);
+  if (path.length() <= prefixLen) return false;
+  if (!path.startsWith(BG_EFFECTS_DIR)) return false;
+  return path.charAt(prefixLen) == '/';
+}
+
+static String sanitizeBgEffectPath(const String& in) {
+  String path = in;
+  path.trim();
+  if (!path.length()) return String();
+  if (path.indexOf("..") >= 0) return String();
+  if (path[0] != '/') path = "/" + path;
+  if (!isBgEffectPath(path)) return String();
+  if (!isFseqName(path)) return String();
+  return path;
+}
+
+static String bgEffectDisplayName(const String& path) {
+  if (isBgEffectPath(path)) {
+    size_t prefixLen = strlen(BG_EFFECTS_DIR);
+    if (path.length() > prefixLen + 1) {
+      return path.substring(prefixLen + 1);
+    }
+  }
+  String name = path;
+  int slash = name.lastIndexOf('/');
+  if (slash >= 0) name = name.substring(slash + 1);
+  return name;
+}
+
 static String defaultStationId() {
   char buf[16];
   uint64_t mac = ESP.getEfuseMac();
@@ -326,6 +388,16 @@ static bool ensureSettingsDirLocked() {
   if (!SD_MMC.exists(SETTINGS_DIR)) {
     if (!SD_MMC.mkdir(SETTINGS_DIR)) {
       Serial.println("[CFG] Failed to create settings directory");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool ensureBgEffectsDirLocked() {
+  if (!SD_MMC.exists(BG_EFFECTS_DIR)) {
+    if (!SD_MMC.mkdir(BG_EFFECTS_DIR)) {
+      Serial.println("[CFG] Failed to create BGEffects directory");
       return false;
     }
   }
@@ -355,6 +427,8 @@ static bool saveSettingsBackupLocked() {
   f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
   f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
   f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
+  f.print("bge_enable="); f.println(g_bgEffectEnabled ? 1 : 0);
+  f.print("bge_path=");   f.println(g_bgEffectPath);
   f.close();
   return true;
 }
@@ -384,6 +458,8 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
     else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
     else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
+    else if (key == "bge_enable") { out.hasBgEffectEnable = true; out.bgEffectEnable = (value.toInt() != 0); }
+    else if (key == "bge_path") { out.hasBgEffectPath = true; out.bgEffectPath = value; }
   }
   f.close();
   return true;
@@ -454,7 +530,16 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
     g_watchdogEnabled = data.watchdog;
     prefs.putBool("watchdog", g_watchdogEnabled);
   }
-  if (!present.sdMode && data.hasSdMode) {
+  if (!present.bgEffectEnable && data.hasBgEffectEnable) {
+    g_bgEffectEnabled = data.bgEffectEnable;
+    prefs.putBool("bge_enable", g_bgEffectEnabled);
+  }
+  if (!present.bgEffectPath && data.hasBgEffectPath) {
+    g_bgEffectPath = sanitizeBgEffectPath(data.bgEffectPath);
+    prefs.putString("bge_path", g_bgEffectPath);
+    g_bgEffectNextAttemptMs = millis();
+  }
+  if (!present.sdMode && data.hasSdFreq) {
     g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
     prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth);
   }
@@ -505,10 +590,7 @@ static void checkSdFirmwareUpdate() {
   if (!g_sdReady || !g_sdMutex) return;
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
   File f = SD_MMC.open(OTA_FILE, FILE_READ);
-  if (!f) {
-    SD_UNLOCK();
-    return;
-  }
+  if (!f) { SD_UNLOCK(); return; }
   size_t size = f.size();
   if (!size) {
     f.close();
@@ -700,6 +782,7 @@ static void freeFseq(){
   if (g_cblocks){ free(g_cblocks); g_cblocks=nullptr; }
   if (s_ctmp){ free(s_ctmp); s_ctmp=nullptr; s_ctmp_size=0; }
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
+  g_bgEffectActive = false;
   memset(&g_fh,0,sizeof(g_fh));
 }
 
@@ -718,7 +801,7 @@ static int64_t sparseTranslate(uint32_t absCh) {
 
 static bool openFseq(const String& path, String& why){
   freeFseq();
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { why="sd busy"; return false; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { why="sd busy"; return false; }
   bool ok = false;
   do {
     g_fseq = SD_MMC.open(path, FILE_READ);
@@ -780,6 +863,7 @@ static bool openFseq(const String& path, String& why){
     if (!g_frameBuf){ why="oom frame"; break; }
 
     g_currentPath = path; g_frameIndex=0; g_lastTickMs = millis(); g_playing = true;
+    g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
     Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
       path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
       g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, (unsigned)g_fh.sparseCnt, g_fh.chanDataOffset);
@@ -796,7 +880,7 @@ static bool loadFrame(uint32_t idx){
   if (!g_fseq || !g_fh.frameCount) return false;
   idx %= g_fh.frameCount;
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) return false;
   bool ok=false;
 
   if (g_fh.compType == 0){
@@ -921,8 +1005,40 @@ static void listFseqInDir_locked(const char* path, String& optionsHtml, uint8_t 
   dir.close();
 }
 static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth = 0) {
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip list"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip list"); return; }
   listFseqInDir_locked(path, optionsHtml, depth);
+  SD_UNLOCK();
+}
+
+static void listBgEffects_locked(String& optionsHtml, const String& current) {
+  File dir = SD_MMC.open(BG_EFFECTS_DIR);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  File ent;
+  while ((ent = dir.openNextFile())) {
+    if (ent.isDirectory()) { ent.close(); continue; }
+    String name = ent.name();
+    if (!isFseqName(name)) { ent.close(); continue; }
+    bool selected = (name == current);
+    String valueEsc = htmlEscape(name);
+    String labelEsc = htmlEscape(bgEffectDisplayName(name));
+    optionsHtml += "<option value='";
+    optionsHtml += valueEsc;
+    optionsHtml += "'";
+    if (selected) optionsHtml += " selected";
+    optionsHtml += ">";
+    optionsHtml += labelEsc;
+    optionsHtml += "</option>";
+    ent.close();
+  }
+  dir.close();
+}
+
+static void listBgEffects(String& optionsHtml, const String& current) {
+  optionsHtml += "<option value=''";
+  if (!current.length()) optionsHtml += " selected";
+  optionsHtml += ">(none)</option>";
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip bge list"); return; }
+  listBgEffects_locked(optionsHtml, current);
   SD_UNLOCK();
 }
 
@@ -930,7 +1046,7 @@ static void handleFiles() {
   String path = server.hasArg("path") ? server.arg("path") : "/";
   if (!path.length() || path[0] != '/') path = "/" + path;
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
   File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close(); SD_UNLOCK();
@@ -976,7 +1092,7 @@ static void handleDownload() {
   if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
   String path = server.arg("path"); if (!path.startsWith("/")) path = "/" + path;
 
-  if (!SD_LOCK(pdMS_TO_TICKS(5000))) { server.send(503,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { server.send(503,"text/plain","SD busy"); return; }
   File f = SD_MMC.open(path, FILE_READ);
   if (!f || f.isDirectory()) { if (f) f.close(); SD_UNLOCK(); server.send(404, "text/plain", "not found"); return; }
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + htmlEscape(path.substring(path.lastIndexOf('/')+1)) + "\"");
@@ -991,7 +1107,7 @@ static void handlePlayLink() {
   String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
   if (!path.startsWith("/")) path = "/" + path;
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
   bool ok = SD_MMC.exists(path) && isFseqName(path);
   SD_UNLOCK();
   if (!ok) { server.sendHeader("Location", back); server.send(302, "text/plain", "Not a .fseq or missing"); return; }
@@ -1007,7 +1123,7 @@ static void handleDelete() {
   String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
   if (!path.startsWith("/")) path = "/" + path;
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
   File f = SD_MMC.open(path);
   bool ok=false;
   if (f) {
@@ -1021,13 +1137,13 @@ static void handleDelete() {
 
 static void handleMkdir() {
   if (!server.hasArg("path") || !server.hasArg("name")) { server.send(400, "text/plain", "args"); return; }
-  String base = server.arg("path");
+  String base = server.hasArg("path") ? server.arg("path") : "/";
   String name = server.arg("name");
   if (!base.startsWith("/")) base = "/" + base;
   if (name.indexOf('/')>=0 || !name.length()) { server.send(400, "text/plain", "bad name"); return; }
   if (!base.endsWith("/")) base += "/";
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
   bool ok = SD_MMC.mkdir(base + name);
   SD_UNLOCK();
 
@@ -1046,7 +1162,7 @@ static void handleRename() {
   String dir = dirnameOf(p);
   String dst = (dir == "/") ? ("/" + to) : (dir + "/" + to);
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
   bool ok = SD_MMC.rename(p, dst);
   SD_UNLOCK();
 
@@ -1054,7 +1170,7 @@ static void handleRename() {
   server.send(ok?302:500, "text/plain", ok?"Renamed":"Rename failed");
 }
 
-// Upload state
+// Upload state for .fseq
 File   g_uploadFile;
 String g_uploadFilename;
 size_t g_uploadBytes = 0;
@@ -1076,7 +1192,7 @@ static void handleUploadData() {
     if (!isFseqName(g_uploadFilename)) {
       Serial.printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
     } else {
-      if (!SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[UPLOAD] SD busy"); return; }
+      if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[UPLOAD] SD busy"); return; }
       File d = SD_MMC.open(dir);
       bool okdir = d && d.isDirectory(); if (d) d.close();
       if (!okdir) {
@@ -1090,7 +1206,7 @@ static void handleUploadData() {
     }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (g_uploadFile) {
-      if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
         g_uploadFile.write(up.buf, up.currentSize);
         SD_UNLOCK();
         g_uploadBytes += up.currentSize;
@@ -1099,7 +1215,7 @@ static void handleUploadData() {
     }
   } else if (up.status == UPLOAD_FILE_END) {
     if (g_uploadFile) {
-      if (SD_LOCK(pdMS_TO_TICKS(2000))) { g_uploadFile.close(); SD_UNLOCK(); }
+      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_uploadFile.close(); SD_UNLOCK(); }
       Serial.printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes);
     } else {
       Serial.println("[UPLOAD] Aborted/invalid file");
@@ -1111,7 +1227,7 @@ static void handleUploadDone() {
   String back = server.hasArg("back") ? server.arg("back") : "/";
   bool ok=false;
   if (isFseqName(g_uploadFilename)) {
-    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
       ok = SD_MMC.exists(g_uploadFilename);
       SD_UNLOCK();
     }
@@ -1137,6 +1253,36 @@ static void handleUploadDone() {
 static inline const char* statusText() { if (g_paused && g_playing) return "Paused"; if (g_playing) return "Playing"; return "Stopped"; }
 static inline const char* statusClass(){ if (g_paused && g_playing) return "badge pause"; if (g_playing) return "badge play"; return "badge stop"; }
 
+static uint32_t computeRpmSnapshot() {
+  // Calculate RPM based on most recent period; falls back to pulse count if needed.
+  uint32_t rpm = g_rpmUi;
+  uint32_t nowMs = millis();
+
+  // If we had a recent pulse, compute from period
+  uint32_t periodUs = g_lastPeriodUs; // volatile read
+  if (periodUs > 0) {
+    // 60e6 us per minute / (period_us * pulses_per_rev)
+    uint64_t num = 60000000ULL;
+    uint32_t denom = (uint32_t)((uint64_t)periodUs * (uint64_t)PULSES_PER_REV);
+    if (denom) {
+      uint32_t inst = (uint32_t)(num / denom);
+      // simple low-pass filter toward inst
+      rpm = (rpm * 3 + inst) / 4;
+      g_rpmUi = rpm;
+      g_lastRpmUpdateMs = nowMs;
+      return rpm;
+    }
+  }
+
+  // Timeout: if no pulses for >2s, decay to zero
+  if (nowMs - g_lastRpmUpdateMs > 2000) {
+    g_rpmUi = 0;
+    rpm = 0;
+  }
+
+  return rpm;
+}
+
 static void handleStatus(){
   String json = String("{\"playing\":")+(g_playing?"true":"false")
     +",\"paused\":"+(g_paused?"true":"false")
@@ -1159,14 +1305,21 @@ static void handleStatus(){
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
   json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
   json += ",\"watchdog\":" + String(g_watchdogEnabled ? "true" : "false");
+  json += ",\"bgEffect\":{\"enabled\":" + String(g_bgEffectEnabled ? "true" : "false") +
+          ",\"active\":" + String(g_bgEffectActive ? "true" : "false") +
+          ",\"path\":\"" + htmlEscape(g_bgEffectPath) + "\"}";
+  json += ",\"rpm\":" + String(computeRpmSnapshot());
   json += "}";
   server.send(200,"application/json",json);
 }
 
 static void handleRoot() {
   String options; listFseqInDir("/", options);
+  String bgOptions; listBgEffects(bgOptions, g_bgEffectPath);
   String cur = g_currentPath.length() ? g_currentPath : "(none)";
   String curEsc = htmlEscape(cur);
+  String bgDisplay = g_bgEffectPath.length() ? bgEffectDisplayName(g_bgEffectPath) : String("(none)");
+  String bgEsc = htmlEscape(bgDisplay);
   String apIp = AP_IP.toString();
   wl_status_t st = WiFi.status();
   bool staConfigured = g_staSsid.length() > 0;
@@ -1183,7 +1336,8 @@ static void handleRoot() {
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
-                                   g_watchdogEnabled);
+                                   g_watchdogEnabled, g_bgEffectEnabled, g_bgEffectActive, bgEsc,
+                                   bgOptions);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1223,7 +1377,9 @@ static void handleStart(){ // GET /start?path=/file.fseq
 static void handleStop(){
   g_playing=false;
   g_paused=false;
+  g_bgEffectActive = false;
   g_bootMs = millis();
+  g_bgEffectNextAttemptMs = g_bootMs;
   blackoutAll();
   server.send(200,"application/json","{\"playing\":false}");
 }
@@ -1290,7 +1446,9 @@ static void handleHallDiag(){
       g_hallDiagEnabled = true;
       g_playing = false;
       g_paused = false;
+      g_bgEffectActive = false;
       g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
       g_hallDiagBlinkActive = false;
       blackoutAll();
     }
@@ -1299,6 +1457,7 @@ static void handleHallDiag(){
       g_hallDiagEnabled = false;
       g_hallDiagBlinkActive = false;
       g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
       blackoutAll();
     }
   }
@@ -1462,6 +1621,89 @@ static void handleWatchdog(){
               String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
 }
 
+static void handleBgEffect(){
+  bool hasEnable = server.hasArg("enable");
+  bool hasPath = server.hasArg("path");
+  if (!hasEnable && !hasPath) {
+    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
+    return;
+  }
+
+  bool enable = g_bgEffectEnabled;
+  if (hasEnable) {
+    enable = parseBoolArg(server.arg("enable"));
+  }
+
+  String newPath = g_bgEffectPath;
+  if (hasPath) {
+    String raw = server.arg("path");
+    String sanitized = sanitizeBgEffectPath(raw);
+    if (raw.length() && !sanitized.length()) {
+      server.send(400, "application/json", "{\"error\":\"invalid path\"}");
+      return;
+    }
+    newPath = sanitized;
+  }
+
+  bool enableChanged = (enable != g_bgEffectEnabled);
+  bool pathChanged = (newPath != g_bgEffectPath);
+  bool stateChanged = enableChanged || pathChanged;
+
+  if (enableChanged) {
+    g_bgEffectEnabled = enable;
+    prefs.putBool("bge_enable", g_bgEffectEnabled);
+  }
+  if (pathChanged) {
+    g_bgEffectPath = newPath;
+    prefs.putString("bge_path", g_bgEffectPath);
+  }
+  if (stateChanged) {
+    persistSettingsToSd();
+  }
+  g_bootMs = millis();
+
+  if (!g_bgEffectEnabled || !g_bgEffectPath.length()) {
+    if (g_bgEffectActive) {
+      g_playing = false;
+      g_paused = false;
+      g_bgEffectActive = false;
+      g_bootMs = millis();
+      const uint8_t arms = activeArmCount();
+      for (uint8_t a=0; a<arms; ++a){
+        if (!strips[a]) continue;
+        uint16_t pix = strips[a]->numPixels();
+        for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
+        strips[a]->show();
+      }
+    }
+    g_bgEffectNextAttemptMs = millis();
+  } else {
+    if (!g_hallDiagEnabled) {
+      if (!g_playing || g_bgEffectActive) {
+        String why;
+        g_paused = false;
+        if (!openFseq(g_bgEffectPath, why)) {
+          Serial.printf("[BGE] open fail: %s\n", why.c_str());
+          g_bgEffectNextAttemptMs = millis() + 5000;
+        } else {
+          g_bgEffectNextAttemptMs = millis();
+        }
+      } else if (stateChanged) {
+        g_bgEffectNextAttemptMs = millis();
+      }
+    }
+  }
+
+  String resp = "{\"bgEffect\":{\"enabled\":";
+  resp += (g_bgEffectEnabled ? "true" : "false");
+  resp += ",\"active\":";
+  resp += (g_bgEffectActive ? "true" : "false");
+  resp += ",\"path\":\"";
+  resp += htmlEscape(g_bgEffectPath);
+  resp += "\"}}";
+  server.send(200, "application/json", resp);
+}
+
 // Diagnostics
 static void handleFseqHeader(){
   String j="{\"ok\":false}";
@@ -1490,7 +1732,7 @@ static void handleCBlocks(){
 
 static void handleSdReinit(){
   bool ok=false;
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
   bool mounted = (SD_MMC.cardType()!=CARD_NONE);
   SD_UNLOCK();
 
@@ -1557,7 +1799,7 @@ static void handleSdConfig(){
   bool remounted = false;
   bool reopened = false;
   if (card) {
-    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
       SD_MMC.end();
       g_sdBusWidth = 0;
       g_sdReady = false;
@@ -1620,7 +1862,7 @@ static bool recoverSd(const char* reason) {
     }
   }
 
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) return false;
   SD_MMC.end();
   g_sdBusWidth = 0;
   g_sdReady = false;
@@ -1646,6 +1888,127 @@ static bool recoverSd(const char* reason) {
   if (ok) g_sdFailStreak = 0;
   feedWatchdog();
   return ok;
+}
+
+/* -------------------- OTA / Updates page handlers -------------------- */
+
+// Simple direct OTA form (independent page)
+static void handleOtaPage() {
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Direct OTA</title>"
+    "<style>body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
+    ".card{max-width:680px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}"
+    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
+    "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
+    "input[type=file]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+    ".muted{opacity:.75}"
+    "</style></head><body><div class='card'>"
+    "<h2 style='margin:0 0 .5rem 0'>Direct OTA (Flash Now)</h2>"
+    "<p class='muted'>Upload a compiled <b>.bin</b> firmware image. Device will reboot automatically.</p>"
+    "<form method='POST' action='/ota' enctype='multipart/form-data'>"
+    "<input type='file' name='fw' accept='.bin' required> "
+    "<button type='submit'>Flash Immediately</button>"
+    "</form>"
+    "<p style='margin-top:1rem'><a href='/'>Back</a> &middot; <a href='/updates'>Updates</a></p>"
+    "</div></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// Direct OTA upload stream → flash immediately
+File   g_otaFile; // not actually used to store; we stream to Update
+size_t g_otaBytes = 0;
+
+static void handleOtaData() {
+  if (!otaAuthOK()) return;
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_otaBytes = 0;
+    Serial.printf("[OTA] Direct start: %s\n", up.filename.c_str());
+    if (!Update.begin()) { // use max available
+      Serial.printf("[OTA] begin failed: %s\n", Update.errorString());
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (Update.isRunning()) {
+      size_t w = Update.write(up.buf, up.currentSize);
+      if (w != up.currentSize) {
+        Serial.printf("[OTA] write failed: %s\n", Update.errorString());
+      }
+    }
+    g_otaBytes += up.currentSize;
+    feedWatchdog();
+  } else if (up.status == UPLOAD_FILE_END) {
+    bool ok = Update.end(true);
+    Serial.printf("[OTA] Direct end (%u bytes): %s\n", (unsigned)g_otaBytes, ok?"OK":"FAIL");
+  }
+}
+
+static void handleOtaFinish() {
+  if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
+  if (Update.isFinished()) {
+    server.send(200, "text/plain", "OTA complete, rebooting...");
+    delay(200);
+    ESP.restart();
+  } else {
+    server.send(500, "text/plain", String("OTA failed: ") + Update.errorString());
+  }
+}
+
+// Upload firmware.bin to SD (for boot-time apply)
+File   g_fwSdFile;
+size_t g_fwSdBytes = 0;
+
+static void handleFwUploadData() {
+  if (!otaAuthOK()) return;
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_fwSdBytes = 0;
+    if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[FWSD] SD busy at START"); return; }
+    if (SD_MMC.exists(OTA_FILE)) SD_MMC.remove(OTA_FILE);
+    g_fwSdFile = SD_MMC.open(OTA_FILE, FILE_WRITE);
+    SD_UNLOCK();
+    Serial.println("[FWSD] START -> /firmware.bin");
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_fwSdFile) {
+      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
+        g_fwSdFile.write(up.buf, up.currentSize);
+        SD_UNLOCK();
+        g_fwSdBytes += up.currentSize;
+      }
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (g_fwSdFile) {
+      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_fwSdFile.close(); SD_UNLOCK(); }
+      Serial.printf("[FWSD] DONE (%u bytes)\n", (unsigned)g_fwSdBytes);
+    } else {
+      Serial.println("[FWSD] Aborted/invalid");
+    }
+  }
+}
+
+static void handleFwUploadDone() {
+  if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
+  bool present = false;
+  if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
+    present = SD_MMC.exists(OTA_FILE);
+    SD_UNLOCK();
+  }
+  server.sendHeader("Location", present ? "/updates?uploaded=1" : "/updates?uploaded=0");
+  server.send(302);
+}
+
+// Updates hub (Upload to SD + Reboot; Direct OTA link lives elsewhere)
+static void handleUpdatesPage() {
+  bool canReboot = (server.hasArg("uploaded") && server.arg("uploaded") == "1");
+  String html = WebPages::updatesPage(canReboot);
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleReboot() {
+  server.send(200, "text/plain", "Rebooting");
+  delay(150);
+  ESP.restart();
 }
 
 /* -------------------- Server, Setup, Loop -------------------- */
@@ -1677,6 +2040,7 @@ static void startWifiAP(){
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
   server.on("/autoplay",HTTP_POST, handleAutoplay);
   server.on("/watchdog",HTTP_POST, handleWatchdog);
+  server.on("/bgeffect",HTTP_POST, handleBgEffect);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -1691,8 +2055,22 @@ static void startWifiAP(){
   server.on("/mkdir",   HTTP_GET,  handleMkdir);
   server.on("/ren",     HTTP_GET,  handleRename);
 
-  // Upload
+  // Upload FSEQ
   server.on("/upload",  HTTP_POST, handleUploadDone, handleUploadData);
+
+  // Updates hub / OTA / FW to SD
+  server.on("/updates",    HTTP_GET,  handleUpdatesPage);
+  server.on("/ota",        HTTP_GET,  handleOtaPage);
+  server.on("/ota",        HTTP_POST, handleOtaFinish, handleOtaData);
+  server.on("/fw/upload",  HTTP_POST, handleFwUploadDone, handleFwUploadData);
+  server.on("/fw/apply",   HTTP_POST, [](){
+    if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
+    checkSdFirmwareUpdate();
+    server.send(200,"text/plain","OK");
+  });
+
+  // Reboot button endpoint
+  server.on("/reboot", HTTP_POST, handleReboot);
 
   server.onNotFound([](){ server.send(404, "text/plain", String("404 Not Found: ") + server.uri()); });
   server.begin();
@@ -1706,6 +2084,8 @@ void setup(){
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
   pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR), hallIsr, FALLING); // A3144 pulls LOW near magnet
+
   g_statusPixel.begin();
   g_statusPixel.setBrightness(64);
   g_statusPixel.clear();
@@ -1746,6 +2126,17 @@ void setup(){
   g_autoplayEnabled = prefs.getBool("autoplay", true);
   present.watchdog = prefs.isKey("watchdog");
   g_watchdogEnabled = prefs.getBool("watchdog", false);
+  present.bgEffectEnable = prefs.isKey("bge_enable");
+  g_bgEffectEnabled = prefs.getBool("bge_enable", false);
+  present.bgEffectPath = prefs.isKey("bge_path");
+  {
+    String storedBg = prefs.getString("bge_path", "");
+    g_bgEffectPath = sanitizeBgEffectPath(storedBg);
+    if (storedBg.length() && !g_bgEffectPath.length()) {
+      prefs.putString("bge_path", g_bgEffectPath);
+    }
+  }
+  g_bgEffectNextAttemptMs = millis();
 
   bool card = cardPresent();
   if (!card) {
@@ -1760,11 +2151,15 @@ void setup(){
   }
 
   if (g_sdReady) {
-    checkSdFirmwareUpdate();
+    checkSdFirmwareUpdate(); // applies /firmware.bin if present
   }
 
   if (g_sdReady) {
     ensureSettingsFromBackup(present);
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
+      ensureBgEffectsDirLocked();
+      SD_UNLOCK();
+    }
   }
 
   applyWatchdogSetting();
@@ -1794,7 +2189,7 @@ void setup(){
   startWifiAP();
 
   if (g_sdReady) {
-    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
       uint8_t type = SD_MMC.cardType();
       uint64_t sizeMB = (type==CARD_NONE) ? 0 : (SD_MMC.cardSize() / (1024ULL*1024ULL));
       SD_UNLOCK();
@@ -1809,6 +2204,8 @@ void setup(){
   g_bootMs   = millis();
   g_playing  = false;
   g_currentPath = "";
+  g_rpmUi = 0;
+  g_lastRpmUpdateMs = millis();
   Serial.println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
 }
 
@@ -1817,10 +2214,34 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
+  // Periodically stabilize RPM value
+  static uint32_t lastRpmPoll = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastRpmPoll >= 250) {
+    (void)computeRpmSnapshot();
+    lastRpmPoll = nowMs;
+  }
+
   feedWatchdog();
 
-  if (g_autoplayEnabled && !g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_playing) {
+    uint32_t now = millis();
+    if (now >= g_bgEffectNextAttemptMs) {
+      String why;
+      g_paused = false;
+      if (openFseq(g_bgEffectPath, why)) {
+        Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str());
+        g_bgEffectNextAttemptMs = now;
+      } else {
+        Serial.printf("[BGE] open fail: %s\n", why.c_str());
+        g_bgEffectNextAttemptMs = now + 5000;
+      }
+    }
+  }
+
+  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
+    g_paused = false;
     if (openFseq("/test2.fseq", why)) {
       Serial.println("[TIMEOUT] Auto-start /test2.fseq");
     } else {
@@ -1846,9 +2267,11 @@ void loop(){
     ++g_sdFailStreak;
     Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
     if (!recoverSd("frame read failed")) {
-      if (g_sdFailStreak >= 6) {  // give up gracefully for now
+      if (g_sdFailStreak >= 6) {
         Serial.println("[SD] Unrecoverable — pausing playback.");
         g_playing = false;
+        g_bgEffectActive = false;
+        g_bgEffectNextAttemptMs = millis();
         g_sdFailStreak = 0;
       }
     }
