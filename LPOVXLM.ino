@@ -147,6 +147,7 @@ static const char* SETTINGS_DIR  = "/config";
 static const char* SETTINGS_FILE = "/config/settings.ini";
 static const char* OTA_FILE      = "/firmware.bin";
 static const char* OTA_FAIL_FILE = "/firmware.failed";
+static const char* BG_EFFECTS_DIR = "/BGEffects";
 
 WebServer server(80);
 
@@ -166,6 +167,10 @@ uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
 bool     g_autoplayEnabled   = true;
+bool     g_bgEffectEnabled   = false;
+bool     g_bgEffectActive    = false;
+String   g_bgEffectPath;
+uint32_t g_bgEffectNextAttemptMs = 0;
 
 // Spinner model mapping (persisted)
 uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
@@ -254,6 +259,7 @@ static void handleSdReinit();
 static void handleSdConfig();
 static void handleAutoplay();
 static void handleWatchdog();
+static void handleBgEffect();
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -308,6 +314,37 @@ static bool isFseqName(const String& n) {
   return ext == "fseq";
 }
 
+static bool isBgEffectPath(const String& path) {
+  const size_t prefixLen = strlen(BG_EFFECTS_DIR);
+  if (path.length() <= prefixLen) return false;
+  if (!path.startsWith(BG_EFFECTS_DIR)) return false;
+  return path.charAt(prefixLen) == '/';
+}
+
+static String sanitizeBgEffectPath(const String& in) {
+  String path = in;
+  path.trim();
+  if (!path.length()) return String();
+  if (path.indexOf("..") >= 0) return String();
+  if (path[0] != '/') path = "/" + path;
+  if (!isBgEffectPath(path)) return String();
+  if (!isFseqName(path)) return String();
+  return path;
+}
+
+static String bgEffectDisplayName(const String& path) {
+  if (isBgEffectPath(path)) {
+    size_t prefixLen = strlen(BG_EFFECTS_DIR);
+    if (path.length() > prefixLen + 1) {
+      return path.substring(prefixLen + 1);
+    }
+  }
+  String name = path;
+  int slash = name.lastIndexOf('/');
+  if (slash >= 0) name = name.substring(slash + 1);
+  return name;
+}
+
 static String defaultStationId() {
   char buf[16];
   uint64_t mac = ESP.getEfuseMac();
@@ -326,6 +363,16 @@ static bool ensureSettingsDirLocked() {
   if (!SD_MMC.exists(SETTINGS_DIR)) {
     if (!SD_MMC.mkdir(SETTINGS_DIR)) {
       Serial.println("[CFG] Failed to create settings directory");
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool ensureBgEffectsDirLocked() {
+  if (!SD_MMC.exists(BG_EFFECTS_DIR)) {
+    if (!SD_MMC.mkdir(BG_EFFECTS_DIR)) {
+      Serial.println("[CFG] Failed to create BGEffects directory");
       return false;
     }
   }
@@ -355,6 +402,8 @@ static bool saveSettingsBackupLocked() {
   f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
   f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
   f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
+  f.print("bge_enable="); f.println(g_bgEffectEnabled ? 1 : 0);
+  f.print("bge_path=");   f.println(g_bgEffectPath);
   f.close();
   return true;
 }
@@ -384,6 +433,8 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
     else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
     else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
+    else if (key == "bge_enable") { out.hasBgEffectEnable = true; out.bgEffectEnable = (value.toInt() != 0); }
+    else if (key == "bge_path") { out.hasBgEffectPath = true; out.bgEffectPath = value; }
   }
   f.close();
   return true;
@@ -453,6 +504,15 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   if (!present.watchdog && data.hasWatchdog) {
     g_watchdogEnabled = data.watchdog;
     prefs.putBool("watchdog", g_watchdogEnabled);
+  }
+  if (!present.bgEffectEnable && data.hasBgEffectEnable) {
+    g_bgEffectEnabled = data.bgEffectEnable;
+    prefs.putBool("bge_enable", g_bgEffectEnabled);
+  }
+  if (!present.bgEffectPath && data.hasBgEffectPath) {
+    g_bgEffectPath = sanitizeBgEffectPath(data.bgEffectPath);
+    prefs.putString("bge_path", g_bgEffectPath);
+    g_bgEffectNextAttemptMs = millis();
   }
   if (!present.sdMode && data.hasSdMode) {
     g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
@@ -700,6 +760,7 @@ static void freeFseq(){
   if (g_cblocks){ free(g_cblocks); g_cblocks=nullptr; }
   if (s_ctmp){ free(s_ctmp); s_ctmp=nullptr; s_ctmp_size=0; }
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
+  g_bgEffectActive = false;
   memset(&g_fh,0,sizeof(g_fh));
 }
 
@@ -780,6 +841,7 @@ static bool openFseq(const String& path, String& why){
     if (!g_frameBuf){ why="oom frame"; break; }
 
     g_currentPath = path; g_frameIndex=0; g_lastTickMs = millis(); g_playing = true;
+    g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
     Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
       path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
       g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, (unsigned)g_fh.sparseCnt, g_fh.chanDataOffset);
@@ -923,6 +985,38 @@ static void listFseqInDir_locked(const char* path, String& optionsHtml, uint8_t 
 static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth = 0) {
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip list"); return; }
   listFseqInDir_locked(path, optionsHtml, depth);
+  SD_UNLOCK();
+}
+
+static void listBgEffects_locked(String& optionsHtml, const String& current) {
+  File dir = SD_MMC.open(BG_EFFECTS_DIR);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  File ent;
+  while ((ent = dir.openNextFile())) {
+    if (ent.isDirectory()) { ent.close(); continue; }
+    String name = ent.name();
+    if (!isFseqName(name)) { ent.close(); continue; }
+    bool selected = (name == current);
+    String valueEsc = htmlEscape(name);
+    String labelEsc = htmlEscape(bgEffectDisplayName(name));
+    optionsHtml += "<option value='";
+    optionsHtml += valueEsc;
+    optionsHtml += "'";
+    if (selected) optionsHtml += " selected";
+    optionsHtml += ">";
+    optionsHtml += labelEsc;
+    optionsHtml += "</option>";
+    ent.close();
+  }
+  dir.close();
+}
+
+static void listBgEffects(String& optionsHtml, const String& current) {
+  optionsHtml += "<option value=''";
+  if (!current.length()) optionsHtml += " selected";
+  optionsHtml += ">(none)</option>";
+  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip bge list"); return; }
+  listBgEffects_locked(optionsHtml, current);
   SD_UNLOCK();
 }
 
@@ -1159,14 +1253,20 @@ static void handleStatus(){
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
   json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
   json += ",\"watchdog\":" + String(g_watchdogEnabled ? "true" : "false");
+  json += ",\"bgEffect\":{\"enabled\":" + String(g_bgEffectEnabled ? "true" : "false") +
+          ",\"active\":" + String(g_bgEffectActive ? "true" : "false") +
+          ",\"path\":\"" + htmlEscape(g_bgEffectPath) + "\"}";
   json += "}";
   server.send(200,"application/json",json);
 }
 
 static void handleRoot() {
   String options; listFseqInDir("/", options);
+  String bgOptions; listBgEffects(bgOptions, g_bgEffectPath);
   String cur = g_currentPath.length() ? g_currentPath : "(none)";
   String curEsc = htmlEscape(cur);
+  String bgDisplay = g_bgEffectPath.length() ? bgEffectDisplayName(g_bgEffectPath) : String("(none)");
+  String bgEsc = htmlEscape(bgDisplay);
   String apIp = AP_IP.toString();
   wl_status_t st = WiFi.status();
   bool staConfigured = g_staSsid.length() > 0;
@@ -1183,7 +1283,8 @@ static void handleRoot() {
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
-                                   g_watchdogEnabled);
+                                   g_watchdogEnabled, g_bgEffectEnabled, g_bgEffectActive, bgEsc,
+                                   bgOptions);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1223,7 +1324,9 @@ static void handleStart(){ // GET /start?path=/file.fseq
 static void handleStop(){
   g_playing=false;
   g_paused=false;
+  g_bgEffectActive = false;
   g_bootMs = millis();
+  g_bgEffectNextAttemptMs = g_bootMs;
   blackoutAll();
   server.send(200,"application/json","{\"playing\":false}");
 }
@@ -1290,7 +1393,9 @@ static void handleHallDiag(){
       g_hallDiagEnabled = true;
       g_playing = false;
       g_paused = false;
+      g_bgEffectActive = false;
       g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
       g_hallDiagBlinkActive = false;
       blackoutAll();
     }
@@ -1299,6 +1404,7 @@ static void handleHallDiag(){
       g_hallDiagEnabled = false;
       g_hallDiagBlinkActive = false;
       g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
       blackoutAll();
     }
   }
@@ -1460,6 +1566,84 @@ static void handleWatchdog(){
 
   server.send(200, "application/json",
               String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
+}
+
+static void handleBgEffect(){
+  bool hasEnable = server.hasArg("enable");
+  bool hasPath = server.hasArg("path");
+  if (!hasEnable && !hasPath) {
+    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
+    return;
+  }
+
+  bool enable = g_bgEffectEnabled;
+  if (hasEnable) {
+    enable = parseBoolArg(server.arg("enable"));
+  }
+
+  String newPath = g_bgEffectPath;
+  if (hasPath) {
+    String raw = server.arg("path");
+    String sanitized = sanitizeBgEffectPath(raw);
+    if (raw.length() && !sanitized.length()) {
+      server.send(400, "application/json", "{\"error\":\"invalid path\"}");
+      return;
+    }
+    newPath = sanitized;
+  }
+
+  bool enableChanged = (enable != g_bgEffectEnabled);
+  bool pathChanged = (newPath != g_bgEffectPath);
+  bool stateChanged = enableChanged || pathChanged;
+
+  if (enableChanged) {
+    g_bgEffectEnabled = enable;
+    prefs.putBool("bge_enable", g_bgEffectEnabled);
+  }
+  if (pathChanged) {
+    g_bgEffectPath = newPath;
+    prefs.putString("bge_path", g_bgEffectPath);
+  }
+  if (stateChanged) {
+    persistSettingsToSd();
+  }
+  g_bootMs = millis();
+
+  if (!g_bgEffectEnabled || !g_bgEffectPath.length()) {
+    if (g_bgEffectActive) {
+      g_playing = false;
+      g_paused = false;
+      g_bgEffectActive = false;
+      g_bootMs = millis();
+      blackoutAll();
+    }
+    g_bgEffectNextAttemptMs = millis();
+  } else {
+    if (!g_hallDiagEnabled) {
+      if (!g_playing || g_bgEffectActive) {
+        String why;
+        g_playing = false;
+        g_paused = false;
+        if (!openFseq(g_bgEffectPath, why)) {
+          Serial.printf("[BGE] open fail: %s\n", why.c_str());
+          g_bgEffectNextAttemptMs = millis() + 5000;
+        } else {
+          g_bgEffectNextAttemptMs = millis();
+        }
+      } else if (stateChanged) {
+        g_bgEffectNextAttemptMs = millis();
+      }
+    }
+  }
+
+  String resp = "{\"bgEffect\":{\"enabled\":";
+  resp += (g_bgEffectEnabled ? "true" : "false");
+  resp += ",\"active\":";
+  resp += (g_bgEffectActive ? "true" : "false");
+  resp += ",\"path\":\"";
+  resp += htmlEscape(g_bgEffectPath);
+  resp += "\"}}";
+  server.send(200, "application/json", resp);
 }
 
 // Diagnostics
@@ -1677,6 +1861,7 @@ static void startWifiAP(){
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
   server.on("/autoplay",HTTP_POST, handleAutoplay);
   server.on("/watchdog",HTTP_POST, handleWatchdog);
+  server.on("/bgeffect",HTTP_POST, handleBgEffect);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -1746,6 +1931,17 @@ void setup(){
   g_autoplayEnabled = prefs.getBool("autoplay", true);
   present.watchdog = prefs.isKey("watchdog");
   g_watchdogEnabled = prefs.getBool("watchdog", false);
+  present.bgEffectEnable = prefs.isKey("bge_enable");
+  g_bgEffectEnabled = prefs.getBool("bge_enable", false);
+  present.bgEffectPath = prefs.isKey("bge_path");
+  {
+    String storedBg = prefs.getString("bge_path", "");
+    g_bgEffectPath = sanitizeBgEffectPath(storedBg);
+    if (storedBg.length() && !g_bgEffectPath.length()) {
+      prefs.putString("bge_path", g_bgEffectPath);
+    }
+  }
+  g_bgEffectNextAttemptMs = millis();
 
   bool card = cardPresent();
   if (!card) {
@@ -1765,6 +1961,10 @@ void setup(){
 
   if (g_sdReady) {
     ensureSettingsFromBackup(present);
+    if (SD_LOCK(pdMS_TO_TICKS(2000))) {
+      ensureBgEffectsDirLocked();
+      SD_UNLOCK();
+    }
   }
 
   applyWatchdogSetting();
@@ -1819,8 +2019,24 @@ void loop(){
 
   feedWatchdog();
 
-  if (g_autoplayEnabled && !g_playing && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_playing) {
+    uint32_t now = millis();
+    if (now >= g_bgEffectNextAttemptMs) {
+      String why;
+      g_paused = false;
+      if (openFseq(g_bgEffectPath, why)) {
+        Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str());
+        g_bgEffectNextAttemptMs = now;
+      } else {
+        Serial.printf("[BGE] open fail: %s\n", why.c_str());
+        g_bgEffectNextAttemptMs = now + 5000;
+      }
+    }
+  }
+
+  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
+    g_paused = false;
     if (openFseq("/test2.fseq", why)) {
       Serial.println("[TIMEOUT] Auto-start /test2.fseq");
     } else {
@@ -1849,6 +2065,8 @@ void loop(){
       if (g_sdFailStreak >= 6) {  // give up gracefully for now
         Serial.println("[SD] Unrecoverable — pausing playback.");
         g_playing = false;
+        g_bgEffectActive = false;
+        g_bgEffectNextAttemptMs = millis();
         g_sdFailStreak = 0;
       }
     }

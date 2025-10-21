@@ -122,7 +122,11 @@ String rootPage(const String &statusClass,
                 bool paused,
                 bool autoplayEnabled,
                 bool hallDiagEnabled,
-                bool watchdogEnabled) {
+                bool watchdogEnabled,
+                bool bgEffectEnabled,
+                bool bgEffectActive,
+                const String &bgEffectCurrentEscaped,
+                const String &bgEffectOptionsHtml) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel = strideIsSpoke ? "" : "selected";
 
@@ -168,6 +172,9 @@ String rootPage(const String &statusClass,
   if (!playing) pauseAttrs += " disabled";
   String autoplayAttrs;
   if (autoplayEnabled) autoplayAttrs += " checked";
+  String bgAttrs;
+  if (bgEffectEnabled) bgAttrs += " checked";
+  String bgStatus = bgEffectActive ? "<span class='badge play'>Active</span>" : "<span class='badge stop'>Idle</span>";
 
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
@@ -276,6 +283,14 @@ String rootPage(const String &statusClass,
       "<div class='muted'>" + watchdogHelp + "</div>"
       "</div>"
       "<div class='sep'></div>"
+      "<h3>Background Effect</h3>"
+      "<label style='display:flex;align-items:center;gap:.5rem'>"
+      "<input type='checkbox' id='bgenable'" + bgAttrs + "> Run Background Effect"
+      "</label>"
+      "<select id='bgepath'>" + bgEffectOptionsHtml + "</select>"
+      "<div class='muted'>Current: <b>" + bgEffectCurrentEscaped + "</b> • Status: " + bgStatus + "</div>"
+      "<div class='muted'>Files sourced from <b>/BGEffects</b> on the SD card.</div>"
+      "<div class='sep'></div>"
       "<h3>Auto-Play</h3>"
       "<label style='display:flex;align-items:center;gap:.5rem'>"
       "<input type='checkbox' id='autoplay'" + autoplayAttrs + "> Enable fallback auto-play"
@@ -331,6 +346,10 @@ String rootPage(const String &statusClass,
       "if(autoplay){autoplay.onchange=()=>{const en=autoplay.checked?'1':'0';fetch('/autoplay?enable='+en,{method:'POST'}).catch(()=>{autoplay.checked=!autoplay.checked;});};}"
       "const watchdog=document.getElementById('watchdog');"
       "if(watchdog){watchdog.onchange=()=>{const en=watchdog.checked?'1':'0';fetch('/watchdog?enable='+en,{method:'POST'}).catch(()=>{watchdog.checked=!watchdog.checked;});};}"
+      "const bgenable=document.getElementById('bgenable');"
+      "const bgepath=document.getElementById('bgepath');"
+      "if(bgenable){bgenable.onchange=()=>{const en=bgenable.checked?'1':'0';const path=bgepath?bgepath.value:'';fetch('/bgeffect?enable='+en+'&path='+encodeURIComponent(path),{method:'POST'}).then(()=>location.reload()).catch(()=>{bgenable.checked=!bgenable.checked;});};}"
+      "if(bgepath){bgepath.onchange=()=>{const path=bgepath.value;let url='/bgeffect?path='+encodeURIComponent(path);if(bgenable) url+='&enable='+(bgenable.checked?'1':'0');fetch(url,{method:'POST'}).then(()=>location.reload()).catch(()=>location.reload());};}"
       "const sdinfo=document.getElementById('sdinfo');"
       "function formatSd(j){if(!j||!j.sd) return 'Unavailable';const d=j.sd;let cur=d.ready?(d.currentWidth?d.currentWidth+'-bit':'Unknown width')+' @ '+d.freq+' kHz':'Card not mounted';const tgt=(d.desiredMode?d.desiredMode+'-bit':'Auto')+' @ '+d.baseFreq+' kHz';return 'Current: '+cur+' • Target: '+tgt;}"
       "function updateSd(){fetch('/status').then(r=>r.json()).then(j=>{if(sdinfo) sdinfo.textContent=formatSd(j);}).catch(()=>{if(sdinfo) sdinfo.textContent='Status unavailable';});}"

@@ -53,7 +53,11 @@ String rootPage(const String &statusClass,
                 bool paused,
                 bool autoplayEnabled,
                 bool hallDiagEnabled,
-                bool watchdogEnabled);
+                bool watchdogEnabled,
+                bool bgEffectEnabled,
+                bool bgEffectActive,
+                const String &bgEffectCurrentEscaped,
+                const String &bgEffectOptionsHtml);
 
 }  // namespace WebPages
 

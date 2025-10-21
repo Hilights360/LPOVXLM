@@ -19,6 +19,8 @@ struct PrefPresence {
   bool sdFreq=false;
   bool autoplay=false;
   bool watchdog=false;
+  bool bgEffectEnable=false;
+  bool bgEffectPath=false;
 };
 
 struct SettingsData {
@@ -36,4 +38,6 @@ struct SettingsData {
   bool hasSdFreq=false;     uint32_t sdFreq=0;
   bool hasAutoplay=false;   bool     autoplay=false;
   bool hasWatchdog=false;   bool     watchdog=false;
+  bool hasBgEffectEnable=false; bool bgEffectEnable=false;
+  bool hasBgEffectPath=false;   String bgEffectPath;
 };
