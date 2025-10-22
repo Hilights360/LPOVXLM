@@ -208,6 +208,20 @@ StrideMode g_strideMode = STRIDE_SPOKE;
 // Rotary index (0..spokes-1)
 volatile uint16_t g_indexPosition = 0;
 
+struct ArmDrawState {
+  uint16_t spokeIdx = 0;
+  bool     lit      = false;
+  uint32_t blankAtUs = 0;
+};
+
+static ArmDrawState g_armDraw[MAX_ARMS];
+static bool     g_frameValid        = false;
+static bool     g_spokeScheduleActive = false;
+static uint32_t g_spokeIntervalUs   = 0;
+static uint32_t g_blankHoldUs       = 0;
+static uint32_t g_nextSpokeUs       = 0;
+static uint16_t g_nextBaseSpoke     = 0;
+
 // Playback state
 volatile bool  g_playing = false, g_paused = false;
 String         g_currentPath;
@@ -274,6 +288,11 @@ static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
   return (delta <= (g_strobeWidthDeg * 0.5f));
 }
 
+static void resetSpokeSchedule(bool blankNow);
+static void processSpokeSchedule();
+static void handleHallSyncEvent();
+static bool ensureFrameFresh(uint32_t nowMs);
+
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
@@ -314,6 +333,10 @@ static void updateHallSensor() {
       strips[a]->show();
     }
     g_hallDiagActive = false;
+  }
+
+  if (!g_hallDiagEnabled && g_playing && !g_paused && hallActive && !prevHall) {
+    handleHallSyncEvent();
   }
 
   if (hallActive != prevHall) {
@@ -735,6 +758,8 @@ static void freeFseq(){
   if (s_ctmp){ free(s_ctmp); s_ctmp=nullptr; s_ctmp_size=0; }
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
   g_bgEffectActive = false;
+  g_frameValid = false;
+  resetSpokeSchedule(true);
   memset(&g_fh,0,sizeof(g_fh));
 }
 
@@ -815,6 +840,7 @@ static bool openFseq(const String& path, String& why){
     if (!g_frameBuf){ why="oom frame"; break; }
 
     g_currentPath = path; g_frameIndex=0; g_lastTickMs = millis(); g_playing = true;
+    g_frameValid = false;
     g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
     Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
       path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
@@ -902,47 +928,177 @@ static void blackoutAll(){
   }
 }
 
-/* ---------- NEW: render a specific angular spoke, not time-based index ---------- */
-static bool renderFrameAtSpoke(uint16_t spokeIdx) {
-  if (!g_fh.frameCount) return false;
-  if (!loadFrame(g_frameIndex)) return false;
+/* ---------- Arm painting & timing helpers ---------- */
 
+static void blankArm(uint8_t arm) {
+  if (arm >= MAX_ARMS) return;
+  if (!strips[arm]) return;
+  strips[arm]->clear();
+  strips[arm]->show();
+}
+
+static void resetSpokeSchedule(bool blankNow) {
+  const uint8_t arms = activeArmCount();
+  g_spokeScheduleActive = false;
+  g_spokeIntervalUs = 0;
+  g_blankHoldUs = 0;
+  g_nextSpokeUs = 0;
+  g_nextBaseSpoke = 0;
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    g_armDraw[a].spokeIdx = 0;
+    g_armDraw[a].lit = false;
+    g_armDraw[a].blankAtUs = 0;
+    if (blankNow && a < arms) {
+      blankArm(a);
+    }
+  }
+}
+
+static void paintAllArmsForBaseSpoke(uint16_t baseSpoke, uint32_t stampUs) {
   const uint16_t spokes = spokesCount();
-  const uint8_t  arms   = activeArmCount();
-  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
+  if (!spokes) { g_indexPosition = baseSpoke; return; }
+  if (!g_frameValid || !g_frameBuf || !g_fh.channelCount) {
+    g_indexPosition = baseSpoke;
+    return;
+  }
 
+  const uint8_t arms = activeArmCount();
+  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
   const uint32_t fallbackPixels = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
   const uint32_t chPerSpoke =
       (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
-
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
   const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
 
-  for (uint8_t arm=0; arm<arms; ++arm) {
+  uint32_t blankDeadline = stampUs + g_blankHoldUs;
+  if (blankDeadline <= stampUs) blankDeadline = stampUs + 1;
+
+  for (uint8_t arm = 0; arm < arms; ++arm) {
     if (!strips[arm]) continue;
 
-    // Arm’s base spoke, then force to current angular position
     uint32_t armBaseSpoke = (uint32_t)armSpokeIdx0((int)arm, startIdx0, (int)spokes, (int)arms);
-    armBaseSpoke = (armBaseSpoke + spokeIdx) % spokes;
+    armBaseSpoke = (armBaseSpoke + baseSpoke) % spokes;
 
     const uint32_t baseChAbsR = startChBase + armBaseSpoke * chPerSpoke;
     const uint32_t pixelCount = strips[arm]->numPixels();
 
-    for (uint32_t i=0; i<pixelCount; ++i){
+    for (uint32_t i = 0; i < pixelCount; ++i) {
       const uint32_t absR = baseChAbsR + i * blockStride;
-      const int64_t  idxR = sparseTranslate(absR);
-      if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
-        strips[arm]->setPixelColor(i,0,0,0);
+      const int64_t idxR = sparseTranslate(absR);
+      if (idxR < 0 || (idxR + 2) >= (int64_t)g_fh.channelCount) {
+        strips[arm]->setPixelColor(i, 0, 0, 0);
         continue;
       }
-      uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
-      strips[arm]->setPixelColor(i, R,G,B);
+      uint8_t R, G, B; mapChannels(&g_frameBuf[idxR], R, G, B);
+      strips[arm]->setPixelColor(i, R, G, B);
     }
-    strips[arm]->show();  // shift while gate is OFF (or while software gating will blank later)
+    strips[arm]->show();
+
+    g_armDraw[arm].spokeIdx = (uint16_t)armBaseSpoke;
+    g_armDraw[arm].lit = true;
+    g_armDraw[arm].blankAtUs = blankDeadline;
   }
 
-  // Advance animation frame
-  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
+  g_indexPosition = baseSpoke;
+}
+
+static void handleHallSyncEvent() {
+  const uint16_t spokes = spokesCount();
+  if (!spokes) return;
+
+  uint32_t perUs = g_lastPeriodUs;
+  if (!perUs && g_spokeIntervalUs > 0) {
+    perUs = g_spokeIntervalUs * spokes;
+  }
+  if (!perUs) perUs = 200000; // ~300 RPM fallback
+
+  const uint32_t MIN_PER_US = 4000;     // 15,000 RPM upper bound guard
+  const uint32_t MAX_PER_US = 2000000;  // 30 RPM lower bound guard
+  if (perUs < MIN_PER_US) perUs = MIN_PER_US;
+  if (perUs > MAX_PER_US) perUs = MAX_PER_US;
+
+  uint32_t interval = perUs / spokes;
+  if (interval == 0) interval = 100; // safety floor (~0.1ms)
+
+  uint32_t hold = interval / 8;      // default: keep lit for 12.5% of spoke time
+  if (hold < 25) hold = 25;
+  if (hold >= interval) {
+    if (interval > 25) {
+      hold = interval - 25;
+    } else if (interval > 1) {
+      hold = interval / 2;
+    } else {
+      hold = 1;
+    }
+  }
+
+  g_spokeIntervalUs = interval;
+  g_blankHoldUs = hold;
+  g_spokeScheduleActive = true;
+  g_nextBaseSpoke = 0;
+  g_nextSpokeUs = micros();
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    g_armDraw[a].lit = false;
+  }
+}
+
+static void processSpokeSchedule() {
+  const uint8_t arms = activeArmCount();
+  if (!arms) return;
+
+  uint32_t nowUs = micros();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (g_armDraw[a].lit) {
+      if ((int32_t)(nowUs - g_armDraw[a].blankAtUs) >= 0) {
+        blankArm(a);
+        g_armDraw[a].lit = false;
+      }
+    }
+  }
+
+  if (!g_spokeScheduleActive || !g_frameValid || !g_spokeIntervalUs) return;
+
+  const uint16_t spokes = spokesCount();
+  if (!spokes) return;
+
+  uint16_t guard = 0;
+  while ((int32_t)(nowUs - g_nextSpokeUs) >= 0) {
+    uint32_t stampUs = g_nextSpokeUs;
+    if ((int32_t)(nowUs - stampUs) > 0) stampUs = nowUs;
+    uint16_t base = g_nextBaseSpoke;
+    paintAllArmsForBaseSpoke(base, stampUs);
+    g_nextBaseSpoke = (uint16_t)((base + 1) % spokes);
+    g_nextSpokeUs += g_spokeIntervalUs;
+    nowUs = micros();
+    if (++guard >= spokes) break; // avoid runaway if timing goes bad
+  }
+}
+
+static bool ensureFrameFresh(uint32_t nowMs) {
+  if (!g_playing) return true;
+  if (!g_fh.frameCount) return false;
+
+  const uint32_t totalFrames = g_fh.frameCount ? g_fh.frameCount : 1;
+
+  if (!g_frameValid) {
+    if (!loadFrame(g_frameIndex)) {
+      return false;
+    }
+    g_frameValid = true;
+    g_lastTickMs = nowMs;
+    g_frameIndex = (g_frameIndex + 1) % totalFrames;
+    return true;
+  }
+
+  if (g_framePeriodMs && (nowMs - g_lastTickMs) < g_framePeriodMs) {
+    return true;
+  }
+
+  if (!loadFrame(g_frameIndex)) {
+    return false;
+  }
+  g_lastTickMs = nowMs;
+  g_frameIndex = (g_frameIndex + 1) % totalFrames;
   return true;
 }
 
@@ -1369,6 +1525,7 @@ static void handleStop(){
   g_bgEffectActive = false;
   g_bootMs = millis();
   g_bgEffectNextAttemptMs = g_bootMs;
+  resetSpokeSchedule(false);
   blackoutAll();
   server.send(200,"application/json","{\"playing\":false}");
 }
@@ -1412,7 +1569,10 @@ static void handlePause(){
     g_paused = !g_paused && g_playing;
   }
 
-  if (!g_paused) {
+  if (g_paused) {
+    resetSpokeSchedule(true);
+    blackoutAll();
+  } else {
     g_lastTickMs = millis();
   }
 
@@ -1439,6 +1599,7 @@ static void handleHallDiag(){
       g_bootMs = millis();
       g_bgEffectNextAttemptMs = g_bootMs;
       g_hallDiagActive = false;
+      resetSpokeSchedule(true);
       blackoutAll();
     }
   } else {
@@ -1447,6 +1608,7 @@ static void handleHallDiag(){
       g_hallDiagActive = false;
       g_bootMs = millis();
       g_bgEffectNextAttemptMs = g_bootMs;
+      resetSpokeSchedule(true);
       blackoutAll();
     }
   }
@@ -2340,10 +2502,37 @@ void loop(){
   if (!g_playing || g_paused) {
     // Gate off while idle
     if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
+    if (g_spokeScheduleActive) {
+      resetSpokeSchedule(true);
+    } else {
+      const uint8_t arms = activeArmCount();
+      for (uint8_t a = 0; a < arms; ++a) {
+        if (g_armDraw[a].lit) { resetSpokeSchedule(true); break; }
+      }
+    }
     delay(1);
     feedWatchdog();
     return;
   }
+
+  nowMs = millis();
+  if (!ensureFrameFresh(nowMs)) {
+    ++g_sdFailStreak;
+    Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
+    if (!recoverSd("frame read failed")) {
+      if (g_sdFailStreak >= 6) {
+        Serial.println("[SD] Unrecoverable — pausing playback.");
+        g_playing = false;
+        g_bgEffectActive = false;
+        g_bgEffectNextAttemptMs = millis();
+        g_sdFailStreak = 0;
+      }
+    }
+    feedWatchdog();
+    return;
+  }
+
+  g_sdFailStreak = 0;
 
   // ---- Angular spoke & gating management ----
   const uint16_t spokeNow = currentSpokeIndex();
@@ -2365,29 +2554,7 @@ void loop(){
     }
   }
 
-  // Update frame content at requested FPS, but draw it aligned to current spoke
-  const uint32_t now = millis();
-  if (now - g_lastTickMs >= g_framePeriodMs) {
-    g_lastTickMs = now;
-
-    if (!renderFrameAtSpoke(spokeNow)) {
-      ++g_sdFailStreak;
-      Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
-      if (!recoverSd("frame read failed")) {
-        if (g_sdFailStreak >= 6) {
-          Serial.println("[SD] Unrecoverable — pausing playback.");
-          g_playing = false;
-          g_bgEffectActive = false;
-          g_bgEffectNextAttemptMs = millis();
-          g_sdFailStreak = 0;
-        }
-      }
-      feedWatchdog();
-      return;
-    }
-
-    g_sdFailStreak = 0;
-  }
+  processSpokeSchedule();
 
   feedWatchdog();
 }
