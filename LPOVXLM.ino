@@ -16,6 +16,8 @@
 #include <esp_task_wdt.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h> // fabsf
+
 #include "QuadMap.h"
 #include "WebPages.h"
 
@@ -58,12 +60,20 @@ static bool              g_hallDiagBlinkActive = false;
 static uint32_t          g_hallDiagBlinkStartMs = 0;
 
 // RPM measurement (A3144)
-static const uint8_t     PULSES_PER_REV      = 1;   // change if you have multiple magnets
+static const uint8_t     PULSES_PER_REV      = 1;   // default; can override at runtime via /rpm
 volatile uint32_t        g_lastPeriodUs      = 0;   // last valid pulse period (us)
 volatile uint32_t        g_pulseCount        = 0;   // total pulses seen
 volatile uint32_t        g_lastPulseUsIsr    = 0;   // last pulse timestamp (us) in ISR
 static uint32_t          g_rpmUi             = 0;   // filtered RPM for UI/status
 static uint32_t          g_lastRpmUpdateMs   = 0;
+
+// --- NEW: RPM configuration & counting-based measurement ---
+static uint8_t  g_pulsesPerRev   = PULSES_PER_REV; // runtime-configurable PPR
+// 0=FALLING, 1=RISING, 2=CHANGE
+static uint8_t  g_hallEdgeMode   = 0;
+
+static uint32_t g_rpmSampleUs    = 0;  // last sample timestamp (us)
+static uint32_t g_rpmLastCount   = 0;  // pulse count snapshot at last sample
 
 static void IRAM_ATTR hallIsr() {
   uint32_t now = micros();
@@ -73,8 +83,15 @@ static void IRAM_ATTR hallIsr() {
   uint32_t dt = now - last;
   if (dt > 1000) {
     g_lastPeriodUs = dt;
-    g_pulseCount++;
+    g_pulseCount = g_pulseCount + 1; // avoid ++ on volatile (deprecated)
   }
+}
+
+// Allow runtime selection of ISR edge
+static void attachHallInterrupt() {
+  detachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR));
+  int mode = (g_hallEdgeMode == 1) ? RISING : (g_hallEdgeMode == 2 ? CHANGE : FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR), hallIsr, mode);
 }
 
 // Latest arm pin map (CLK and DATA per arm)
@@ -202,6 +219,63 @@ const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
+/* -------------------- NEW: Strobe gating / angular timing -------------------- */
+
+// Optional HARD strobe gate pin (drive external gate). -1 disables.
+static const int PIN_STROBE_GATE = -1; // leave -1 if not used
+
+// Strobe control (accessible via /strobe)
+static volatile bool  g_strobeEnable   = true;   // enable narrow on-window
+static volatile float g_strobeWidthDeg = 1.5f;   // width of on-window in degrees
+static volatile float g_strobePhaseDeg = 0.0f;   // global phase trim in degrees
+
+// Per-arm phase trims (degrees)
+static float g_armPhaseDeg[MAX_ARMS] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+static inline uint16_t spokesCount() { return (g_spokesTotal ? g_spokesTotal : 1); }
+
+static inline void getHallSnapshot(uint32_t& periodUs, uint32_t& sinceUs) {
+  uint32_t lastIsr = g_lastPulseUsIsr;  // volatile read
+  periodUs = g_lastPeriodUs;            // volatile read
+  uint32_t now = micros();
+  sinceUs = now - lastIsr;
+}
+
+static inline float sinceUsToDeg(uint32_t sinceUs, uint32_t periodUs) {
+  if (periodUs == 0) return 0.0f;
+  return (360.0f * (float)sinceUs) / (float)periodUs;
+}
+
+// Current spoke index from hall phase with global trim
+static inline uint16_t currentSpokeIndex() {
+  uint32_t perUs, sinceUs; getHallSnapshot(perUs, sinceUs);
+  if (perUs == 0) return g_indexPosition; // until first lock
+  float deg = sinceUsToDeg(sinceUs, perUs) + g_strobePhaseDeg;
+  while (deg < 0.0f)  deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+  const uint16_t s = spokesCount();
+  uint32_t idx = (uint32_t)((deg / 360.0f) * s);
+  if (idx >= s) idx = s - 1;
+  return (uint16_t)idx;
+}
+
+// True if we're inside the (narrow) strobe window for a given arm
+static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
+  if (!g_strobeEnable) return true; // always on if disabled
+  uint32_t perUs, sinceUs; getHallSnapshot(perUs, sinceUs);
+  if (perUs == 0) return true;
+  float deg = sinceUsToDeg(sinceUs, perUs) + g_armPhaseDeg[arm] + g_strobePhaseDeg;
+  while (deg < 0.0f)  deg += 360.0f;
+  while (deg >= 360.0f) deg -= 360.0f;
+
+  const float spokeDegW = 360.0f / (float)spokesCount();
+  const float centerDeg = (spokeCenter + 0.5f) * spokeDegW;
+  float delta = fabsf(deg - centerDeg);
+  if (delta > 180.0f) delta = 360.0f - delta; // wrap-shortcut
+
+  return (delta <= (g_strobeWidthDeg * 0.5f));
+}
+
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
@@ -275,6 +349,13 @@ static void handleSdConfig();
 static void handleAutoplay();
 static void handleWatchdog();
 static void handleBgEffect();
+
+// NEW: strobe & arm phase REST handlers
+static void handleStrobe();
+static void handleArmPhase();
+
+// NEW: RPM configuration handler
+static void handleRpmCfg();
 
 // New: Updates hub, OTA, FW to SD, Reboot
 static void handleUpdatesPage();
@@ -599,7 +680,7 @@ static void checkSdFirmwareUpdate() {
     Serial.println("[OTA] Empty firmware.bin removed");
     return;
   }
-  Serial.printf("[OTA] Found %s (%u bytes)\n", OTA_FILE, (unsigned int)size);
+  Serial.printf("[OTA] Found %s (%u bytes)\n", OTA_FILE, (unsigned)size);
   if (!Update.begin(size)) {
     Serial.printf("[OTA] Update begin failed: %s\n", Update.errorString());
     f.close();
@@ -682,8 +763,7 @@ static String joinPath(const String& dir, const String& name){
   if (!d.length() || d[0] != '/') d = "/" + d;
   if (d != "/" && d.endsWith("/")) d.remove(d.length()-1);
   String base = name;
-  int slash = base.lastIndexOf('/');
-  if (slash >= 0) base = base.substring(slash+1);
+  int slash = base.lastIndexOf('/'); if (slash >= 0) base = base.substring(slash+1);
   return (d == "/") ? ("/" + base) : (d + "/" + base);
 }
 
@@ -950,27 +1030,28 @@ static void blackoutAll(){
   }
 }
 
-static bool renderFrame(uint32_t idx){
-  if (!loadFrame(idx)) return false;
+/* ---------- NEW: render a specific angular spoke, not time-based index ---------- */
+static bool renderFrameAtSpoke(uint16_t spokeIdx) {
+  if (!g_fh.frameCount) return false;
+  if (!loadFrame(g_frameIndex)) return false;
 
-  const uint32_t spokes = (g_spokesTotal ? g_spokesTotal : 1);
-  const uint8_t  arms = activeArmCount();
+  const uint16_t spokes = spokesCount();
+  const uint8_t  arms   = activeArmCount();
   const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
 
   const uint32_t fallbackPixels = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
   const uint32_t chPerSpoke =
-    (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
+      (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
 
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
-  const uint32_t indexOffset = (spokes > 0) ? (g_indexPosition % spokes) : 0;
-
   const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
 
-  for (uint8_t arm=0; arm<arms; ++arm){
+  for (uint8_t arm=0; arm<arms; ++arm) {
     if (!strips[arm]) continue;
 
+    // Arm’s base spoke, then force to current angular position
     uint32_t armBaseSpoke = (uint32_t)armSpokeIdx0((int)arm, startIdx0, (int)spokes, (int)arms);
-    armBaseSpoke = (armBaseSpoke + indexOffset) % spokes;
+    armBaseSpoke = (armBaseSpoke + spokeIdx) % spokes;
 
     const uint32_t baseChAbsR = startChBase + armBaseSpoke * chPerSpoke;
     const uint32_t pixelCount = strips[arm]->numPixels();
@@ -978,12 +1059,18 @@ static bool renderFrame(uint32_t idx){
     for (uint32_t i=0; i<pixelCount; ++i){
       const uint32_t absR = baseChAbsR + i * blockStride;
       const int64_t  idxR = sparseTranslate(absR);
-      if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) { strips[arm]->setPixelColor(i,0,0,0); continue; }
+      if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
+        strips[arm]->setPixelColor(i,0,0,0);
+        continue;
+      }
       uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
       strips[arm]->setPixelColor(i, R,G,B);
     }
-    strips[arm]->show();
+    strips[arm]->show();  // shift while gate is OFF (or while software gating will blank later)
   }
+
+  // Advance animation frame
+  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
   return true;
 }
 
@@ -1253,34 +1340,34 @@ static void handleUploadDone() {
 static inline const char* statusText() { if (g_paused && g_playing) return "Paused"; if (g_playing) return "Playing"; return "Stopped"; }
 static inline const char* statusClass(){ if (g_paused && g_playing) return "badge pause"; if (g_playing) return "badge play"; return "badge stop"; }
 
+// --- REPLACED: robust count-based RPM computation ---
 static uint32_t computeRpmSnapshot() {
-  // Calculate RPM based on most recent period; falls back to pulse count if needed.
-  uint32_t rpm = g_rpmUi;
-  uint32_t nowMs = millis();
+  uint32_t nowUs = micros();
+  if (g_rpmSampleUs == 0) {
+    g_rpmSampleUs  = nowUs;
+    g_rpmLastCount = g_pulseCount;
+    return g_rpmUi;
+  }
 
-  // If we had a recent pulse, compute from period
-  uint32_t periodUs = g_lastPeriodUs; // volatile read
-  if (periodUs > 0) {
-    // 60e6 us per minute / (period_us * pulses_per_rev)
-    uint64_t num = 60000000ULL;
-    uint32_t denom = (uint32_t)((uint64_t)periodUs * (uint64_t)PULSES_PER_REV);
-    if (denom) {
-      uint32_t inst = (uint32_t)(num / denom);
-      // simple low-pass filter toward inst
-      rpm = (rpm * 3 + inst) / 4;
-      g_rpmUi = rpm;
-      g_lastRpmUpdateMs = nowMs;
-      return rpm;
+  uint32_t dtUs = nowUs - g_rpmSampleUs;
+  if (dtUs >= 250000) { // sample ~every 0.25 s
+    uint32_t countNow = g_pulseCount;
+    uint32_t delta    = countNow - g_rpmLastCount;
+    g_rpmLastCount    = countNow;
+    g_rpmSampleUs     = nowUs;
+
+    if (dtUs > 0 && g_pulsesPerRev > 0) {
+      // RPM = delta * 60e6 / (dtUs * PPR)
+      uint64_t num   = (uint64_t)delta * 60000000ULL;
+      uint64_t denom = (uint64_t)dtUs * (uint64_t)g_pulsesPerRev;
+      uint32_t inst  = (denom ? (uint32_t)(num / denom) : 0);
+      g_rpmUi = (g_rpmUi * 3 + inst) / 4; // light smoothing
+      g_lastRpmUpdateMs = millis();
     }
   }
 
-  // Timeout: if no pulses for >2s, decay to zero
-  if (nowMs - g_lastRpmUpdateMs > 2000) {
-    g_rpmUi = 0;
-    rpm = 0;
-  }
-
-  return rpm;
+  if (millis() - g_lastRpmUpdateMs > 2000) g_rpmUi = 0; // idle decay
+  return g_rpmUi;
 }
 
 static void handleStatus(){
@@ -1308,7 +1395,14 @@ static void handleStatus(){
   json += ",\"bgEffect\":{\"enabled\":" + String(g_bgEffectEnabled ? "true" : "false") +
           ",\"active\":" + String(g_bgEffectActive ? "true" : "false") +
           ",\"path\":\"" + htmlEscape(g_bgEffectPath) + "\"}";
+  json += ",\"strobe\":{\"enable\":" + String(g_strobeEnable ? "true" : "false") +
+          ",\"deg\":" + String(g_strobeWidthDeg,2) +
+          ",\"phase\":" + String(g_strobePhaseDeg,2) + "}";
   json += ",\"rpm\":" + String(computeRpmSnapshot());
+  // NEW: expose RPM config + raw period for quick sanity checks
+  json += ",\"rpmPpr\":" + String((unsigned)g_pulsesPerRev);
+  json += ",\"rpmEdge\":" + String((unsigned)g_hallEdgeMode);
+  json += ",\"period_us\":" + String(g_lastPeriodUs);
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1890,9 +1984,83 @@ static bool recoverSd(const char* reason) {
   return ok;
 }
 
-/* -------------------- OTA / Updates page handlers -------------------- */
+/* -------------------- NEW: Strobe & per-arm phase handlers -------------------- */
+static void handleStrobe() {
+  bool haveEnable = server.hasArg("enable");
+  bool haveDeg    = server.hasArg("deg");
+  bool havePhase  = server.hasArg("phase");
+  if (!haveEnable && !haveDeg && !havePhase) {
+    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
+    return;
+  }
+  if (haveEnable) {
+    g_strobeEnable = parseBoolArg(server.arg("enable"));
+  }
+  if (haveDeg) {
+    g_strobeWidthDeg = server.arg("deg").toFloat();
+    if (g_strobeWidthDeg < 0.1f) g_strobeWidthDeg = 0.1f;
+    if (g_strobeWidthDeg > 10.0f) g_strobeWidthDeg = 10.0f;
+  }
+  if (havePhase) {
+    g_strobePhaseDeg = server.arg("phase").toFloat();
+    while (g_strobePhaseDeg < -180.f) g_strobePhaseDeg += 360.f;
+    while (g_strobePhaseDeg >  180.f) g_strobePhaseDeg -= 360.f;
+  }
+  server.send(200, "application/json",
+              String("{\"strobe\":{\"enable\":") + (g_strobeEnable ? "true":"false") +
+              ",\"deg\":" + String(g_strobeWidthDeg,2) +
+              ",\"phase\":" + String(g_strobePhaseDeg,2) + "}}");
+}
 
-// Simple direct OTA form (independent page)
+static void handleArmPhase() {
+  if (!server.hasArg("arm") || !server.hasArg("deg")) {
+    server.send(400, "application/json", "{\"error\":\"arm & deg required\"}");
+    return;
+  }
+  int arm = server.arg("arm").toInt();
+  if (arm < 1 || arm > (int)activeArmCount()) {
+    server.send(400, "application/json", "{\"error\":\"arm out of range\"}");
+    return;
+  }
+  g_armPhaseDeg[arm-1] = server.arg("deg").toFloat();
+  server.send(200, "application/json",
+              String("{\"arm\":") + arm + ",\"phase\":" + String(g_armPhaseDeg[arm-1],2) + "}");
+}
+
+/* -------------------- NEW: RPM config handler -------------------- */
+static void handleRpmCfg(){
+  bool changed = false;
+
+  if (server.hasArg("ppr")) {
+    int p = server.arg("ppr").toInt();
+    if (p < 1) p = 1; if (p > 32) p = 32;
+    g_pulsesPerRev = (uint8_t)p;
+    prefs.putUChar("ppr", g_pulsesPerRev);
+    changed = true;
+  }
+
+  if (server.hasArg("edge")) {
+    String e = server.arg("edge"); e.toLowerCase();
+    uint8_t mode = 0; // falling
+    if (e == "rising") mode = 1;
+    else if (e == "change") mode = 2;
+    if (mode != g_hallEdgeMode) {
+      g_hallEdgeMode = mode;
+      prefs.putUChar("hedge", g_hallEdgeMode);
+      attachHallInterrupt();
+      changed = true;
+    }
+  }
+
+  if (changed) persistSettingsToSd();
+
+  String edgeStr = (g_hallEdgeMode==1) ? "rising" : (g_hallEdgeMode==2 ? "change" : "falling");
+  String resp = String("{\"ok\":true,\"ppr\":") + g_pulsesPerRev +
+                ",\"edge\":\"" + edgeStr + "\"}";
+  server.send(200, "application/json", resp);
+}
+
+/* -------------------- OTA / Updates page handlers -------------------- */
 static void handleOtaPage() {
   String html =
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -1916,7 +2084,6 @@ static void handleOtaPage() {
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-// Direct OTA upload stream → flash immediately
 File   g_otaFile; // not actually used to store; we stream to Update
 size_t g_otaBytes = 0;
 
@@ -2042,6 +2209,13 @@ static void startWifiAP(){
   server.on("/watchdog",HTTP_POST, handleWatchdog);
   server.on("/bgeffect",HTTP_POST, handleBgEffect);
 
+  // NEW: strobe + per-arm phase tuning
+  server.on("/strobe",   HTTP_POST, handleStrobe);
+  server.on("/armphase", HTTP_POST, handleArmPhase);
+
+  // NEW: RPM configuration (PPR + ISR edge)
+  server.on("/rpm", HTTP_POST, handleRpmCfg);
+
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
   server.on("/fseq/cblocks",HTTP_GET,  handleCBlocks);
@@ -2084,7 +2258,6 @@ void setup(){
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
   pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR), hallIsr, FALLING); // A3144 pulls LOW near magnet
 
   g_statusPixel.begin();
   g_statusPixel.setBrightness(64);
@@ -2137,6 +2310,18 @@ void setup(){
     }
   }
   g_bgEffectNextAttemptMs = millis();
+
+  // NEW: RPM prefs & ISR attach
+  g_pulsesPerRev = prefs.getUChar("ppr", PULSES_PER_REV);
+  if (g_pulsesPerRev < 1) g_pulsesPerRev = 1;
+  g_hallEdgeMode = prefs.getUChar("hedge", 0); // 0=FALLING
+  attachHallInterrupt();
+
+  // NEW: strobe gate pin init (optional)
+  if (PIN_STROBE_GATE >= 0) {
+    pinMode(PIN_STROBE_GATE, OUTPUT);
+    digitalWrite(PIN_STROBE_GATE, LOW); // LOW = off (for typical N-MOSFET low-side)
+  }
 
   bool card = cardPresent();
   if (!card) {
@@ -2214,7 +2399,7 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
-  // Periodically stabilize RPM value
+  // Frequent RPM smoothing
   static uint32_t lastRpmPoll = 0;
   uint32_t nowMs = millis();
   if (nowMs - lastRpmPoll >= 250) {
@@ -2224,6 +2409,7 @@ void loop(){
 
   feedWatchdog();
 
+  // Auto-start background effect if configured
   if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_playing) {
     uint32_t now = millis();
     if (now >= g_bgEffectNextAttemptMs) {
@@ -2239,6 +2425,7 @@ void loop(){
     }
   }
 
+  // Autoplay fallback after idle
   if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     g_paused = false;
@@ -2250,36 +2437,58 @@ void loop(){
     }
   }
 
+  // If not playing, keep loop light
   if (!g_playing || g_paused) {
+    // Gate off while idle
+    if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
     delay(1);
     feedWatchdog();
     return;
   }
 
-  const uint32_t now = millis();
-  if (now - g_lastTickMs < g_framePeriodMs) {
-    feedWatchdog();
-    return;
-  }
-  g_lastTickMs = now;
+  // ---- Angular spoke & gating management ----
+  const uint16_t spokeNow = currentSpokeIndex();
 
-  if (!renderFrame(g_frameIndex)) {
-    ++g_sdFailStreak;
-    Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
-    if (!recoverSd("frame read failed")) {
-      if (g_sdFailStreak >= 6) {
-        Serial.println("[SD] Unrecoverable — pausing playback.");
-        g_playing = false;
-        g_bgEffectActive = false;
-        g_bgEffectNextAttemptMs = millis();
-        g_sdFailStreak = 0;
+  // HARD gate: pulse on only inside the window (software blanking otherwise)
+  if (PIN_STROBE_GATE >= 0) {
+    bool on = inStrobeWindowForArm(spokeNow, 0); // arm 0 as timing reference
+    digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
+  } else {
+    // Software blank outside the window (less crisp than hardware gate)
+    const uint8_t arms = activeArmCount();
+    for (uint8_t a = 0; a < arms; ++a) {
+      bool on = inStrobeWindowForArm(spokeNow, a);
+      if (!on && strips[a]) {
+        uint16_t pix = strips[a]->numPixels();
+        for (uint16_t i = 0; i < pix; ++i) strips[a]->setPixelColor(i,0,0,0);
+        strips[a]->show();
       }
     }
-    feedWatchdog();
-    return;
   }
 
-  g_sdFailStreak = 0; // success resets streak
-  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
+  // Update frame content at requested FPS, but draw it aligned to current spoke
+  const uint32_t now = millis();
+  if (now - g_lastTickMs >= g_framePeriodMs) {
+    g_lastTickMs = now;
+
+    if (!renderFrameAtSpoke(spokeNow)) {
+      ++g_sdFailStreak;
+      Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
+      if (!recoverSd("frame read failed")) {
+        if (g_sdFailStreak >= 6) {
+          Serial.println("[SD] Unrecoverable — pausing playback.");
+          g_playing = false;
+          g_bgEffectActive = false;
+          g_bgEffectNextAttemptMs = millis();
+          g_sdFailStreak = 0;
+        }
+      }
+      feedWatchdog();
+      return;
+    }
+
+    g_sdFailStreak = 0;
+  }
+
   feedWatchdog();
 }
