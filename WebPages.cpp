@@ -21,7 +21,9 @@ namespace WebPages {
 String filesPageHeader(const String &pathEscaped,
                        const String &parentEncoded,
                        const String &currentPathEncoded,
-                       const String &backEncoded) {
+                       const String &backEncoded,
+                       const String &currentPathAttrEscaped,
+                       const String &backAttrEscaped) {
   String html =
       "<!doctype html><html><head><meta charset='utf-8'>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -54,6 +56,13 @@ String filesPageHeader(const String &pathEscaped,
       "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + currentPathEncoded + "&name='+encodeURIComponent(n);\">New Folder</button>"
       "<button onclick=\"location.reload()\">Refresh</button>"
       "</div>"
+      "<form class='row' method='POST' action='/upload' enctype='multipart/form-data' style='align-items:center;margin-top:.75rem'>"
+      "<input type='hidden' name='dir' value='" + currentPathAttrEscaped + "'>"
+      "<input type='hidden' name='back' value='" + backAttrEscaped + "'>"
+      "<label class='muted' style='min-width:fit-content'>Upload .fseq:</label>"
+      "<input type='file' name='file' accept='.fseq' required>"
+      "<button type='submit'>Upload</button>"
+      "</form>"
       "<table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody>";
   return html;
 }

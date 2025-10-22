@@ -76,6 +76,8 @@ static uint8_t  g_hallEdgeMode   = 0;
 
 static uint32_t g_rpmSampleUs    = 0;  // last sample timestamp (us)
 static uint32_t g_rpmLastCount   = 0;  // pulse count snapshot at last sample
+static uint64_t g_rpmAccumulatedUs   = 0;  // total us accumulated for current window
+static uint32_t g_rpmAccumulatedPulses = 0; // pulses accumulated for current window
 
 static void IRAM_ATTR hallIsr() {
   uint32_t now = micros();
@@ -1021,7 +1023,9 @@ static void handleFiles() {
   String backParam = String("/files?path=") + pathEnc;
   String backEncoded = urlEncode(backPlain);
 
-  String html = WebPages::filesPageHeader(pathEsc, parentEnc, pathEnc, backEncoded);
+  String pathAttrEsc = htmlEscape(path);
+  String backAttrEsc = htmlEscape(backPlain);
+  String html = WebPages::filesPageHeader(pathEsc, parentEnc, pathEnc, backEncoded, pathAttrEsc, backAttrEsc);
 
   File ent;
   while ((ent = dir.openNextFile())) {
@@ -1218,27 +1222,48 @@ static uint32_t computeRpmSnapshot() {
   if (g_rpmSampleUs == 0) {
     g_rpmSampleUs  = nowUs;
     g_rpmLastCount = g_pulseCount;
+    g_rpmAccumulatedUs = 0;
+    g_rpmAccumulatedPulses = 0;
     return g_rpmUi;
   }
 
   uint32_t dtUs = nowUs - g_rpmSampleUs;
   if (dtUs >= 250000) { // sample ~every 0.25 s
+    g_rpmSampleUs = nowUs;
+    g_rpmAccumulatedUs += dtUs;
+
     uint32_t countNow = g_pulseCount;
     uint32_t delta    = countNow - g_rpmLastCount;
-    g_rpmLastCount    = countNow;
-    g_rpmSampleUs     = nowUs;
+    if (delta > 0) {
+      g_rpmAccumulatedPulses += delta;
+      g_rpmLastCount = countNow;
 
-    if (dtUs > 0 && g_pulsesPerRev > 0) {
-      // RPM = delta * 60e6 / (dtUs * PPR)
-      uint64_t num   = (uint64_t)delta * 60000000ULL;
-      uint64_t denom = (uint64_t)dtUs * (uint64_t)g_pulsesPerRev;
-      uint32_t inst  = (denom ? (uint32_t)(num / denom) : 0);
-      g_rpmUi = (g_rpmUi * 3 + inst) / 4; // light smoothing
-      g_lastRpmUpdateMs = millis();
+      if (g_pulsesPerRev > 0) {
+        uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)g_pulsesPerRev;
+        uint64_t num   = (uint64_t)g_rpmAccumulatedPulses * 60000000ULL;
+        uint32_t inst  = (denom ? (uint32_t)((num + denom / 2) / denom) : 0);
+        if (inst > 0) {
+          g_rpmUi = (g_rpmUi * 3 + inst) / 4; // light smoothing
+          g_lastRpmUpdateMs = millis();
+        }
+      }
+
+      g_rpmAccumulatedUs = 0;
+      g_rpmAccumulatedPulses = 0;
+    } else {
+      if (g_rpmAccumulatedUs > 6000000ULL) {
+        g_rpmAccumulatedUs = 6000000ULL;
+      }
     }
   }
 
-  if (millis() - g_lastRpmUpdateMs > 2000) g_rpmUi = 0; // idle decay
+  if (millis() - g_lastRpmUpdateMs > 2000) {
+    g_rpmUi = 0; // idle decay
+    g_rpmAccumulatedUs = 0;
+    g_rpmAccumulatedPulses = 0;
+    g_rpmSampleUs = nowUs;
+    g_rpmLastCount = g_pulseCount;
+  }
   return g_rpmUi;
 }
 
@@ -2263,6 +2288,10 @@ void setup(){
   g_currentPath = "";
   g_rpmUi = 0;
   g_lastRpmUpdateMs = millis();
+  g_rpmSampleUs = 0;
+  g_rpmLastCount = g_pulseCount;
+  g_rpmAccumulatedUs = 0;
+  g_rpmAccumulatedPulses = 0;
   Serial.println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
 }
 
