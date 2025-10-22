@@ -1218,24 +1218,56 @@ static uint32_t computeRpmSnapshot() {
   if (g_rpmSampleUs == 0) {
     g_rpmSampleUs  = nowUs;
     g_rpmLastCount = g_pulseCount;
-    return g_rpmUi;
+  }
+
+  uint32_t instCount = 0;
+  uint32_t instPeriod = 0;
+  bool     periodFresh = false;
+
+  uint32_t lastPulseUs = g_lastPulseUsIsr;
+  uint32_t periodUs    = g_lastPeriodUs;
+  if (periodUs > 0 && g_pulsesPerRev > 0) {
+    uint32_t sinceLast = nowUs - lastPulseUs;
+    uint64_t freshness = (uint64_t)periodUs * 2ULL; // allow 2 revolutions before marking stale
+    if (freshness < 250000ULL) freshness = 250000ULL; // guard against very small periods
+    if (sinceLast <= freshness) {
+      uint64_t denom = (uint64_t)periodUs * (uint64_t)g_pulsesPerRev;
+      if (denom) {
+        instPeriod = (uint32_t)((60000000ULL + (denom / 2ULL)) / denom); // rounded
+        periodFresh = true;
+      }
+    }
   }
 
   uint32_t dtUs = nowUs - g_rpmSampleUs;
+  bool sampled = false;
   if (dtUs >= 250000) { // sample ~every 0.25 s
     uint32_t countNow = g_pulseCount;
     uint32_t delta    = countNow - g_rpmLastCount;
     g_rpmLastCount    = countNow;
     g_rpmSampleUs     = nowUs;
+    sampled = true;
 
-    if (dtUs > 0 && g_pulsesPerRev > 0) {
-      // RPM = delta * 60e6 / (dtUs * PPR)
+    if (delta > 0 && g_pulsesPerRev > 0) {
       uint64_t num   = (uint64_t)delta * 60000000ULL;
       uint64_t denom = (uint64_t)dtUs * (uint64_t)g_pulsesPerRev;
-      uint32_t inst  = (denom ? (uint32_t)(num / denom) : 0);
-      g_rpmUi = (g_rpmUi * 3 + inst) / 4; // light smoothing
+      if (denom) {
+        instCount = (uint32_t)((num + (denom / 2ULL)) / denom);
+      }
+    }
+  }
+
+  uint32_t inst = instPeriod;
+  if (!inst) inst = instCount;
+  else if (instCount) inst = (inst + instCount + 1U) / 2U; // blend
+
+  if (inst) {
+    g_rpmUi = (g_rpmUi * 3 + inst) / 4;
+    if (periodFresh || instCount) {
       g_lastRpmUpdateMs = millis();
     }
+  } else if (sampled) {
+    g_rpmUi = (g_rpmUi * 3) / 4; // decay gently when we sampled but saw nothing
   }
 
   if (millis() - g_lastRpmUpdateMs > 2000) g_rpmUi = 0; // idle decay

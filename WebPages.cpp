@@ -36,6 +36,8 @@ String filesPageHeader(const String &pathEscaped,
       "button{padding:.4rem .7rem;border:0;border-radius:8px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
       "button:hover{filter:brightness(1.1)}"
       "input{padding:.45rem .5rem;border-radius:8px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
+      "form.upload{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-top:.75rem}"
+      "form.upload input[type=file]{flex:1;min-width:200px}"
       ".muted{opacity:.75}"
       "</style></head><body><div class='card'>"
       "<div style='display:flex;justify-content:space-between;align-items:center'>"
@@ -47,9 +49,13 @@ String filesPageHeader(const String &pathEscaped,
       "</div>"
       "<p>Path: <b>" + pathEscaped + "</b> &middot; "
       "<a href='/files?path=" + parentEncoded + "'>Up</a></p>"
-
-      // NOTE: Firmware upload moved to /updates
-
+      "<form class='upload' method='POST' action='/upload' enctype='multipart/form-data'>"
+      "<input type='hidden' name='dir' value='" + currentPathEncoded + "'>"
+      "<input type='hidden' name='back' value='" + backEncoded + "'>"
+      "<input type='file' name='data' accept='.fseq' required>"
+      "<button type='submit'>Upload .fseq</button>"
+      "<div class='muted' style='flex-basis:100%'>Files are saved in the current directory. Only <b>.fseq</b> uploads are accepted.</div>"
+      "</form>"
       "<div class='row' style='margin-top:.75rem'>"
       "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + currentPathEncoded + "&name='+encodeURIComponent(n);\">New Folder</button>"
       "<button onclick=\"location.reload()\">Refresh</button>"
