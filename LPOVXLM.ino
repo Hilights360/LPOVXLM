@@ -50,16 +50,11 @@ static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 // ---------- Hall effect + status pixel ----------
 static const int      PIN_HALL_SENSOR        = 5;   // A3144 on this pin (LOW when magnet present)
 static const int      PIN_STATUS_PIXEL       = 48;
-static const uint32_t HALL_BLINK_DURATION_MS = 100;
-static const uint32_t HALL_DIAG_BLINK_DURATION_MS = 200;
 
 static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800);
 static bool              g_hallPrevActive   = false;
-static bool              g_hallBlinkActive  = false;
-static uint32_t          g_hallBlinkStartMs = 0;
 static bool              g_hallDiagEnabled  = false;
-static bool              g_hallDiagBlinkActive = false;
-static uint32_t          g_hallDiagBlinkStartMs = 0;
+static bool              g_hallDiagActive = false;
 
 // RPM measurement (A3144)
 static const uint8_t     PULSES_PER_REV      = 1;   // default; can override at runtime via /rpm
@@ -282,11 +277,11 @@ static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
+  const bool prevHall   = g_hallPrevActive;
 
   if (g_hallDiagEnabled) {
-    if ((hallActive && !g_hallPrevActive) || (!hallActive && g_hallPrevActive)) {
-      g_hallDiagBlinkActive = true;
-      g_hallDiagBlinkStartMs = millis();
+    if (hallActive && !g_hallDiagActive) {
+      g_hallDiagActive = true;
       const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
       for (uint8_t a = 0; a < arms; ++a) {
         if (!strips[a]) continue;
@@ -296,34 +291,37 @@ static void updateHallSensor() {
         }
         strips[a]->show();
       }
+    } else if (!hallActive && g_hallDiagActive) {
+      const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
+      for (uint8_t a = 0; a < arms; ++a) {
+        if (!strips[a]) continue;
+        uint16_t pix = strips[a]->numPixels();
+        for (uint16_t i = 0; i < pix; ++i) {
+          strips[a]->setPixelColor(i, 0, 0, 0);
+        }
+        strips[a]->show();
+      }
+      g_hallDiagActive = false;
     }
+  } else if (g_hallDiagActive) {
+    const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
+    for (uint8_t a = 0; a < arms; ++a) {
+      if (!strips[a]) continue;
+      uint16_t pix = strips[a]->numPixels();
+      for (uint16_t i = 0; i < pix; ++i) {
+        strips[a]->setPixelColor(i, 0, 0, 0);
+      }
+      strips[a]->show();
+    }
+    g_hallDiagActive = false;
   }
 
-  if (hallActive && !g_hallPrevActive) {
-    g_hallBlinkActive = true;
-    g_hallBlinkStartMs = millis();
-    g_statusPixel.setPixelColor(0, g_statusPixel.Color(255, 255, 255));
+  if (hallActive != prevHall) {
+    g_statusPixel.setPixelColor(0, hallActive ? g_statusPixel.Color(255, 255, 255) : 0);
     g_statusPixel.show();
   }
 
   g_hallPrevActive = hallActive;
-
-  if (g_hallBlinkActive && (millis() - g_hallBlinkStartMs >= HALL_BLINK_DURATION_MS)) {
-    g_statusPixel.setPixelColor(0, 0);
-    g_statusPixel.show();
-    g_hallBlinkActive = false;
-  }
-
-  if (g_hallDiagBlinkActive && (millis() - g_hallDiagBlinkStartMs >= HALL_DIAG_BLINK_DURATION_MS)) {
-    const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
-    for (uint8_t a=0; a<arms; ++a){
-      if (!strips[a]) continue;
-      uint16_t pix = strips[a]->numPixels();
-      for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
-      strips[a]->show();
-    }
-    g_hallDiagBlinkActive = false;
-  }
 }
 
 /* -------------------- Prototypes for all web handlers -------------------- */
@@ -1440,13 +1438,13 @@ static void handleHallDiag(){
       g_bgEffectActive = false;
       g_bootMs = millis();
       g_bgEffectNextAttemptMs = g_bootMs;
-      g_hallDiagBlinkActive = false;
+      g_hallDiagActive = false;
       blackoutAll();
     }
   } else {
     if (g_hallDiagEnabled) {
       g_hallDiagEnabled = false;
-      g_hallDiagBlinkActive = false;
+      g_hallDiagActive = false;
       g_bootMs = millis();
       g_bgEffectNextAttemptMs = g_bootMs;
       blackoutAll();
