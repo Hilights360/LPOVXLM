@@ -63,6 +63,7 @@ static uint32_t          g_hallDiagBlinkStartMs = 0;
 
 // RPM measurement (A3144)
 static const uint8_t     PULSES_PER_REV      = 1;   // default; can override at runtime via /rpm
+static const uint32_t    MIN_PULSE_INTERVAL_US = 150; // debounce threshold between hall pulses
 volatile uint32_t        g_lastPeriodUs      = 0;   // last valid pulse period (us)
 volatile uint32_t        g_pulseCount        = 0;   // total pulses seen
 volatile uint32_t        g_lastPulseUsIsr    = 0;   // last pulse timestamp (us) in ISR
@@ -81,9 +82,9 @@ static void IRAM_ATTR hallIsr() {
   uint32_t now = micros();
   uint32_t last = g_lastPulseUsIsr;
   g_lastPulseUsIsr = now;
-  // crude debounce: ignore pulses < 1ms apart (spurious)
+  // debounce: ignore pulses that arrive unrealistically fast (noise)
   uint32_t dt = now - last;
-  if (dt > 1000) {
+  if (dt >= MIN_PULSE_INTERVAL_US) {
     g_lastPeriodUs = dt;
     g_pulseCount = g_pulseCount + 1; // avoid ++ on volatile (deprecated)
   }

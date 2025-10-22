@@ -48,7 +48,12 @@ String filesPageHeader(const String &pathEscaped,
       "<p>Path: <b>" + pathEscaped + "</b> &middot; "
       "<a href='/files?path=" + parentEncoded + "'>Up</a></p>"
 
-      // NOTE: Firmware upload moved to /updates
+      "<form method='POST' action='/upload?dir=" + currentPathEncoded + "&back=" + backEncoded + "' "
+      "enctype='multipart/form-data' class='row' style='margin-top:.75rem'>"
+      "<input type='file' name='fseq' accept='.fseq' required>"
+      "<button type='submit'>Upload .fseq</button>"
+      "</form>"
+      "<div class='muted' style='margin-top:.25rem'>Only <b>.fseq</b> files are accepted.</div>"
 
       "<div class='row' style='margin-top:.75rem'>"
       "<button onclick=\"const n=prompt('New folder name'); if(n) location='/mkdir?path=" + currentPathEncoded + "&name='+encodeURIComponent(n);\">New Folder</button>"
