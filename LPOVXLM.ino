@@ -232,6 +232,21 @@ static float g_armPhaseDeg[MAX_ARMS] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 static inline uint16_t spokesCount() { return (g_spokesTotal ? g_spokesTotal : 1); }
 
+// Runtime tracking for spoke rendering cadence
+static const float    SPOKE_BLANK_FRACTION = 0.20f;   // portion of a spoke period before blanking
+static const uint32_t SPOKE_BLANK_MIN_US   = 150;     // ensure a minimum blanking window
+
+struct SpokeRuntimeState {
+  uint32_t nextSpokeUs      = 0;   // micros() deadline for next spoke paint
+  uint32_t blankDeadlineUs  = 0;   // micros() deadline to blackout after paint
+  uint16_t rotationIndex    = 0;   // which spoke in the 0..spokes-1 sweep we are on
+  bool     lit              = false;
+  bool     valid            = false;
+};
+
+static SpokeRuntimeState g_spokeRuntime;
+static volatile uint32_t g_lastHallSyncUs = 0;
+
 static inline void getHallSnapshot(uint32_t& periodUs, uint32_t& sinceUs) {
   uint32_t lastIsr = g_lastPulseUsIsr;  // volatile read
   periodUs = g_lastPeriodUs;            // volatile read
@@ -242,6 +257,20 @@ static inline void getHallSnapshot(uint32_t& periodUs, uint32_t& sinceUs) {
 static inline float sinceUsToDeg(uint32_t sinceUs, uint32_t periodUs) {
   if (periodUs == 0) return 0.0f;
   return (360.0f * (float)sinceUs) / (float)periodUs;
+}
+
+static inline uint32_t revolutionPeriodUs() {
+  uint32_t per = g_lastPeriodUs;
+  if (!per) return 0;
+  return per * (uint32_t)g_pulsesPerRev;
+}
+
+static inline uint32_t spokePeriodUs() {
+  uint16_t spokes = spokesCount();
+  if (!spokes) return 0;
+  uint32_t rev = revolutionPeriodUs();
+  if (!rev) return 0;
+  return rev / (uint32_t)spokes;
 }
 
 // Current spoke index from hall phase with global trim
@@ -319,6 +348,10 @@ static void updateHallSensor() {
   if (hallActive != prevHall) {
     g_statusPixel.setPixelColor(0, hallActive ? g_statusPixel.Color(255, 255, 255) : 0);
     g_statusPixel.show();
+  }
+
+  if (hallActive && !prevHall && !g_hallDiagEnabled) {
+    resetSpokeRuntime(micros());
   }
 
   g_hallPrevActive = hallActive;
@@ -736,6 +769,8 @@ static void freeFseq(){
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
   g_bgEffectActive = false;
   memset(&g_fh,0,sizeof(g_fh));
+  g_spokeRuntime = SpokeRuntimeState{};
+  g_lastHallSyncUs = 0;
 }
 
 static int64_t sparseTranslate(uint32_t absCh) {
@@ -816,6 +851,8 @@ static bool openFseq(const String& path, String& why){
 
     g_currentPath = path; g_frameIndex=0; g_lastTickMs = millis(); g_playing = true;
     g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
+    g_spokeRuntime = SpokeRuntimeState{};
+    g_lastHallSyncUs = 0;
     Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
       path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
       g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, (unsigned)g_fh.sparseCnt, g_fh.chanDataOffset);
@@ -903,17 +940,25 @@ static void blackoutAll(){
 }
 
 /* ---------- NEW: render a specific angular spoke, not time-based index ---------- */
-static bool renderFrameAtSpoke(uint16_t spokeIdx) {
+static bool loadNextFrame() {
   if (!g_fh.frameCount) return false;
   if (!loadFrame(g_frameIndex)) return false;
+  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
+  return true;
+}
+
+static void paintSpokeRotation(uint16_t rotationIdx) {
+  if (!g_frameBuf) return;
 
   const uint16_t spokes = spokesCount();
-  const uint8_t  arms   = activeArmCount();
-  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
+  if (!spokes) return;
 
-  const uint32_t fallbackPixels = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
-  const uint32_t chPerSpoke =
-      (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
+  const uint8_t  arms        = activeArmCount();
+  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
+  const uint32_t fallbackPix = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
+  const uint32_t chPerSpoke  =
+      (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPix * 3u);
+  if (!chPerSpoke) return;
 
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
   const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
@@ -921,29 +966,104 @@ static bool renderFrameAtSpoke(uint16_t spokeIdx) {
   for (uint8_t arm=0; arm<arms; ++arm) {
     if (!strips[arm]) continue;
 
-    // Arm’s base spoke, then force to current angular position
-    uint32_t armBaseSpoke = (uint32_t)armSpokeIdx0((int)arm, startIdx0, (int)spokes, (int)arms);
-    armBaseSpoke = (armBaseSpoke + spokeIdx) % spokes;
-
-    const uint32_t baseChAbsR = startChBase + armBaseSpoke * chPerSpoke;
+    const uint32_t baseSpoke = (uint32_t)armSpokeIdx0((int)arm, startIdx0, (int)spokes, (int)arms);
+    const uint32_t armSpoke  = (baseSpoke + rotationIdx) % spokes;
+    const uint32_t baseChAbsR = startChBase + armSpoke * chPerSpoke;
     const uint32_t pixelCount = strips[arm]->numPixels();
 
-    for (uint32_t i=0; i<pixelCount; ++i){
+    for (uint32_t i=0; i<pixelCount; ++i) {
       const uint32_t absR = baseChAbsR + i * blockStride;
-      const int64_t  idxR = sparseTranslate(absR);
-      if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
-        strips[arm]->setPixelColor(i,0,0,0);
+      const int64_t idxR = sparseTranslate(absR);
+      if (idxR < 0 || (idxR + 2) >= (int64_t)g_fh.channelCount) {
+        strips[arm]->setPixelColor(i, 0,0,0);
         continue;
       }
       uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
       strips[arm]->setPixelColor(i, R,G,B);
     }
-    strips[arm]->show();  // shift while gate is OFF (or while software gating will blank later)
+    strips[arm]->show();
   }
 
-  // Advance animation frame
-  g_frameIndex = (g_frameIndex + 1) % (g_fh.frameCount ? g_fh.frameCount : 1);
-  return true;
+  if (PIN_STROBE_GATE >= 0) {
+    digitalWrite(PIN_STROBE_GATE, HIGH);
+  }
+}
+
+static void blackoutSpokes() {
+  if (PIN_STROBE_GATE >= 0) {
+    digitalWrite(PIN_STROBE_GATE, LOW);
+  }
+  blackoutAll();
+}
+
+static void resetSpokeRuntime(uint32_t nowUs) {
+  if (g_spokeRuntime.lit) {
+    blackoutSpokes();
+    g_spokeRuntime.lit = false;
+  }
+  g_spokeRuntime.rotationIndex   = 0;
+  g_spokeRuntime.nextSpokeUs     = nowUs;
+  g_spokeRuntime.blankDeadlineUs = 0;
+  g_lastHallSyncUs               = nowUs;
+  g_indexPosition                = 0;
+  g_spokeRuntime.valid           = true;
+}
+
+static void updateSpokeRuntime() {
+  if (!g_playing || g_paused) return;
+  if (!g_spokeRuntime.valid) return;
+
+  uint32_t nowUs = micros();
+  uint32_t spokeUs = spokePeriodUs();
+  if (!spokeUs) {
+    if (g_spokeRuntime.lit) {
+      blackoutSpokes();
+      g_spokeRuntime.lit = false;
+    }
+    return;
+  }
+
+  const uint16_t spokes = spokesCount();
+
+  if (!g_spokeRuntime.lit) {
+    uint32_t nextUs = g_spokeRuntime.nextSpokeUs;
+    int32_t diff = (int32_t)(nowUs - nextUs);
+    if (diff >= 0) {
+      if (spokeUs > 0) {
+        uint32_t stepsLate = (uint32_t)diff / spokeUs;
+        if (stepsLate > 0) {
+          g_spokeRuntime.rotationIndex = (g_spokeRuntime.rotationIndex + stepsLate) % spokes;
+          nextUs += stepsLate * spokeUs;
+          g_spokeRuntime.nextSpokeUs = nextUs;
+        }
+      }
+
+      uint16_t rotation = g_spokeRuntime.rotationIndex % spokes;
+      paintSpokeRotation(rotation);
+      g_spokeRuntime.lit = true;
+      g_indexPosition = rotation;
+
+      uint32_t blankDelay = (uint32_t)((float)spokeUs * SPOKE_BLANK_FRACTION);
+      uint32_t minBlank = (spokeUs > SPOKE_BLANK_MIN_US) ? SPOKE_BLANK_MIN_US : (spokeUs / 2u);
+      if (minBlank == 0) minBlank = 1;
+      if (blankDelay < minBlank) blankDelay = minBlank;
+      if (blankDelay >= spokeUs) {
+        blankDelay = (spokeUs > 1) ? (spokeUs / 2u) : 1u;
+      }
+      g_spokeRuntime.blankDeadlineUs = nowUs + blankDelay;
+
+      g_spokeRuntime.rotationIndex = (rotation + 1) % spokes;
+      g_spokeRuntime.nextSpokeUs = nextUs + spokeUs;
+    }
+  }
+
+  if (g_spokeRuntime.lit) {
+    int32_t blankDiff = (int32_t)(nowUs - g_spokeRuntime.blankDeadlineUs);
+    if (blankDiff >= 0) {
+      blackoutSpokes();
+      g_spokeRuntime.lit = false;
+    }
+  }
 }
 
 /* -------------------- Web: Files page + ops -------------------- */
@@ -2340,29 +2460,14 @@ void loop(){
   if (!g_playing || g_paused) {
     // Gate off while idle
     if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
+    if (g_spokeRuntime.lit) {
+      blackoutSpokes();
+      g_spokeRuntime.lit = false;
+    }
+    g_spokeRuntime.valid = false;
     delay(1);
     feedWatchdog();
     return;
-  }
-
-  // ---- Angular spoke & gating management ----
-  const uint16_t spokeNow = currentSpokeIndex();
-
-  // HARD gate: pulse on only inside the window (software blanking otherwise)
-  if (PIN_STROBE_GATE >= 0) {
-    bool on = inStrobeWindowForArm(spokeNow, 0); // arm 0 as timing reference
-    digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
-  } else {
-    // Software blank outside the window (less crisp than hardware gate)
-    const uint8_t arms = activeArmCount();
-    for (uint8_t a = 0; a < arms; ++a) {
-      bool on = inStrobeWindowForArm(spokeNow, a);
-      if (!on && strips[a]) {
-        uint16_t pix = strips[a]->numPixels();
-        for (uint16_t i = 0; i < pix; ++i) strips[a]->setPixelColor(i,0,0,0);
-        strips[a]->show();
-      }
-    }
   }
 
   // Update frame content at requested FPS, but draw it aligned to current spoke
@@ -2370,7 +2475,7 @@ void loop(){
   if (now - g_lastTickMs >= g_framePeriodMs) {
     g_lastTickMs = now;
 
-    if (!renderFrameAtSpoke(spokeNow)) {
+    if (!loadNextFrame()) {
       ++g_sdFailStreak;
       Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
       if (!recoverSd("frame read failed")) {
@@ -2388,6 +2493,8 @@ void loop(){
 
     g_sdFailStreak = 0;
   }
+
+  updateSpokeRuntime();
 
   feedWatchdog();
 }
