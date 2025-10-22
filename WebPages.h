@@ -7,7 +7,9 @@ namespace WebPages {
 String filesPageHeader(const String &pathEscaped,
                        const String &parentEncoded,
                        const String &currentPathEncoded,
-                       const String &backEncoded);
+                       const String &backEncoded,
+                       const String &currentPathAttrEscaped,
+                       const String &backAttrEscaped);
 
 String filesDirectoryRow(const String &displayNameEscaped,
                          const String &linkEncoded,
