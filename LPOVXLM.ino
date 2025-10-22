@@ -20,6 +20,8 @@
 
 #include "QuadMap.h"
 #include "WebPages.h"
+#include "HtmlUtils.h"
+#include "WifiManager.h"
 
 // ---------- Optional zlib backends (auto-detect) ----------
 #if defined(__has_include)
@@ -173,7 +175,6 @@ static const char* SETTINGS_DIR  = "/config";
 static const char* SETTINGS_FILE = "/config/settings.ini";
 static const char* OTA_FILE      = "/firmware.bin";
 static const char* OTA_FAIL_FILE = "/firmware.failed";
-static const char* BG_EFFECTS_DIR = "/BGEffects";
 
 WebServer server(80);
 
@@ -413,58 +414,6 @@ static uint32_t nextLowerSdFreq(uint32_t freq){
   return SD_FREQ_OPTIONS[SD_FREQ_OPTION_COUNT-1];
 }
 
-static bool isFseqName(const String& n) {
-  int dot = n.lastIndexOf('.');
-  if (dot < 0) return false;
-  String ext = n.substring(dot + 1); ext.toLowerCase();
-  return ext == "fseq";
-}
-
-static bool isBgEffectPath(const String& path) {
-  const size_t prefixLen = strlen(BG_EFFECTS_DIR);
-  if (path.length() <= prefixLen) return false;
-  if (!path.startsWith(BG_EFFECTS_DIR)) return false;
-  return path.charAt(prefixLen) == '/';
-}
-
-static String sanitizeBgEffectPath(const String& in) {
-  String path = in;
-  path.trim();
-  if (!path.length()) return String();
-  if (path.indexOf("..") >= 0) return String();
-  if (path[0] != '/') path = "/" + path;
-  if (!isBgEffectPath(path)) return String();
-  if (!isFseqName(path)) return String();
-  return path;
-}
-
-static String bgEffectDisplayName(const String& path) {
-  if (isBgEffectPath(path)) {
-    size_t prefixLen = strlen(BG_EFFECTS_DIR);
-    if (path.length() > prefixLen + 1) {
-      return path.substring(prefixLen + 1);
-    }
-  }
-  String name = path;
-  int slash = name.lastIndexOf('/');
-  if (slash >= 0) name = name.substring(slash + 1);
-  return name;
-}
-
-static String defaultStationId() {
-  char buf[16];
-  uint64_t mac = ESP.getEfuseMac();
-  uint32_t suffix = (uint32_t)(mac & 0xFFFFFFu);
-  snprintf(buf, sizeof(buf), "pov-%06X", (unsigned int)suffix);
-  return String(buf);
-}
-
-static void applyStationHostname() {
-  if (!g_stationId.length()) g_stationId = defaultStationId();
-  WiFi.setHostname(g_stationId.c_str());
-  WiFi.softAPsetHostname(g_stationId.c_str());
-}
-
 static bool ensureSettingsDirLocked() {
   if (!SD_MMC.exists(SETTINGS_DIR)) {
     if (!SD_MMC.mkdir(SETTINGS_DIR)) {
@@ -631,42 +580,6 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
   }
 }
 
-static void markStationState(bool connected) {
-  if (connected != g_staConnected) {
-    g_staConnected = connected;
-    Serial.printf("[WIFI] Station %s\n", connected ? "connected" : "disconnected");
-  }
-  if (connected) g_staConnecting = false;
-}
-
-static void connectWifiStation() {
-  if (!g_staSsid.length()) {
-    markStationState(false);
-    return;
-  }
-  applyStationHostname();
-  Serial.printf("[WIFI] Connecting to SSID '%s'...\n", g_staSsid.c_str());
-  WiFi.disconnect(false, true);
-  markStationState(false);
-  WiFi.begin(g_staSsid.c_str(), g_staPass.c_str());
-  g_staConnecting = true;
-  g_staConnectStartMs = millis();
-}
-
-static void pollWifiStation() {
-  if (!g_staSsid.length()) return;
-  wl_status_t st = WiFi.status();
-  if (st == WL_CONNECTED) {
-    markStationState(true);
-  } else {
-    if (g_staConnected) markStationState(false);
-    if (g_staConnecting && millis() - g_staConnectStartMs > 20000) {
-      Serial.println("[WIFI] Retry station connection");
-      connectWifiStation();
-    }
-  }
-}
-
 static void checkSdFirmwareUpdate() {
   if (!g_sdReady || !g_sdMutex) return;
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
@@ -724,47 +637,6 @@ static void checkSdFirmwareUpdate() {
   SD_UNLOCK();
   delay(200);
   ESP.restart();
-}
-
-static String htmlEscape(const String& in) {
-  String s; s.reserve(in.length()+8);
-  for (size_t i=0;i<in.length();++i){
-    char c=in[i];
-    if(c=='&') s+="&amp;";
-    else if(c=='<') s+="&lt;";
-    else if(c=='>') s+="&gt;";
-    else if(c=='\"') s+="&quot;";
-    else if(c=='\'') s+="&#39;";
-    else s+=c;
-  }
-  return s;
-}
-static String urlEncode(const String& in){
-  const char* hex="0123456789ABCDEF";
-  String s; s.reserve(in.length()*3);
-  for (size_t i=0;i<in.length();++i){
-    uint8_t c=(uint8_t)in[i];
-    if( (c>='A'&&c<='Z') || (c>='a'&&c<='z') || (c>='0'&&c<='9') || c=='-'||c=='_'||c=='.'||c=='/' ){
-      s+=(char)c;
-    } else {
-      s+='%'; s+=hex[c>>4]; s+=hex[c&0xF];
-    }
-  }
-  return s;
-}
-static String dirnameOf(const String& path){
-  if(path=="/") return "/";
-  int slash = path.lastIndexOf('/');
-  if (slash<=0) return "/";
-  return path.substring(0, slash);
-}
-static String joinPath(const String& dir, const String& name){
-  String d = dir;
-  if (!d.length() || d[0] != '/') d = "/" + d;
-  if (d != "/" && d.endsWith("/")) d.remove(d.length()-1);
-  String base = name;
-  int slash = base.lastIndexOf('/'); if (slash >= 0) base = base.substring(slash+1);
-  return (d == "/") ? ("/" + base) : (d + "/" + base);
 }
 
 /* -------------------- SD helpers (prefer 4-bit + mutex) -------------------- */
