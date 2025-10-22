@@ -74,6 +74,10 @@ static uint32_t g_rpmLastCount   = 0;  // pulse count snapshot at last sample
 static uint64_t g_rpmAccumulatedUs   = 0;  // total us accumulated for current window
 static uint32_t g_rpmAccumulatedPulses = 0; // pulses accumulated for current window
 
+// --- Hall sync flags used by ISR and main loop ---
+static volatile bool     g_hallSyncPending     = false;
+static volatile uint32_t g_hallSyncTimestampUs = 0;
+
 static void IRAM_ATTR hallIsr() {
   uint32_t now = micros();
   uint32_t last = g_lastPulseUsIsr;
@@ -231,12 +235,12 @@ struct ArmRuntimeState {
 };
 
 static ArmRuntimeState g_armState[MAX_ARMS];
-static volatile bool   g_hallSyncPending     = false;
-static volatile uint32_t g_hallSyncTimestampUs = 0;
+//static volatile bool   g_hallSyncPending     = false;
+//static volatile uint32_t g_hallSyncTimestampUs = 0;
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 400; // microseconds each spoke stays lit
+static const uint32_t  ARM_BLANK_DELAY_US    = 4; // microseconds each spoke stays lit
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
