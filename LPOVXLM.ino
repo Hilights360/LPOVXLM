@@ -143,7 +143,8 @@ static const uint8_t NUM_LANES = 2;
 // Reuse two of the original four ports (edit here if you want different ones):
 /* This is now setup to use both SPI lanes at full clock speed. 
 Arm 1 is outside fed and feeds Arm 2 from the center and it extends 90 degrees from Arm 1 Clockwise as viewed from the Pixels. 
-Arm 3 and 4 follow suit with Arm 3 being outside fed and 4 fed from the center */
+Arm 3 and 4 follow suit with Arm 3 being outside fed and 4 fed from the center. Arm 3 has been moved to the Port for 
+Arm 2 to keep from drawing too much current accross the entire PCB*/
 static const int LANE_CLK[NUM_LANES]  = { 47, 35 }; // old Arm1 CLK, old Arm3 CLK
 static const int LANE_DATA[NUM_LANES] = { 45, 36 }; // old Arm1 DATA, old Arm3 DATA
 
