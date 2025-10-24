@@ -88,9 +88,10 @@ static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800
 static bool              g_hallPrevActive   = false;
 static bool              g_hallDiagEnabled  = false;
 static bool              g_hallDiagActive = false;
-static bool              g_armTestEnabled   = false;
+static bool              g_armTestEnabled    = false;
 static uint8_t           g_armTestCurrentArm = 0;
 static uint8_t           g_armTestColorIdx   = 0;
+static uint16_t          g_armTestCurrentPixel = 0;
 static uint32_t          g_armTestNextStepMs = 0;
 static const uint8_t     ARM_TEST_COLORS[3][3] = {
   {255,   0,   0},
@@ -471,25 +472,32 @@ static void updateArmTest() {
   const uint8_t arms = activeArmCount();
   if (!arms) return;
 
+  const uint16_t pixels = armPixelCount();
+  if (!pixels) return;
+
   uint32_t now = millis();
   if (g_armTestNextStepMs && now < g_armTestNextStepMs) return;
 
   if (g_armTestCurrentArm >= arms) g_armTestCurrentArm = 0;
   if (g_armTestColorIdx >= ARM_TEST_COLOR_COUNT) g_armTestColorIdx = 0;
+  if (g_armTestCurrentPixel >= pixels) g_armTestCurrentPixel = 0;
 
   const uint8_t *color = ARM_TEST_COLORS[g_armTestColorIdx];
-  for (uint8_t a = 0; a < arms; ++a) {
-    if (a == g_armTestCurrentArm) armFillColor(a, color[0], color[1], color[2]);
-    else                          armFillColor(a, 0, 0, 0);
-  }
+
+  for (uint8_t a = 0; a < arms; ++a) armFillColor(a, 0, 0, 0);
+  armSetPixel(g_armTestCurrentArm, g_armTestCurrentPixel, color[0], color[1], color[2]);
 
   lanesShowAll();
 
-  g_armTestNextStepMs = now + 500;
-  ++g_armTestCurrentArm;
-  if (g_armTestCurrentArm >= arms) {
-    g_armTestCurrentArm = 0;
-    g_armTestColorIdx = (g_armTestColorIdx + 1) % ARM_TEST_COLOR_COUNT;
+  g_armTestNextStepMs = now + 50;
+  ++g_armTestCurrentPixel;
+  if (g_armTestCurrentPixel >= pixels) {
+    g_armTestCurrentPixel = 0;
+    ++g_armTestCurrentArm;
+    if (g_armTestCurrentArm >= arms) {
+      g_armTestCurrentArm = 0;
+      g_armTestColorIdx = (g_armTestColorIdx + 1) % ARM_TEST_COLOR_COUNT;
+    }
   }
 }
 
@@ -829,6 +837,10 @@ static void resetArmRuntimeStates(){
 static void handleLaneDiag() {
   g_playing = false; g_paused = false;
   g_hallDiagEnabled = false; g_armTestEnabled = false;
+  g_armTestCurrentArm = 0;
+  g_armTestColorIdx = 0;
+  g_armTestCurrentPixel = 0;
+  g_armTestNextStepMs = 0;
   blackoutAll();
 
   const uint8_t arms = activeArmCount();
@@ -1231,6 +1243,7 @@ static void handleStart(){
     g_armTestEnabled = false;
     g_armTestCurrentArm = 0;
     g_armTestColorIdx = 0;
+    g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
   g_playing=true; g_paused=false; g_lastTickMs=millis();
@@ -1303,6 +1316,7 @@ static void handleHallDiag(){
       g_armTestEnabled = false;
       g_armTestCurrentArm = 0;
       g_armTestColorIdx = 0;
+      g_armTestCurrentPixel = 0;
       g_armTestNextStepMs = 0;
     }
     if (!g_hallDiagEnabled) {
@@ -1343,6 +1357,7 @@ static void handleArmTest(){
       g_armTestEnabled = true;
       g_armTestCurrentArm = 0;
       g_armTestColorIdx = 0;
+      g_armTestCurrentPixel = 0;
       g_armTestNextStepMs = 0;
       g_playing = false;
       g_paused = false;
@@ -1360,6 +1375,7 @@ static void handleArmTest(){
       g_armTestEnabled = false;
       g_armTestCurrentArm = 0;
       g_armTestColorIdx = 0;
+      g_armTestCurrentPixel = 0;
       g_armTestNextStepMs = 0;
       g_bootMs = millis();
       g_bgEffectNextAttemptMs = g_bootMs;
