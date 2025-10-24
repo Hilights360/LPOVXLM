@@ -347,7 +347,6 @@ static ArmRuntimeState g_armState[MAX_ARMS];
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
@@ -357,7 +356,6 @@ static inline bool microsReached(uint32_t now, uint32_t target) {
 static void resetArmRuntimeStates();
 static void blankArm(uint8_t arm);
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs);
-static void processArmBlanking(uint32_t nowUs);
 static void processHallSyncEvent(uint32_t nowUs);
 static void advancePredictedSpokes(uint32_t nowUs);
 static bool loadNextFrame();
@@ -691,6 +689,14 @@ bool openFseq(const String& path, String& why){
     g_frameIndex = 0;
     g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
 
+    if (g_fh.stepTimeMs > 0) {
+      g_framePeriodMs = (uint32_t)g_fh.stepTimeMs;
+      if (g_framePeriodMs == 0) g_framePeriodMs = 1;
+      uint32_t fpsCalc = (1000UL + (uint32_t)g_fh.stepTimeMs / 2UL) / (uint32_t)g_fh.stepTimeMs;
+      if (fpsCalc == 0) fpsCalc = 1;
+      g_fps = (uint16_t)clampI32((int32_t)fpsCalc, 1, 1000);
+    }
+
     ok = true;
   } while(0);
   SD_UNLOCK();
@@ -915,8 +921,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
       for (uint8_t a = 0; a < arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-        if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+        g_armState[a].blankDeadlineUs = 0;
       }
     }
     return;
@@ -999,24 +1004,9 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-  if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  g_armState[arm].blankDeadlineUs = 0;
 }
 
-
-static void processArmBlanking(uint32_t nowUs){
-  const uint8_t arms = activeArmCount();
-  for (uint8_t a=0; a<arms; ++a){
-    if (!g_armState[a].lit) continue;
-    uint32_t blankAt = g_armState[a].blankDeadlineUs;
-    if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a);
-    }
-  }
-  for (uint8_t a=arms; a<MAX_ARMS; ++a){
-    if (g_armState[a].lit) blankArm(a);
-  }
-}
 
 static void processHallSyncEvent(uint32_t nowUs){
   uint32_t syncUs = 0;
@@ -1037,21 +1027,25 @@ static void processHallSyncEvent(uint32_t nowUs){
   const uint8_t arms = activeArmCount();
   const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
 
+  uint16_t hallBase = (uint16_t)startIdx0 % spokes;
+  g_indexPosition = hallBase;
+
   for (uint8_t a = 0; a < arms; ++a){
-    uint16_t base = (uint16_t)armSpokeIdx0((int)a, startIdx0, (int)spokes, (int)arms);
-    base %= spokes;
+    uint32_t offset = ((uint32_t)a * (uint32_t)spokes) / (uint32_t)arms;
+    uint32_t baseCalc = ((uint32_t)hallBase + (offset % (uint32_t)spokes)) % (uint32_t)spokes;
+    uint16_t base = (uint16_t)baseCalc;
     g_armState[a].baseSpoke = base;
+    g_lastPulseSpoke[a] = 0xFFFF;
+    g_armState[a].lit = false;
 
     if (!g_strobeEnable) {
       paintArmAt(a, base, nowUs);
-    } else {
-      if (g_armState[a].lit) blankArm(a);
-      g_lastPulseSpoke[a] = 0xFFFF;
     }
   }
   for (uint8_t a = arms; a < MAX_ARMS; ++a){
     g_armState[a].baseSpoke = 0;
-    if (g_armState[a].lit) blankArm(a);
+    g_lastPulseSpoke[a] = 0xFFFF;
+    g_armState[a].lit = false;
   }
 
   uint64_t revolutionUs = 0;
@@ -1086,6 +1080,8 @@ static void advancePredictedSpokes(uint32_t nowUs){
   const uint8_t arms = activeArmCount();
   while (microsReached(nowUs, g_nextSpokeDeadlineUs)) {
     g_spokeStep = (g_spokeStep + 1) % spokes;
+    uint32_t nextIdx = ((uint32_t)g_indexPosition + 1u) % (uint32_t)spokes;
+    g_indexPosition = (uint16_t)nextIdx;
     for (uint8_t a=0; a<arms; ++a){
       uint16_t base = g_armState[a].baseSpoke % spokes;
       uint16_t spoke = (base + g_spokeStep) % spokes;
@@ -2148,21 +2144,26 @@ void loop(){
     const uint16_t spokeNow2 = currentSpokeIndex();
     const uint8_t arms = activeArmCount();
 
-    for (uint8_t a = 0; a < arms; ++a) {
-      const bool in = inStrobeWindowForArm(spokeNow2, a);
+    const uint16_t spokes = spokesCount();
+    if (spokes) {
+      uint32_t base0 = (uint32_t)(g_armState[0].baseSpoke % spokes);
+      uint32_t delta = (((uint32_t)spokeNow2 + (uint32_t)spokes) - base0) % (uint32_t)spokes;
+      g_indexPosition = (uint16_t)((base0 + delta) % (uint32_t)spokes);
+      for (uint8_t a = 0; a < arms; ++a) {
+        const bool in = inStrobeWindowForArm(spokeNow2, a);
+        uint32_t base = (uint32_t)(g_armState[a].baseSpoke % spokes);
+        uint16_t spokeForArm = (uint16_t)((base + delta) % (uint32_t)spokes);
 
-      if (in && g_lastPulseSpoke[a] != spokeNow2) {
-        paintArmAt(a, spokeNow2, nowUs);
-        g_lastPulseSpoke[a] = spokeNow2;
-        g_armState[a].lit = true;
+        if (in && g_lastPulseSpoke[a] != spokeForArm) {
+          paintArmAt(a, spokeForArm, nowUs);
+          g_lastPulseSpoke[a] = spokeForArm;
+          g_armState[a].lit = true;
+        }
       }
-
-      if (!in && g_armState[a].lit) blankArm(a);
     }
   } else {
     processHallSyncEvent(nowUs);
     advancePredictedSpokes(nowUs);
-    processArmBlanking(nowUs);
   }
 
   feedWatchdog();
