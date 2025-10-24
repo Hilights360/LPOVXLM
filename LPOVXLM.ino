@@ -812,7 +812,9 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
+  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE)
+      ? 3UL
+      : ((uint32_t)activeArmCount() * 3UL);
   const uint16_t pixelCount   = armPixelCount();
   const uint32_t fallbackPixels = pixelCount;
   const uint32_t chPerSpoke =
