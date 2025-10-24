@@ -1,9 +1,9 @@
-// ConfigTypes.h
 #pragma once
 #include <Arduino.h>
 
 enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
 
+// Presence flags for what exists in NVS (preferences)
 struct PrefPresence {
   bool brightness=false;
   bool fps=false;
@@ -21,8 +21,10 @@ struct PrefPresence {
   bool watchdog=false;
   bool bgEffectEnable=false;
   bool bgEffectPath=false;
+  bool outMode=false;     // presence flag ONLY (no value here)
 };
 
+// Values loaded from /config/settings.ini (SD backup)
 struct SettingsData {
   bool hasBrightness=false; uint8_t  brightness=0;
   bool hasFps=false;        uint16_t fps=0;
@@ -40,4 +42,5 @@ struct SettingsData {
   bool hasWatchdog=false;   bool     watchdog=false;
   bool hasBgEffectEnable=false; bool bgEffectEnable=false;
   bool hasBgEffectPath=false;   String bgEffectPath;
+  bool hasOutMode=false;    uint8_t  outMode=0;   // 0=SPI, 1=Parallel
 };
