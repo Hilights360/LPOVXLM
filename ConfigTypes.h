@@ -48,6 +48,7 @@ struct PrefPresence {
   bool bgEffectEnable=false;
   bool bgEffectPath=false;
   bool outMode=false;     // presence flag ONLY (no value here)
+  bool strobePct[MAX_ARMS] = { false, false, false, false };
 };
 
 // Values loaded from /config/settings.ini (SD backup)
@@ -69,4 +70,6 @@ struct SettingsData {
   bool hasBgEffectEnable=false; bool bgEffectEnable=false;
   bool hasBgEffectPath=false;   String bgEffectPath;
   bool hasOutMode=false;    uint8_t  outMode=0;   // 0=SPI, 1=Parallel
+  bool hasStrobePct[MAX_ARMS] = { false, false, false, false };
+  uint8_t strobePct[MAX_ARMS] = { 0, 0, 0, 0 };
 };

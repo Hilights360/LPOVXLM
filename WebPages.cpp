@@ -176,7 +176,11 @@ String rootPage(const String &statusClass,
                 bool bgEffectEnabled,
                 bool bgEffectActive,
                 const String &bgEffectCurrentEscaped,
-                const String &bgEffectOptionsHtml) {
+                const String &bgEffectOptionsHtml,
+                uint8_t strobePct1,
+                uint8_t strobePct2,
+                uint8_t strobePct3,
+                uint8_t strobePct4) {
   const char *spokeSel = strideIsSpoke ? "selected" : "";
   const char *ledSel   = strideIsSpoke ? "" : "selected";
 
@@ -189,6 +193,8 @@ String rootPage(const String &statusClass,
   const char *freq2Sel = (sdBaseFreqKHz == 2000) ? "selected" : "";
   const char *freq1Sel = (sdBaseFreqKHz == 1000) ? "selected" : "";
   const char *freq0Sel = (sdBaseFreqKHz ==  400) ? "selected" : "";
+
+  const uint8_t strobePctVals[4] = { strobePct1, strobePct2, strobePct3, strobePct4 };
 
   String sdCurrent = "Current: ";
   if (!sdReady) {
@@ -294,6 +300,20 @@ String rootPage(const String &statusClass,
           "<label>Value: <span id='v'>" + String(brightnessPercent) + "%</span></label>"
           "<input id='rng' type='range' min='0' max='100' value='" + String(brightnessPercent) + "'>"
           "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
+          "<div class='sep'></div>";
+
+  html += "<h3>Strobe Timing</h3>"
+          "<p class='muted'>Adjust how long each arm displays pixels before blanking within a spoke.</p>"
+          "<div class='row' style='gap:1rem;flex-wrap:wrap'>";
+  for (uint8_t a = 0; a < 4; ++a) {
+    html += "<div style='min-width:140px'><label>Arm " + String((unsigned)(a + 1)) + " Strobe %</label>"
+            "<input id='stbpct" + String((unsigned)(a + 1)) + "' type='number' min='0' max='100' value='" +
+            String((unsigned)strobePctVals[a]) + "'></div>";
+  }
+  html += "<div style='align-self:end'><button id='applyStrobePct'>Apply</button></div>"
+          "</div>"
+          "<div class='muted'>Currently configured arms: <b>" + String((unsigned)arms) + "</b>. Extra controls are ignored.</div>"
+          "<div class='muted'>100% keeps the arm lit for the full spoke time; lower values blank sooner.</div>"
           "<div class='sep'></div>";
 
   html += "<h3>SD Card</h3>"
@@ -450,6 +470,24 @@ if(bgepath){
     let url='/bgeffect?path='+encodeURIComponent(path);
     if(bgenable) url += '&enable='+(bgenable.checked?'1':'0');
     fetch(url,{method:'POST'}).then(()=>location.reload()).catch(()=>location.reload());
+  };
+}
+
+const applyStrobePct=document.getElementById('applyStrobePct');
+if(applyStrobePct){
+  applyStrobePct.onclick=()=>{
+    const params=[];
+    for(let i=1;i<=4;i++){
+      const el=document.getElementById('stbpct'+i);
+      if(!el) continue;
+      let val=parseInt(el.value,10);
+      if(isNaN(val)) val=0;
+      if(val<0) val=0;
+      if(val>100) val=100;
+      el.value=val;
+      params.push('pct'+i+'='+val);
+    }
+    if(params.length){fetch('/strobe?'+params.join('&'),{method:'POST'}).then(()=>location.reload());}
   };
 }
 

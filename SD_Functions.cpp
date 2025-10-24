@@ -4,6 +4,7 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <stdio.h>
 
 #include "HtmlUtils.h"
 #include "WebPages.h"
@@ -61,6 +62,7 @@ extern bool g_paused;
 extern uint32_t g_bootMs;
 extern bool g_hallDiagEnabled;
 extern String g_currentPath;
+extern uint8_t g_armStrobePercent[MAX_ARMS];
 
 extern bool openFseq(const String& path, String& why);
 extern void feedWatchdog();
@@ -112,6 +114,12 @@ bool saveSettingsBackupLocked() {
   f.print("bge_enable="); f.println(g_bgEffectEnabled ? 1 : 0);
   f.print("bge_path=");   f.println(g_bgEffectPath);
   f.print("outmode=");    f.println((unsigned)g_outputMode);
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    f.print("strobe_pct");
+    f.print((unsigned)(a + 1));
+    f.print('=');
+    f.println((unsigned)clampU32(g_armStrobePercent[a], 0, 100));
+  }
   f.close();
   return true;
 }
@@ -144,6 +152,13 @@ bool loadSettingsBackupLocked(SettingsData &out) {
     else if (key == "bge_enable") { out.hasBgEffectEnable = true; out.bgEffectEnable = (value.toInt() != 0); }
     else if (key == "bge_path") { out.hasBgEffectPath = true; out.bgEffectPath = value; }
     else if (key == "outmode") { out.hasOutMode = true; out.outMode = (uint8_t)clampU32(value.toInt(),0,1); }
+    else if (key.startsWith("strobe_pct")) {
+      int idx = key.substring(10).toInt();
+      if (idx >= 1 && idx <= (int)MAX_ARMS) {
+        out.hasStrobePct[idx-1] = true;
+        out.strobePct[idx-1] = (uint8_t)clampU32(value.toInt(), 0, 100);
+      }
+    }
   }
   f.close();
   return true;
@@ -272,6 +287,14 @@ void ensureSettingsFromBackup(const PrefPresence &present) {
   if (!present.outMode && data.hasOutMode) {
     g_outputMode = (data.outMode == OUT_PARALLEL) ? OUT_PARALLEL : OUT_SPI;
     prefs.putUChar("outmode", g_outputMode);
+  }
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    if (!present.strobePct[a] && data.hasStrobePct[a]) {
+      g_armStrobePercent[a] = (uint8_t)clampU32(data.strobePct[a], 0, 100);
+      char key[12];
+      snprintf(key, sizeof(key), "stb_pct%u", (unsigned)(a + 1));
+      prefs.putUChar(key, g_armStrobePercent[a]);
+    }
   }
 }
 

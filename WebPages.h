@@ -59,7 +59,11 @@ String rootPage(const String &statusClass,
                 bool bgEffectEnabled,
                 bool bgEffectActive,
                 const String &bgEffectCurrentEscaped,
-                const String &bgEffectOptionsHtml);
+                const String &bgEffectOptionsHtml,
+                uint8_t strobePct1,
+                uint8_t strobePct2,
+                uint8_t strobePct3,
+                uint8_t strobePct4);
 
 // NEW: Standalone Updates page (Upload + Reboot UI)
 // Pass canReboot=true to enable the Reboot button (e.g., after successful upload)

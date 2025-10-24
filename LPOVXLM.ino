@@ -36,6 +36,7 @@
 #include <esp_task_wdt.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <math.h> // fabsf
 
 #include "QuadMap.h"
@@ -314,7 +315,12 @@ static ArmRuntimeState g_armState[MAX_ARMS];
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
+static const uint32_t  DEFAULT_ARM_BLANK_US  = 80;  // fallback microseconds if spoke duration unknown
+static const uint8_t   DEFAULT_ARM_STROBE_PERCENT = 100;
+uint8_t                g_armStrobePercent[MAX_ARMS] = {
+  DEFAULT_ARM_STROBE_PERCENT, DEFAULT_ARM_STROBE_PERCENT,
+  DEFAULT_ARM_STROBE_PERCENT, DEFAULT_ARM_STROBE_PERCENT
+};
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
@@ -323,6 +329,8 @@ static inline bool microsReached(uint32_t now, uint32_t target) {
 
 static void resetArmRuntimeStates();
 static void blankArm(uint8_t arm);
+static uint32_t blankDurationUsForArm(uint8_t arm);
+static void scheduleArmBlank(uint8_t arm, uint32_t nowUs);
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs);
 static void processArmBlanking(uint32_t nowUs);
 static void processHallSyncEvent(uint32_t nowUs);
@@ -740,6 +748,29 @@ static void resetArmRuntimeStates(){
   g_spokeStep = 0;
 }
 
+static uint32_t blankDurationUsForArm(uint8_t arm) {
+  if (arm >= MAX_ARMS) return DEFAULT_ARM_BLANK_US;
+  uint8_t pct = g_armStrobePercent[arm];
+  if (pct == 0) return 0;
+  uint32_t base = g_spokeDurationUs;
+  if (base == 0) base = DEFAULT_ARM_BLANK_US;
+  uint64_t dur = (uint64_t)base * (uint64_t)pct;
+  dur /= 100ULL;
+  if (dur == 0 && pct > 0) dur = 1;
+  return (uint32_t)dur;
+}
+
+static void scheduleArmBlank(uint8_t arm, uint32_t nowUs) {
+  uint32_t dur = blankDurationUsForArm(arm);
+  if (dur == 0) {
+    g_armState[arm].blankDeadlineUs = nowUs;
+  } else {
+    uint32_t target = nowUs + dur;
+    if (target == 0) target = 1;
+    g_armState[arm].blankDeadlineUs = target;
+  }
+}
+
 /* -------------------- Parallel helpers (unchanged behavior) -------------------- */
 static void configureParallelPins() {
   if (g_parallelPinsInit) return;
@@ -791,8 +822,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
       for (uint8_t a=0; a<arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-        if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+        scheduleArmBlank(a, nowUs);
       }
     }
     return;
@@ -837,8 +867,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   armShow(arm);
 
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-  if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  scheduleArmBlank(arm, nowUs);
 }
 
 static void processArmBlanking(uint32_t nowUs){
@@ -1013,7 +1042,13 @@ static void handleStatus(){
           ",\"path\":\"" + htmlEscape(g_bgEffectPath) + "\"}";
   json += ",\"strobe\":{\"enable\":" + String(g_strobeEnable ? "true" : "false") +
           ",\"deg\":" + String(g_strobeWidthDeg,2) +
-          ",\"phase\":" + String(g_strobePhaseDeg,2) + "}";
+          ",\"phase\":" + String(g_strobePhaseDeg,2) +
+          ",\"pct\":[";
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    if (a) json += ',';
+    json += String((unsigned)g_armStrobePercent[a]);
+  }
+  json += "]}";
   json += ",\"rpm\":" + String(computeRpmSnapshot());
   json += ",\"rpmPpr\":" + String((unsigned)g_pulsesPerRev);
   json += ",\"rpmEdge\":" + String((unsigned)g_hallEdgeMode);
@@ -1047,7 +1082,9 @@ static void handleRoot() {
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
                                    g_watchdogEnabled, g_bgEffectEnabled, g_bgEffectActive, bgEsc,
-                                   bgOptions);
+                                   bgOptions,
+                                   g_armStrobePercent[0], g_armStrobePercent[1],
+                                   g_armStrobePercent[2], g_armStrobePercent[3]);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -1452,7 +1489,31 @@ static void handleStrobe() {
   bool haveEnable = server.hasArg("enable");
   bool haveDeg    = server.hasArg("deg");
   bool havePhase  = server.hasArg("phase");
-  if (!haveEnable && !haveDeg && !havePhase) { server.send(400, "application/json", "{\"error\":\"missing parameters\"}"); return; }
+  bool havePct    = false;
+  bool pctChanged = false;
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    char argName[8];
+    snprintf(argName, sizeof(argName), "pct%u", (unsigned)(a + 1));
+    if (server.hasArg(argName)) {
+      havePct = true;
+      int v = server.arg(argName).toInt();
+      if (v < 0) v = 0;
+      if (v > 100) v = 100;
+      uint8_t nv = (uint8_t)v;
+      if (g_armStrobePercent[a] != nv) {
+        g_armStrobePercent[a] = nv;
+        char prefKey[12];
+        snprintf(prefKey, sizeof(prefKey), "stb_pct%u", (unsigned)(a + 1));
+        prefs.putUChar(prefKey, g_armStrobePercent[a]);
+        pctChanged = true;
+      }
+    }
+  }
+
+  if (!haveEnable && !haveDeg && !havePhase && !havePct) {
+    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
+    return;
+  }
   if (haveEnable) { g_strobeEnable = parseBoolArg(server.arg("enable")); }
   if (haveDeg) {
     g_strobeWidthDeg = server.arg("deg").toFloat();
@@ -1464,10 +1525,25 @@ static void handleStrobe() {
     while (g_strobePhaseDeg < -180.f) g_strobePhaseDeg += 360.f;
     while (g_strobePhaseDeg >  180.f) g_strobePhaseDeg -= 360.f;
   }
-  server.send(200, "application/json",
-              String("{\"strobe\":{\"enable\":") + (g_strobeEnable ? "true":"false") +
-              ",\"deg\":" + String(g_strobeWidthDeg,2) +
-              ",\"phase\":" + String(g_strobePhaseDeg,2) + "}}");
+  if (pctChanged) {
+    uint32_t nowUs = micros();
+    uint8_t arms = activeArmCount();
+    for (uint8_t a = 0; a < arms; ++a) {
+      if (g_armState[a].lit) scheduleArmBlank(a, nowUs);
+    }
+    persistSettingsToSd();
+  }
+
+  String resp = String("{\"strobe\":{\"enable\":") + (g_strobeEnable ? "true" : "false") +
+                 ",\"deg\":" + String(g_strobeWidthDeg, 2) +
+                 ",\"phase\":" + String(g_strobePhaseDeg, 2) +
+                 ",\"pct\":[";
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    if (a) resp += ',';
+    resp += String((unsigned)g_armStrobePercent[a]);
+  }
+  resp += "]}}";
+  server.send(200, "application/json", resp);
 }
 
 static void handleArmPhase() {
@@ -1675,6 +1751,12 @@ void setup(){
     String storedBg = prefs.getString("bge_path", "");
     g_bgEffectPath = sanitizeBgEffectPath(storedBg);
     if (storedBg.length() && !g_bgEffectPath.length()) prefs.putString("bge_path", g_bgEffectPath);
+  }
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    char key[12];
+    snprintf(key, sizeof(key), "stb_pct%u", (unsigned)(a + 1));
+    present.strobePct[a] = prefs.isKey(key);
+    g_armStrobePercent[a] = (uint8_t)clampU32(prefs.getUChar(key, DEFAULT_ARM_STROBE_PERCENT), 0, 100);
   }
   g_bgEffectNextAttemptMs = millis();
 
