@@ -264,6 +264,7 @@ String rootPage(const String &statusClass,
           "<button id='pause'" + pauseAttrs + ">" + pauseLabel + "</button>"
           "<button id='stop'>Stop</button>"
           "<button id='refresh'>Refresh</button>"
+          "<button id='reboot'>Reboot</button>"
           "<button onclick=\"location='/ota'\">Direct OTA</button>"
           "</div>"
           "<div class='sep'></div>";
@@ -397,6 +398,15 @@ const stopBtn=document.getElementById('stop');
 if(stopBtn){stopBtn.onclick=()=>post('/stop');}
 const refresh=document.getElementById('refresh');
 if(refresh){refresh.onclick=()=>location.reload();}
+
+const reboot=document.getElementById('reboot');
+if(reboot){
+  reboot.onclick=()=>{
+    if(confirm('Reboot the controller now?')){
+      fetch('/reboot',{method:'POST'}).then(()=>alert('Rebooting…'));
+    }
+  };
+}
 
 const applymap=document.getElementById('applymap');
 if(applymap){
