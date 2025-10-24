@@ -86,6 +86,16 @@ static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800
 static bool              g_hallPrevActive   = false;
 static bool              g_hallDiagEnabled  = false;
 static bool              g_hallDiagActive = false;
+static bool              g_armTestEnabled   = false;
+static uint8_t           g_armTestCurrentArm = 0;
+static uint8_t           g_armTestColorIdx   = 0;
+static uint32_t          g_armTestNextStepMs = 0;
+static const uint8_t     ARM_TEST_COLORS[3][3] = {
+  {255,   0,   0},
+  {0,   255,   0},
+  {0,     0, 255},
+};
+static const uint8_t     ARM_TEST_COLOR_COUNT = 3;
 
 // RPM measurement (A3144)
 static const uint8_t     PULSES_PER_REV      = 1;   // default; can override at runtime via /rpm
@@ -201,6 +211,11 @@ static inline void armClear(uint8_t arm) {
   const uint16_t n = armPixelCount();
   for (uint16_t i=0;i<n;++i) armSetPixel(arm, i, 0,0,0);
   armShow(arm);
+}
+
+static inline void armFillColor(uint8_t arm, uint8_t R, uint8_t G, uint8_t B) {
+  const uint16_t n = armPixelCount();
+  for (uint16_t i=0; i<n; ++i) armSetPixel(arm, i, R, G, B);
 }
 
 static inline void lanesClearAll() {
@@ -440,6 +455,34 @@ static void updateHallSensor() {
   g_hallPrevActive = hallActive;
 }
 
+static void updateArmTest() {
+  if (!g_armTestEnabled) return;
+
+  const uint8_t arms = activeArmCount();
+  if (!arms) return;
+
+  uint32_t now = millis();
+  if (g_armTestNextStepMs && now < g_armTestNextStepMs) return;
+
+  if (g_armTestCurrentArm >= arms) g_armTestCurrentArm = 0;
+  if (g_armTestColorIdx >= ARM_TEST_COLOR_COUNT) g_armTestColorIdx = 0;
+
+  const uint8_t *color = ARM_TEST_COLORS[g_armTestColorIdx];
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (a == g_armTestCurrentArm) armFillColor(a, color[0], color[1], color[2]);
+    else                          armFillColor(a, 0, 0, 0);
+  }
+
+  lanesShowAll();
+
+  g_armTestNextStepMs = now + 500;
+  ++g_armTestCurrentArm;
+  if (g_armTestCurrentArm >= arms) {
+    g_armTestCurrentArm = 0;
+    g_armTestColorIdx = (g_armTestColorIdx + 1) % ARM_TEST_COLOR_COUNT;
+  }
+}
+
 /* -------------------- Web handlers (decls) -------------------- */
 static void handleStatus();
 static void handleRoot();
@@ -448,6 +491,7 @@ static void handleStart();
 static void handleStop();
 static void handlePause();
 static void handleHallDiag();
+static void handleArmTest();
 static void handleSpeed();
 static void handleMapCfg();
 static void handleWifiCfg();
@@ -1010,6 +1054,7 @@ static void handleStatus(){
   json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
   json += "}";
   json += ",\"hallDiag\":" + String(g_hallDiagEnabled ? "true" : "false");
+  json += ",\"armTest\":" + String(g_armTestEnabled ? "true" : "false");
   json += ",\"autoplay\":" + String(g_autoplayEnabled ? "true" : "false");
   json += ",\"watchdog\":" + String(g_watchdogEnabled ? "true" : "false");
   json += ",\"bgEffect\":{\"enabled\":" + String(g_bgEffectEnabled ? "true" : "false") +
@@ -1050,7 +1095,7 @@ static void handleRoot() {
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
-                                   g_watchdogEnabled, g_bgEffectEnabled, g_bgEffectActive, bgEsc,
+                                   g_armTestEnabled, g_watchdogEnabled, g_bgEffectEnabled, g_bgEffectActive, bgEsc,
                                    bgOptions);
 
   server.send(200, "text/html; charset=utf-8", html);
@@ -1082,6 +1127,12 @@ static void handleStart(){
     String p = server.arg("path"); if (!p.startsWith("/")) p="/"+p;
     String why;
     if (!openFseq(p, why)){ server.send(500,"text/plain",String("FSEQ open failed: ")+why); return; }
+  }
+  if (g_armTestEnabled) {
+    g_armTestEnabled = false;
+    g_armTestCurrentArm = 0;
+    g_armTestColorIdx = 0;
+    g_armTestNextStepMs = 0;
   }
   g_playing=true; g_paused=false; g_lastTickMs=millis();
   g_bootMs = millis();
@@ -1149,6 +1200,12 @@ static void handleHallDiag(){
   bool enable = (v == "1" || v == "true" || v == "on" || v == "yes");
 
   if (enable) {
+    if (g_armTestEnabled) {
+      g_armTestEnabled = false;
+      g_armTestCurrentArm = 0;
+      g_armTestColorIdx = 0;
+      g_armTestNextStepMs = 0;
+    }
     if (!g_hallDiagEnabled) {
       g_hallDiagEnabled = true;
       g_playing = false;
@@ -1172,6 +1229,47 @@ static void handleHallDiag(){
   server.send(200, "application/json",
               String("{\"hallDiag\":") + (g_hallDiagEnabled ? "true" : "false") +
               ",\"playing\":" + (g_playing ? "true" : "false") + "}");
+}
+
+static void handleArmTest(){
+  if (!server.hasArg("enable")) {
+    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    return;
+  }
+
+  bool enable = parseBoolArg(server.arg("enable"));
+
+  if (enable) {
+    if (!g_armTestEnabled) {
+      g_armTestEnabled = true;
+      g_armTestCurrentArm = 0;
+      g_armTestColorIdx = 0;
+      g_armTestNextStepMs = 0;
+      g_playing = false;
+      g_paused = false;
+      g_bgEffectActive = false;
+      g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
+      if (g_hallDiagEnabled || g_hallDiagActive) {
+        g_hallDiagEnabled = false;
+        g_hallDiagActive = false;
+      }
+      blackoutAll();
+    }
+  } else {
+    if (g_armTestEnabled) {
+      g_armTestEnabled = false;
+      g_armTestCurrentArm = 0;
+      g_armTestColorIdx = 0;
+      g_armTestNextStepMs = 0;
+      g_bootMs = millis();
+      g_bgEffectNextAttemptMs = g_bootMs;
+      blackoutAll();
+    }
+  }
+
+  server.send(200, "application/json",
+              String("{\"armTest\":") + (g_armTestEnabled ? "true" : "false") + "}");
 }
 
 static void handleSpeed() {
@@ -1573,6 +1671,7 @@ static void startWifiAP(){
   server.on("/stop",    HTTP_POST, handleStop);
   server.on("/pause",   HTTP_POST, handlePause);
   server.on("/halldiag", HTTP_POST, handleHallDiag);
+  server.on("/armtest", HTTP_POST, handleArmTest);
   server.on("/speed",   HTTP_POST, handleSpeed);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
@@ -1766,6 +1865,7 @@ void loop(){
   pollWifiStation();
   server.handleClient();
   updateHallSensor();
+  updateArmTest();
 
   static uint32_t lastRpmPoll = 0;
   uint32_t nowMs = millis();
@@ -1773,7 +1873,7 @@ void loop(){
 
   feedWatchdog();
 
-  if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_playing) {
+  if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_armTestEnabled && !g_playing) {
     uint32_t now = millis();
     if (now >= g_bgEffectNextAttemptMs) {
       String why;
@@ -1783,7 +1883,7 @@ void loop(){
     }
   }
 
-  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && !g_armTestEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     g_paused = false;
     if (openFseq("/test2.fseq", why)) { Serial.println("[TIMEOUT] Auto-start /test2.fseq"); }

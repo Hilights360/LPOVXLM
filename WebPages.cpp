@@ -172,6 +172,7 @@ String rootPage(const String &statusClass,
                 bool paused,
                 bool autoplayEnabled,
                 bool hallDiagEnabled,
+                bool armTestEnabled,
                 bool watchdogEnabled,
                 bool bgEffectEnabled,
                 bool bgEffectActive,
@@ -205,6 +206,9 @@ String rootPage(const String &statusClass,
   String hallDiagAttrs;
   if (hallDiagEnabled) hallDiagAttrs += " checked";
   if (playing) hallDiagAttrs += " disabled";
+  String armTestAttrs;
+  if (armTestEnabled) armTestAttrs += " checked";
+  if (playing) armTestAttrs += " disabled";
   String hallDiagHelp = playing
       ? String("Stop playback to enable the hall sensor blink test.")
       : String("Blinks all arms red whenever the hall sensor toggles.");
@@ -333,6 +337,13 @@ String rootPage(const String &statusClass,
 
   html += "<div style='margin-top:.75rem'>"
           "<label style='display:flex;align-items:center;gap:.5rem'>"
+          "<input type='checkbox' id='armtest'" + armTestAttrs + "> Arm RGB Test"
+          "</label>"
+          "<div class='muted'>Cycles each arm through red, green, and blue for 500&nbsp;ms per color.</div>"
+          "</div>";
+
+  html += "<div style='margin-top:.75rem'>"
+          "<label style='display:flex;align-items:center;gap:.5rem'>"
           "<input type='checkbox' id='watchdog'" + watchdogAttrs + "> Enable watchdog auto-reboot"
           "</label>"
           "<div class='muted'>" + watchdogHelp + "</div>"
@@ -427,6 +438,9 @@ if(stat){stat.onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.
 
 const halldiag=document.getElementById('halldiag');
 if(halldiag){halldiag.onchange=()=>{const en=halldiag.checked?'1':'0';fetch('/halldiag?enable='+en,{method:'POST'}).then(()=>location.reload());};}
+
+const armtest=document.getElementById('armtest');
+if(armtest){armtest.onchange=()=>{const en=armtest.checked?'1':'0';fetch('/armtest?enable='+en,{method:'POST'}).then(()=>location.reload()).catch(()=>{armtest.checked=!armtest.checked;});};}
 
 const autoplay=document.getElementById('autoplay');
 if(autoplay){autoplay.onchange=()=>{const en=autoplay.checked?'1':'0';fetch('/autoplay?enable='+en,{method:'POST'}).catch(()=>{autoplay.checked=!autoplay.checked;});};}
