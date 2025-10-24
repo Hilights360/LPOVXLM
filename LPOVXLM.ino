@@ -812,21 +812,29 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
   const uint16_t pixelCount   = armPixelCount();
-  const uint32_t fallbackPixels = pixelCount;
-  const uint32_t chPerSpoke =
-      (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
-  const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
-  const uint32_t baseChAbsR  = startChBase + (uint32_t)spokeIdx * chPerSpoke;
+  const uint8_t  arms         = activeArmCount();
+  const uint32_t startChBase  = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
 
-  // *** FIX: add per-arm channel offset inside each spoke ***
-  const uint32_t armOffset = (g_strideMode == STRIDE_SPOKE)
-      ? ((uint32_t)arm * (uint32_t)pixelCount * 3UL)  // [Arm1 block][Arm2 block][Arm3 block][Arm4 block]
-      : ((uint32_t)arm * 3UL);                        // LED-stride: per-LED groups are [A1 RGB][A2 RGB][A3 RGB][A4 RGB]
+  uint32_t armBase = 0;
+  uint32_t stepStride = 0;
+
+  if (g_strideMode == STRIDE_SPOKE) {
+    // SPOKE stride: for each spoke we store [Arm0 pixels][Arm1 pixels]... (RGB per pixel)
+    const uint32_t channelsPerArm   = (uint32_t)pixelCount * 3u;
+    const uint32_t channelsPerSpoke = channelsPerArm * (uint32_t)arms;
+    armBase    = startChBase + (uint32_t)spokeIdx * channelsPerSpoke + (uint32_t)arm * channelsPerArm;
+    stepStride = 3u;
+  } else { // STRIDE_LED
+    // LED stride: layout is per LED radius → for each pixel: [Arm0 spoke0..spokeN][Arm1 ...]
+    const uint32_t channelsPerLed   = (uint32_t)spokes * (uint32_t)arms * 3u;
+    const uint32_t armSpokeStride   = (uint32_t)spokes * 3u;
+    armBase    = startChBase + (uint32_t)arm * armSpokeStride + (uint32_t)spokeIdx * 3u;
+    stepStride = channelsPerLed;
+  }
 
   for (uint16_t i=0; i<pixelCount; ++i){
-    const uint32_t absR = baseChAbsR + armOffset + (uint32_t)i * blockStride;
+    const uint32_t absR = armBase + (uint32_t)i * stepStride;
     const int64_t  idxR = sparseTranslate(absR);
     uint8_t R=0,G=0,B=0;
     if (idxR >= 0 && (idxR+2) < (int64_t)g_fh.channelCount) mapChannels(&g_frameBuf[idxR], R,G,B);
