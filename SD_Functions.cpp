@@ -55,7 +55,6 @@ extern uint32_t g_startChArm1;
 extern uint16_t g_spokesTotal;
 extern uint8_t g_armCount;
 extern uint16_t g_pixelsPerArm;
-extern StrideMode g_strideMode;
 extern bool g_playing;
 extern bool g_paused;
 extern uint32_t g_bootMs;
@@ -101,7 +100,6 @@ bool saveSettingsBackupLocked() {
   f.print("spokes=");     f.println((unsigned)g_spokesTotal);
   f.print("arms=");       f.println((unsigned)g_armCount);
   f.print("pixels=");     f.println((unsigned)g_pixelsPerArm);
-  f.print("stride=");     f.println((unsigned)g_strideMode);
   f.print("ssid=");       f.println(g_staSsid);
   f.print("pass=");       f.println(g_staPass);
   f.print("station=");    f.println(g_stationId);
@@ -133,7 +131,6 @@ bool loadSettingsBackupLocked(SettingsData &out) {
     else if (key == "spokes") { out.hasSpokes = true; out.spokes = (uint16_t)clampU32(value.toInt(),1,65535); }
     else if (key == "arms")   { out.hasArms = true; out.arms = clampArmCount(value.toInt()); }
     else if (key == "pixels") { out.hasPixels = true; out.pixels = clampPixelsPerArm(value.toInt()); }
-    else if (key == "stride") { out.hasStride = true; out.stride = (uint8_t)clampU32(value.toInt(),0,1); }
     else if (key == "ssid")   { out.hasStaSsid = true; out.staSsid = value; }
     else if (key == "pass")   { out.hasStaPass = true; out.staPass = value; }
     else if (key == "station") { out.hasStation = true; out.stationId = value; }
@@ -226,10 +223,6 @@ void ensureSettingsFromBackup(const PrefPresence &present) {
   if (!present.pixels && data.hasPixels) {
     g_pixelsPerArm = clampPixelsPerArm(data.pixels);
     prefs.putUShort("pixels", g_pixelsPerArm);
-  }
-  if (!present.stride && data.hasStride) {
-    g_strideMode = (StrideMode)((data.stride == 0) ? STRIDE_SPOKE : STRIDE_LED);
-    prefs.putUChar("stride", (uint8_t)g_strideMode);
   }
   if ((!present.staSsid || !g_staSsid.length()) && data.hasStaSsid) {
     g_staSsid = data.staSsid;
