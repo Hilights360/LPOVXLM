@@ -1,6 +1,21 @@
-// Flag Sentry / POV Spinner — full sketch with RPM counter, OTA, and Updates page
+// POV Spinner — full sketch with RPM counter, OTA, Updates page, and DUAL-SPI lanes (2 posts) 
 // Board: ESP32-S3
-// Tim Nash (Inventor) — forward-thinking build with traditional robustness
+// Tim Nash (Inventor)
+//
+// Wiring mode in this build:
+//   - Two SPI "posts" (lanes). Each drives TWO arms chained back-to-back.
+//   - Lane 0 (reuses prior Arm1 pins): CLK=47, DATA=45 drives Arm1 then Arm2
+//       Arm1 = outside-fed (normal direction; index 0 at the outside)
+//       Arm2 = center-fed   (reversed direction; index 0 at the center input)
+//   - Lane 1 (reuses prior Arm3 pins): CLK=38, DATA=39 drives Arm3 then Arm4
+//       Arm3 = outside-fed (normal)
+//       Arm4 = center-fed   (reversed)
+//
+// Notes:
+//   * All timing / strobe / Hall logic unchanged.
+//   * Per-arm drawing now routes pixels into lane segments with per-arm reverse support.
+//   * If you need different two reused ports, change LANE_CLK[] / LANE_DATA[] below.
+//   * OUT_SPI remains the default. Parallel mode left available but not used in this wiring.
 
 #include "ConfigTypes.h"
 #include <Arduino.h>
@@ -47,6 +62,24 @@ static const uint8_t  MAX_ARMS               = 4;
 static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
+// ---------- NEW: Output mode (SPI vs Parallel-GPIO) ----------
+enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
+static uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
+
+// Parallel-GPIO driver state (kept for compatibility, not used in this wiring)
+#include "soc/gpio_struct.h"
+#include "driver/gpio.h"
+static uint32_t g_clkMask1 = 0;
+static uint32_t g_dataMask1[MAX_ARMS] = {0};
+static uint32_t g_allDataMask1 = 0;
+static bool     g_parallelPinsInit = false;
+static volatile uint8_t g_clkPadNops = 0;
+static inline void clk_pad_delay() { for (uint8_t i=0;i<g_clkPadNops;i++) __asm__ __volatile__("nop"); }
+static inline uint32_t mask1_for_pin(int gpio) { return (gpio >= 32) ? (1u << (gpio - 32)) : 0u; }
+static void configureParallelPins();
+static void sk9822_tx_parallel_spoke(uint16_t spokeIdx);
+static void sk9822_tx_parallel_black();
+
 // ---------- Hall effect + status pixel ----------
 static const int      PIN_HALL_SENSOR        = 5;   // A3144 on this pin (LOW when magnet present)
 static const int      PIN_STATUS_PIXEL       = 48;
@@ -86,7 +119,7 @@ static void IRAM_ATTR hallIsr() {
   uint32_t dt = now - last;
   if (dt > 1000) {
     g_lastPeriodUs = dt;
-    g_pulseCount = g_pulseCount + 1; // avoid ++ on volatile (deprecated)
+    g_pulseCount = g_pulseCount + 1;
     uint32_t count = g_pulseCount;
     uint8_t ppr = g_pulsesPerRev ? g_pulsesPerRev : 1;
     if ((ppr > 0) && (count % ppr) == 0) {
@@ -103,10 +136,80 @@ static void attachHallInterrupt() {
   attachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR), hallIsr, mode);
 }
 
-// Latest arm pin map (CLK and DATA per arm)
-static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
-static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
+// ===== PAST 4-ARM PINS (kept for reference; not used directly now) =====
+// static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
+// static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
 
+// ===== NEW: TWO-LANE (TWO-POST) SPI =====
+static const uint8_t NUM_LANES = 2;
+// Reuse two of the original four ports (edit here if you want different ones):
+static const int LANE_CLK[NUM_LANES]  = { 47, 38 }; // old Arm1 CLK, old Arm3 CLK
+static const int LANE_DATA[NUM_LANES] = { 45, 39 }; // old Arm1 DATA, old Arm3 DATA
+
+// Lane DotStar objects (each lane drives two arms chained)
+static Adafruit_DotStar* g_lanes[NUM_LANES] = { nullptr, nullptr };
+
+// Virtual "per-arm" routing description into lanes
+struct ArmRoute {
+  uint8_t  lane;      // 0 or 1
+  uint16_t offset;    // start index inside lane
+  bool     reverse;   // true if arm is center-fed (data enters at the "end")
+};
+
+// Filled in rebuildStrips()
+static ArmRoute g_armRoute[MAX_ARMS];
+
+extern uint16_t g_pixelsPerArm;
+
+
+// Keep legacy pointer array to avoid compile guards in parallel helpers
+Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
+
+// Brightness (0..255 computed from percent)
+static uint8_t g_brightness = 63;
+
+// Helpers for per-arm pixel routing into lanes
+static inline uint16_t armPixelCount() { return (g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM); }
+
+static inline uint16_t laneIndexForArmPixel(uint8_t arm, uint16_t pixel) {
+  const ArmRoute &r = g_armRoute[arm];
+  const uint16_t n  = armPixelCount();
+  uint16_t local    = r.reverse ? (n - 1 - pixel) : pixel;
+  return r.offset + local;
+}
+
+static inline void armSetPixel(uint8_t arm, uint16_t pixel, uint8_t R, uint8_t G, uint8_t B) {
+  const ArmRoute &r = g_armRoute[arm];
+  if (r.lane >= NUM_LANES || !g_lanes[r.lane]) return;
+  uint16_t idx = laneIndexForArmPixel(arm, pixel);
+  g_lanes[r.lane]->setPixelColor(idx, R, G, B);
+}
+
+static inline void armShow(uint8_t arm) {
+  const ArmRoute &r = g_armRoute[arm];
+  if (r.lane < NUM_LANES && g_lanes[r.lane]) g_lanes[r.lane]->show();
+}
+
+static inline void lanesShowAll() {
+  for (uint8_t l=0; l<NUM_LANES; ++l) if (g_lanes[l]) g_lanes[l]->show();
+}
+
+static inline void armClear(uint8_t arm) {
+  const uint16_t n = armPixelCount();
+  for (uint16_t i=0;i<n;++i) armSetPixel(arm, i, 0,0,0);
+  armShow(arm);
+}
+
+static inline void lanesClearAll() {
+  for (uint8_t l=0; l<NUM_LANES; ++l) {
+    if (!g_lanes[l]) continue;
+    uint16_t total = armPixelCount()*2; // two arms per lane
+    for (uint16_t i=0;i<total;++i) g_lanes[l]->setPixelColor(i,0,0,0);
+    g_lanes[l]->show();
+  }
+}
+
+// ---------- Watchdog ----------
 static const uint32_t WATCHDOG_TIMEOUT_SECONDS = 8;
 bool     g_watchdogEnabled   = false;
 static bool g_watchdogAttached = false;
@@ -121,9 +224,7 @@ static void applyWatchdogSetting() {
       .trigger_panic = true
     };
     esp_err_t err = esp_task_wdt_init(&cfg);
-    if (err == ESP_ERR_INVALID_STATE) {
-      err = esp_task_wdt_reconfigure(&cfg);
-    }
+    if (err == ESP_ERR_INVALID_STATE) err = esp_task_wdt_reconfigure(&cfg);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
       Serial.printf("[WDT] init/reconfig failed: %d\n", (int)err);
       return;
@@ -145,7 +246,6 @@ static void applyWatchdogSetting() {
     Serial.println("[WDT] Disabled");
   }
 }
-
 static inline void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
 
 // ---------- SD-MMC pins ----------
@@ -197,7 +297,6 @@ uint32_t      g_staConnectStartMs   = 0;
 // ---------- Persisted settings (NVS = flash) ----------
 Preferences prefs;
 uint8_t  g_brightnessPercent = 25;
-uint8_t  g_brightness        = 63;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
 bool     g_autoplayEnabled   = true;
@@ -211,6 +310,7 @@ uint32_t g_startChArm1   = 1;    // 1-based absolute channel (R of Arm1, Pixel0)
 uint16_t g_spokesTotal   = 40;
 uint8_t  g_armCount      = MAX_ARMS;
 uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
+static uint16_t g_lastPulseSpoke[MAX_ARMS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 
 enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;
@@ -225,22 +325,18 @@ uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
-Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
-
+// Arm runtime (timers/blanking)
 struct ArmRuntimeState {
   uint16_t baseSpoke = 0;
   uint16_t currentSpoke = 0;
   uint32_t blankDeadlineUs = 0;
   bool     lit = false;
 };
-
 static ArmRuntimeState g_armState[MAX_ARMS];
-//static volatile bool   g_hallSyncPending     = false;
-//static volatile uint32_t g_hallSyncTimestampUs = 0;
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 4; // microseconds each spoke stays lit
+static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
@@ -255,24 +351,19 @@ static void processHallSyncEvent(uint32_t nowUs);
 static void advancePredictedSpokes(uint32_t nowUs);
 static bool loadNextFrame();
 
-/* -------------------- NEW: Strobe gating / angular timing -------------------- */
+/* -------------------- Strobe gating / angular timing -------------------- */
+static const int PIN_STROBE_GATE = -1; // -1 to disable gate pin
 
-// Optional HARD strobe gate pin (drive external gate). -1 disables.
-static const int PIN_STROBE_GATE = -1; // leave -1 if not used
-
-// Strobe control (accessible via /strobe)
-static volatile bool  g_strobeEnable   = true;   // enable narrow on-window
-static volatile float g_strobeWidthDeg = 1.5f;   // width of on-window in degrees
-static volatile float g_strobePhaseDeg = 0.0f;   // global phase trim in degrees
-
-// Per-arm phase trims (degrees)
+static volatile bool  g_strobeEnable   = true;
+static volatile float g_strobeWidthDeg = 3.0f;
+static volatile float g_strobePhaseDeg = 0.0f;
 static float g_armPhaseDeg[MAX_ARMS] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 static inline uint16_t spokesCount() { return (g_spokesTotal ? g_spokesTotal : 1); }
 
 static inline void getHallSnapshot(uint32_t& periodUs, uint32_t& sinceUs) {
-  uint32_t lastIsr = g_lastPulseUsIsr;  // volatile read
-  periodUs = g_lastPeriodUs;            // volatile read
+  uint32_t lastIsr = g_lastPulseUsIsr;
+  periodUs = g_lastPeriodUs;
   uint32_t now = micros();
   sinceUs = now - lastIsr;
 }
@@ -282,10 +373,9 @@ static inline float sinceUsToDeg(uint32_t sinceUs, uint32_t periodUs) {
   return (360.0f * (float)sinceUs) / (float)periodUs;
 }
 
-// Current spoke index from hall phase with global trim
 static inline uint16_t currentSpokeIndex() {
   uint32_t perUs, sinceUs; getHallSnapshot(perUs, sinceUs);
-  if (perUs == 0) return g_indexPosition; // until first lock
+  if (perUs == 0) return g_indexPosition;
   float deg = sinceUsToDeg(sinceUs, perUs) + g_strobePhaseDeg;
   while (deg < 0.0f)  deg += 360.0f;
   while (deg >= 360.0f) deg -= 360.0f;
@@ -295,9 +385,8 @@ static inline uint16_t currentSpokeIndex() {
   return (uint16_t)idx;
 }
 
-// True if we're inside the (narrow) strobe window for a given arm
 static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
-  if (!g_strobeEnable) return true; // always on if disabled
+  if (!g_strobeEnable) return true;
   uint32_t perUs, sinceUs; getHallSnapshot(perUs, sinceUs);
   if (perUs == 0) return true;
   float deg = sinceUsToDeg(sinceUs, perUs) + g_armPhaseDeg[arm] + g_strobePhaseDeg;
@@ -307,9 +396,18 @@ static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
   const float spokeDegW = 360.0f / (float)spokesCount();
   const float centerDeg = (spokeCenter + 0.5f) * spokeDegW;
   float delta = fabsf(deg - centerDeg);
-  if (delta > 180.0f) delta = 360.0f - delta; // wrap-shortcut
+  if (delta > 180.0f) delta = 360.0f - delta;
 
   return (delta <= (g_strobeWidthDeg * 0.5f));
+}
+
+static void setDefaultArmPhases() {
+  const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
+  bool allZero = true;
+  for (uint8_t a=0; a<arms; ++a) if (fabsf(g_armPhaseDeg[a]) > 1e-3f) { allZero=false; break; }
+  if (!allZero) return;
+  const float sep = 360.0f / (float)arms;
+  for (uint8_t a=0; a<arms; ++a) g_armPhaseDeg[a] = a * sep;
 }
 
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
@@ -321,36 +419,28 @@ static void updateHallSensor() {
     if (hallActive && !g_hallDiagActive) {
       g_hallDiagActive = true;
       const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
+      // Fill all arms red, show once per lane
       for (uint8_t a = 0; a < arms; ++a) {
-        if (!strips[a]) continue;
-        uint16_t pix = strips[a]->numPixels();
-        for (uint16_t i = 0; i < pix; ++i) {
-          strips[a]->setPixelColor(i, 255, 0, 0);
-        }
-        strips[a]->show();
+        const uint16_t n = armPixelCount();
+        for (uint16_t i = 0; i < n; ++i) armSetPixel(a, i, 255, 0, 0);
       }
+      lanesShowAll();
     } else if (!hallActive && g_hallDiagActive) {
       const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
       for (uint8_t a = 0; a < arms; ++a) {
-        if (!strips[a]) continue;
-        uint16_t pix = strips[a]->numPixels();
-        for (uint16_t i = 0; i < pix; ++i) {
-          strips[a]->setPixelColor(i, 0, 0, 0);
-        }
-        strips[a]->show();
+        const uint16_t n = armPixelCount();
+        for (uint16_t i = 0; i < n; ++i) armSetPixel(a, i, 0, 0, 0);
       }
+      lanesShowAll();
       g_hallDiagActive = false;
     }
   } else if (g_hallDiagActive) {
     const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
     for (uint8_t a = 0; a < arms; ++a) {
-      if (!strips[a]) continue;
-      uint16_t pix = strips[a]->numPixels();
-      for (uint16_t i = 0; i < pix; ++i) {
-        strips[a]->setPixelColor(i, 0, 0, 0);
-      }
-      strips[a]->show();
+      const uint16_t n = armPixelCount();
+      for (uint16_t i = 0; i < n; ++i) armSetPixel(a, i, 0, 0, 0);
     }
+    lanesShowAll();
     g_hallDiagActive = false;
   }
 
@@ -362,7 +452,7 @@ static void updateHallSensor() {
   g_hallPrevActive = hallActive;
 }
 
-/* -------------------- Prototypes for all web handlers -------------------- */
+/* -------------------- Web handlers (decls) -------------------- */
 static void handleFiles();
 static void handleDownload();
 static void handlePlayLink();
@@ -388,15 +478,9 @@ static void handleSdConfig();
 static void handleAutoplay();
 static void handleWatchdog();
 static void handleBgEffect();
-
-// NEW: strobe & arm phase REST handlers
 static void handleStrobe();
 static void handleArmPhase();
-
-// NEW: RPM configuration handler
 static void handleRpmCfg();
-
-// New: Updates hub, OTA, FW to SD, Reboot
 static void handleUpdatesPage();
 static void handleReboot();
 static void handleOtaPage();
@@ -404,6 +488,8 @@ static void handleOtaData();
 static void handleOtaFinish();
 static void handleFwUploadData();
 static void handleFwUploadDone();
+static void handleOutMode(); // declared here; implemented later with setOutputMode()
+
 static bool otaAuthOK() { return true; } // stub (add auth if desired)
 
 /* -------------------- FSEQ v2 reader -------------------- */
@@ -444,14 +530,15 @@ static bool isValidSdFreq(uint32_t freq){ for(size_t i=0;i<SD_FREQ_OPTION_COUNT;
 static inline uint32_t sanitizeSdFreq(uint32_t freq){ return isValidSdFreq(freq) ? freq : SD_FREQ_OPTIONS[0]; }
 static uint32_t nextLowerSdFreq(uint32_t freq){
   for(size_t i=0;i<SD_FREQ_OPTION_COUNT;++i){
-    if(SD_FREQ_OPTIONS[i]==freq){
-      if(i+1 < SD_FREQ_OPTION_COUNT) return SD_FREQ_OPTIONS[i+1];
+    if (SD_FREQ_OPTIONS[i]==freq){
+      if (i+1 < SD_FREQ_OPTION_COUNT) return SD_FREQ_OPTIONS[i+1];
       return SD_FREQ_OPTIONS[i];
     }
   }
   return SD_FREQ_OPTIONS[SD_FREQ_OPTION_COUNT-1];
 }
 
+/* -------------------- Settings (SD) -------------------- */
 static bool ensureSettingsDirLocked() {
   if (!SD_MMC.exists(SETTINGS_DIR)) {
     if (!SD_MMC.mkdir(SETTINGS_DIR)) {
@@ -461,7 +548,6 @@ static bool ensureSettingsDirLocked() {
   }
   return true;
 }
-
 static bool ensureBgEffectsDirLocked() {
   if (!SD_MMC.exists(BG_EFFECTS_DIR)) {
     if (!SD_MMC.mkdir(BG_EFFECTS_DIR)) {
@@ -471,15 +557,11 @@ static bool ensureBgEffectsDirLocked() {
   }
   return true;
 }
-
 static bool saveSettingsBackupLocked() {
   if (!ensureSettingsDirLocked()) return false;
   SD_MMC.remove(SETTINGS_FILE);
   File f = SD_MMC.open(SETTINGS_FILE, FILE_WRITE);
-  if (!f) {
-    Serial.println("[CFG] Failed to open settings file for write");
-    return false;
-  }
+  if (!f) { Serial.println("[CFG] Failed to open settings file for write"); return false; }
   f.print("version=1\n");
   f.print("brightness="); f.println((unsigned int)g_brightnessPercent);
   f.print("fps=");        f.println((unsigned int)g_fps);
@@ -497,6 +579,7 @@ static bool saveSettingsBackupLocked() {
   f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
   f.print("bge_enable="); f.println(g_bgEffectEnabled ? 1 : 0);
   f.print("bge_path=");   f.println(g_bgEffectPath);
+  f.print("outmode=");    f.println((unsigned int)g_outputMode);
   f.close();
   return true;
 }
@@ -528,6 +611,7 @@ static bool loadSettingsBackupLocked(SettingsData& out) {
     else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
     else if (key == "bge_enable") { out.hasBgEffectEnable = true; out.bgEffectEnable = (value.toInt() != 0); }
     else if (key == "bge_path") { out.hasBgEffectPath = true; out.bgEffectPath = value; }
+    else if (key == "outmode") { out.hasOutMode = true; out.outMode = (uint8_t)clampU32(value.toInt(),0,1); }
   }
   f.close();
   return true;
@@ -616,6 +700,10 @@ static void ensureSettingsFromBackup(const PrefPresence& present) {
     g_sdFreqKHz = g_sdBaseFreqKHz;
     prefs.putUInt("sdfreq", g_sdBaseFreqKHz);
   }
+  if (!present.outMode && data.hasOutMode) {
+    g_outputMode = (data.outMode==OUT_PARALLEL)?OUT_PARALLEL:OUT_SPI;
+    prefs.putUChar("outmode", g_outputMode);
+  }
 }
 
 static void checkSdFirmwareUpdate() {
@@ -677,7 +765,7 @@ static void checkSdFirmwareUpdate() {
   ESP.restart();
 }
 
-/* -------------------- SD helpers (prefer 4-bit + mutex) -------------------- */
+/* -------------------- SD helpers -------------------- */
 static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
 static void sd_preflight() {
   pinMode(PIN_SD_CMD, INPUT_PULLUP);
@@ -700,13 +788,9 @@ static bool mountSdmmc(){
 
   uint8_t attempts[2] = { 4, 1 };
   size_t attemptCount = 0;
-  if (g_sdPreferredBusWidth == SD_BUS_AUTO) {
-    attempts[0] = 4; attempts[1] = 1; attemptCount = 2;
-  } else if (g_sdPreferredBusWidth == SD_BUS_4BIT) {
-    attempts[0] = 4; attemptCount = 1;
-  } else {
-    attempts[0] = 1; attemptCount = 1;
-  }
+  if (g_sdPreferredBusWidth == SD_BUS_AUTO) { attempts[0] = 4; attempts[1] = 1; attemptCount = 2; }
+  else if (g_sdPreferredBusWidth == SD_BUS_4BIT) { attempts[0] = 4; attemptCount = 1; }
+  else { attempts[0] = 1; attemptCount = 1; }
 
   bool ok = false;
   sd_preflight();
@@ -715,10 +799,7 @@ static bool mountSdmmc(){
   for (size_t i=0; i<attemptCount; ++i) {
     feedWatchdog();
     uint8_t mode = attempts[i];
-    if (i > 0) {
-      SD_MMC.end();
-      delay(2);
-    }
+    if (i > 0) { SD_MMC.end(); delay(2); }
     if (mode == 4) {
       SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
       ok = SD_MMC.begin("/sdcard", false /*4-bit*/, false /*no-format*/, g_sdFreqKHz);
@@ -729,10 +810,7 @@ static bool mountSdmmc(){
     Serial.printf("[SD] Mounted (%ubit request=%u) @ %lu kHz: %s\n",
                   (unsigned)mode, (unsigned)g_sdPreferredBusWidth,
                   (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
-    if (ok) {
-      g_sdBusWidth = mode;
-      break;
-    }
+    if (ok) { g_sdBusWidth = mode; break; }
   }
   SD_UNLOCK();
   g_sdReady = ok;
@@ -869,10 +947,8 @@ static bool openFseq(const String& path, String& why){
   if (ok) {
     resetArmRuntimeStates();
     g_frameValid = false;
-    if (!loadNextFrame()) {
-      why = "frame load";
-      ok = false;
-    } else {
+    if (!loadNextFrame()) { why = "frame load"; ok = false; }
+    else {
       g_lastTickMs = millis();
       g_playing = true;
       g_paused = false;
@@ -924,9 +1000,7 @@ static bool loadNextFrame(){
   if (!g_fseq || !g_fh.frameCount) return false;
   uint32_t count = g_fh.frameCount;
   uint32_t idx = g_frameIndex % count;
-  if (!loadFrame(idx)) {
-    return false;
-  }
+  if (!loadFrame(idx)) return false;
   g_frameIndex = (idx + 1) % count;
   g_frameValid = true;
   return true;
@@ -947,23 +1021,39 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
   }
 }
 
+/* -------------------- Rebuild TWO-LANE strips and arm routes -------------------- */
 static void rebuildStrips(){
-  const uint8_t arms = activeArmCount();
-  const uint16_t pixels = g_pixelsPerArm ? g_pixelsPerArm : 1;
+  // Dispose old lanes
+  for (uint8_t l=0;l<NUM_LANES;++l) {
+    if (g_lanes[l]) { delete g_lanes[l]; g_lanes[l] = nullptr; }
+  }
+  // Build new lanes (each drives 2 * pixelsPerArm)
+  const uint16_t nPerArm = armPixelCount();
+  const uint16_t nPerLane = nPerArm * 2;
+  for (uint8_t l=0;l<NUM_LANES;++l) {
+    g_lanes[l] = new Adafruit_DotStar(nPerLane, LANE_DATA[l], LANE_CLK[l], DOTSTAR_BGR);
+    g_lanes[l]->begin();
+    g_lanes[l]->setBrightness(g_brightness);
+    g_lanes[l]->clear();
+    g_lanes[l]->show();
+  }
 
-  for (uint8_t a=0; a<MAX_ARMS; ++a){
-    if (strips[a]){ delete strips[a]; strips[a] = nullptr; }
-  }
-  for (uint8_t a=0; a<arms; ++a){
-    strips[a] = new Adafruit_DotStar(pixels, ARM_DATA[a], ARM_CLK[a], DOTSTAR_BGR);
-    strips[a]->begin();
-    strips[a]->setBrightness(g_brightness);
-    strips[a]->clear();
-    strips[a]->show();
-  }
+  // Route table: Arm1+Arm2 on Lane0 ; Arm3+Arm4 on Lane1
+  // Arm1 outside-fed (normal), Arm2 center-fed (reversed)
+  // Arm3 outside-fed (normal), Arm4 center-fed (reversed)
+  g_armRoute[0] = { 0, 0,           false };         // Arm1 → lane 0, offset 0, normal
+  g_armRoute[1] = { 0, nPerArm,     true  };         // Arm2 → lane 0, offset N, reversed
+  g_armRoute[2] = { 1, 0,           false };         // Arm3 → lane 1, offset 0, normal
+  g_armRoute[3] = { 1, nPerArm,     true  };         // Arm4 → lane 1, offset N, reversed
+
+  // Clear legacy arm state
+  for (uint8_t a=0;a<MAX_ARMS;++a) strips[a] = nullptr;
+
   resetArmRuntimeStates();
+  setDefaultArmPhases();
 }
 
+/* -------------------- Arm runtime / blanking -------------------- */
 static void resetArmRuntimeStates(){
   noInterrupts();
   g_hallSyncPending = false;
@@ -974,36 +1064,74 @@ static void resetArmRuntimeStates(){
     g_armState[a].currentSpoke = 0;
     g_armState[a].blankDeadlineUs = 0;
     g_armState[a].lit = false;
+    g_lastPulseSpoke[a] = 0xFFFF;
   }
   g_spokeDurationUs = 0;
   g_nextSpokeDeadlineUs = 0;
   g_spokeStep = 0;
 }
 
-static void blankArm(uint8_t arm){
-  if (arm >= MAX_ARMS) return;
-  Adafruit_DotStar* strip = strips[arm];
-  if (strip) {
-    uint16_t pix = strip->numPixels();
-    for (uint16_t i=0; i<pix; ++i) strip->setPixelColor(i,0,0,0);
-    strip->show();
-  }
-  g_armState[arm].lit = false;
-  g_armState[arm].blankDeadlineUs = 0;
+/* -------------------- Parallel helpers (unchanged behavior) -------------------- */
+static void configureParallelPins() {
+  if (g_parallelPinsInit) return;
+  g_clkMask1 = 0;
+  g_allDataMask1 = 0;
+  // No dedicated ARM_CLK/DATA used now; keep masks zeroed (safe no-op if parallel selected)
+  g_parallelPinsInit = true;
 }
 
-static void blackoutAll(){
-  for (uint8_t a=0; a<MAX_ARMS; ++a){
-    blankArm(a);
+static IRAM_ATTR void sk9822_tx_parallel_spoke(uint16_t spokeIdx) {
+  // Fallback-safe using g_pixelsPerArm if no strip object
+  const uint16_t pixelCount = armPixelCount();
+  if (!spokesCount() || !pixelCount) return;
+
+  // Minimal parallel stub clocks (pins/masks are zero in this SPI build)
+  noInterrupts();
+  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
+  for (uint16_t i = 0; i < pixelCount; ++i) {
+    for (int bit = 0; bit < 32; ++bit) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
   }
+  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
+  interrupts();
+}
+
+static IRAM_ATTR void sk9822_tx_parallel_black() {
+  noInterrupts();
+  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
+  const uint16_t pixelCount  = armPixelCount();
+  const uint32_t bits = 32u * pixelCount + 32u;
+  for (uint32_t b = 0; b < bits; ++b) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
+  interrupts();
+}
+
+/* -------------------- Draw / blank on SPI lanes -------------------- */
+static void blackoutAll(){
+  for (uint8_t a=0; a<MAX_ARMS; ++a) blankArm(a);
   resetArmRuntimeStates();
 }
 
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (arm >= MAX_ARMS) return;
-  Adafruit_DotStar* strip = strips[arm];
+
+  if (g_outputMode == OUT_PARALLEL) {
+    if (arm == 0) {
+      configureParallelPins();
+      sk9822_tx_parallel_spoke(spokeIdx);
+      const uint8_t arms = activeArmCount();
+      const uint16_t sct = spokesCount();
+      for (uint8_t a=0; a<arms; ++a) {
+        g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
+        g_armState[a].lit = true;
+        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+        if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+      }
+    }
+    return;
+  }
+
+  // === SPI (two-lane) path ===
   const uint16_t spokes = spokesCount();
-  if (!strip || spokes == 0) {
+  if (!spokes || !g_frameValid || !g_frameBuf || g_fh.channelCount == 0) {
     blankArm(arm);
     return;
   }
@@ -1011,30 +1139,34 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  if (!g_frameValid || !g_frameBuf || g_fh.channelCount == 0) {
-    blankArm(arm);
-    return;
-  }
-
-  const uint32_t blockStride = (g_strideMode==STRIDE_SPOKE && spokes) ? (spokes*3UL) : 3UL;
-  const uint32_t fallbackPixels = g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
+  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
+  const uint16_t pixelCount   = armPixelCount();
+  const uint32_t fallbackPixels = pixelCount;
   const uint32_t chPerSpoke =
       (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
-  const uint32_t baseChAbsR = startChBase + (uint32_t)spokeIdx * chPerSpoke;
-  const uint32_t pixelCount = strip->numPixels();
+  const uint32_t baseChAbsR  = startChBase + (uint32_t)spokeIdx * chPerSpoke;
 
-  for (uint32_t i=0; i<pixelCount; ++i){
-    const uint32_t absR = baseChAbsR + i * blockStride;
+  // *** FIX: add per-arm channel offset inside each spoke ***
+  const uint32_t armOffset = (g_strideMode == STRIDE_SPOKE)
+      ? ((uint32_t)arm * (uint32_t)pixelCount * 3UL)  // [Arm1 block][Arm2 block][Arm3 block][Arm4 block]
+      : ((uint32_t)arm * 3UL);                        // LED-stride: per-LED groups are [A1 RGB][A2 RGB][A3 RGB][A4 RGB]
+
+  for (uint16_t i=0; i<pixelCount; ++i){
+    const uint32_t absR = baseChAbsR + armOffset + (uint32_t)i * blockStride;
     const int64_t  idxR = sparseTranslate(absR);
-    if (idxR < 0 || (idxR+2) >= (int64_t)g_fh.channelCount) {
-      strip->setPixelColor(i,0,0,0);
-      continue;
+    uint8_t R=0,G=0,B=0;
+    if (idxR >= 0 && (idxR+2) < (int64_t)g_fh.channelCount) mapChannels(&g_frameBuf[idxR], R,G,B);
+    // brightness scaling (global)
+    if (g_brightness < 255) {
+      R = (uint8_t)((uint16_t)R * g_brightness / 255);
+      G = (uint8_t)((uint16_t)G * g_brightness / 255);
+      B = (uint8_t)((uint16_t)B * g_brightness / 255);
     }
-    uint8_t R,G,B; mapChannels(&g_frameBuf[idxR], R,G,B);
-    strip->setPixelColor(i, R,G,B);
+    armSetPixel(arm, i, R,G,B);
   }
-  strip->show();
+  armShow(arm);
+
   g_armState[arm].lit = true;
   g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
@@ -1057,6 +1189,7 @@ static void processArmBlanking(uint32_t nowUs){
 static void processHallSyncEvent(uint32_t nowUs){
   uint32_t syncUs = 0;
   bool haveSync = false;
+
   noInterrupts();
   if (g_hallSyncPending) {
     syncUs = g_hallSyncTimestampUs;
@@ -1071,13 +1204,20 @@ static void processHallSyncEvent(uint32_t nowUs){
 
   const uint8_t arms = activeArmCount();
   const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
-  for (uint8_t a=0; a<arms; ++a){
+
+  for (uint8_t a = 0; a < arms; ++a){
     uint16_t base = (uint16_t)armSpokeIdx0((int)a, startIdx0, (int)spokes, (int)arms);
     base %= spokes;
     g_armState[a].baseSpoke = base;
-    paintArmAt(a, base, nowUs);
+
+    if (!g_strobeEnable) {
+      paintArmAt(a, base, nowUs);
+    } else {
+      if (g_armState[a].lit) blankArm(a);
+      g_lastPulseSpoke[a] = 0xFFFF;
+    }
   }
-  for (uint8_t a=arms; a<MAX_ARMS; ++a){
+  for (uint8_t a = arms; a < MAX_ARMS; ++a){
     g_armState[a].baseSpoke = 0;
     if (g_armState[a].lit) blankArm(a);
   }
@@ -1089,16 +1229,17 @@ static void processHallSyncEvent(uint32_t nowUs){
   } else if (g_spokeDurationUs > 0 && spokes > 0) {
     revolutionUs = (uint64_t)g_spokeDurationUs * (uint64_t)spokes;
   }
-  if (revolutionUs == 0) {
-    revolutionUs = 1000000ULL;
-  }
+  if (revolutionUs == 0) revolutionUs = 1000000ULL;
+
   uint32_t newDur = (uint32_t)(revolutionUs / (uint64_t)spokes);
   if (newDur == 0) newDur = 1;
+
   uint32_t prev = g_spokeDurationUs;
   if (prev > 0) {
     newDur = (uint32_t)(((uint64_t)prev * 3ULL + newDur) / 4ULL);
     if (newDur == 0) newDur = 1;
   }
+
   g_spokeDurationUs = newDur;
   g_spokeStep = 0;
   g_nextSpokeDeadlineUs = syncUs + g_spokeDurationUs;
@@ -1123,6 +1264,7 @@ static void advancePredictedSpokes(uint32_t nowUs){
 }
 
 /* -------------------- Web: Files page + ops -------------------- */
+// (unchanged file handlers – omitted comments to keep size down)
 static void listFseqInDir_locked(const char* path, String& optionsHtml, uint8_t depth = 0) {
   File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
@@ -1144,7 +1286,6 @@ static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth =
   listFseqInDir_locked(path, optionsHtml, depth);
   SD_UNLOCK();
 }
-
 static void listBgEffects_locked(String& optionsHtml, const String& current) {
   File dir = SD_MMC.open(BG_EFFECTS_DIR);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
@@ -1167,7 +1308,6 @@ static void listBgEffects_locked(String& optionsHtml, const String& current) {
   }
   dir.close();
 }
-
 static void listBgEffects(String& optionsHtml, const String& current) {
   optionsHtml += "<option value=''";
   if (!current.length()) optionsHtml += " selected";
@@ -1176,7 +1316,6 @@ static void listBgEffects(String& optionsHtml, const String& current) {
   listBgEffects_locked(optionsHtml, current);
   SD_UNLOCK();
 }
-
 static void handleFiles() {
   String path = server.hasArg("path") ? server.arg("path") : "/";
   if (!path.length() || path[0] != '/') path = "/" + path;
@@ -1224,7 +1363,6 @@ static void handleFiles() {
   html += WebPages::filesPageFooter();
   server.send(200, "text/html; charset=utf-8", html);
 }
-
 static void handleDownload() {
   if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
   String path = server.arg("path"); if (!path.startsWith("/")) path = "/" + path;
@@ -1237,7 +1375,6 @@ static void handleDownload() {
   f.close();
   SD_UNLOCK();
 }
-
 static void handlePlayLink() {
   if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
   String path = server.arg("path");
@@ -1253,7 +1390,6 @@ static void handlePlayLink() {
   server.sendHeader("Location", back);
   server.send(302, "text/plain", "OK");
 }
-
 static void handleDelete() {
   if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
   String path = server.arg("path");
@@ -1271,7 +1407,6 @@ static void handleDelete() {
   server.sendHeader("Location", back);
   server.send(ok?302:500, "text/plain", ok?"Deleted":"Delete failed");
 }
-
 static void handleMkdir() {
   if (!server.hasArg("path") || !server.hasArg("name")) { server.send(400, "text/plain", "args"); return; }
   String base = server.hasArg("path") ? server.arg("path") : "/";
@@ -1287,7 +1422,6 @@ static void handleMkdir() {
   server.sendHeader("Location", String("/files?path=") + urlEncode(base.substring(0, base.length()-1)));
   server.send(ok?302:500, "text/plain", ok?"Created":"Create failed");
 }
-
 static void handleRename() {
   if (!server.hasArg("path") || !server.hasArg("to")) { server.send(400, "text/plain", "args"); return; }
   String p = server.arg("path");
@@ -1359,7 +1493,6 @@ static void handleUploadData() {
     }
   }
 }
-
 static void handleUploadDone() {
   String back = server.hasArg("back") ? server.arg("back") : "/";
   bool ok=false;
@@ -1390,7 +1523,6 @@ static void handleUploadDone() {
 static inline const char* statusText() { if (g_paused && g_playing) return "Paused"; if (g_playing) return "Playing"; return "Stopped"; }
 static inline const char* statusClass(){ if (g_paused && g_playing) return "badge pause"; if (g_playing) return "badge play"; return "badge stop"; }
 
-// --- REPLACED: robust count-based RPM computation ---
 static uint32_t computeRpmSnapshot() {
   uint32_t nowUs = micros();
   if (g_rpmSampleUs == 0) {
@@ -1402,7 +1534,7 @@ static uint32_t computeRpmSnapshot() {
   }
 
   uint32_t dtUs = nowUs - g_rpmSampleUs;
-  if (dtUs >= 250000) { // sample ~every 0.25 s
+  if (dtUs >= 250000) {
     g_rpmSampleUs = nowUs;
     g_rpmAccumulatedUs += dtUs;
 
@@ -1417,7 +1549,7 @@ static uint32_t computeRpmSnapshot() {
         uint64_t num   = (uint64_t)g_rpmAccumulatedPulses * 60000000ULL;
         uint32_t inst  = (denom ? (uint32_t)((num + denom / 2) / denom) : 0);
         if (inst > 0) {
-          g_rpmUi = (g_rpmUi * 3 + inst) / 4; // light smoothing
+          g_rpmUi = (g_rpmUi * 3 + inst) / 4;
           g_lastRpmUpdateMs = millis();
         }
       }
@@ -1425,14 +1557,12 @@ static uint32_t computeRpmSnapshot() {
       g_rpmAccumulatedUs = 0;
       g_rpmAccumulatedPulses = 0;
     } else {
-      if (g_rpmAccumulatedUs > 6000000ULL) {
-        g_rpmAccumulatedUs = 6000000ULL;
-      }
+      if (g_rpmAccumulatedUs > 6000000ULL) g_rpmAccumulatedUs = 6000000ULL;
     }
   }
 
   if (millis() - g_lastRpmUpdateMs > 2000) {
-    g_rpmUi = 0; // idle decay
+    g_rpmUi = 0;
     g_rpmAccumulatedUs = 0;
     g_rpmAccumulatedPulses = 0;
     g_rpmSampleUs = nowUs;
@@ -1470,10 +1600,10 @@ static void handleStatus(){
           ",\"deg\":" + String(g_strobeWidthDeg,2) +
           ",\"phase\":" + String(g_strobePhaseDeg,2) + "}";
   json += ",\"rpm\":" + String(computeRpmSnapshot());
-  // NEW: expose RPM config + raw period for quick sanity checks
   json += ",\"rpmPpr\":" + String((unsigned)g_pulsesPerRev);
   json += ",\"rpmEdge\":" + String((unsigned)g_hallEdgeMode);
   json += ",\"period_us\":" + String(g_lastPeriodUs);
+  json += ",\"outmode\":\""; json += (g_outputMode==OUT_PARALLEL?"parallel":"spi"); json += "\"";
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1510,8 +1640,7 @@ static void handleRoot() {
 static void applyBrightness(uint8_t pct){
   if (pct>100) pct=100;
   g_brightnessPercent=pct; g_brightness=(uint8_t)((255*pct)/100);
-  const uint8_t arms = activeArmCount();
-  for (uint8_t a=0; a<arms; ++a){ if (strips[a]){ strips[a]->setBrightness(g_brightness); strips[a]->show(); } }
+  for (uint8_t l=0; l<NUM_LANES; ++l) if (g_lanes[l]) { g_lanes[l]->setBrightness(g_brightness); g_lanes[l]->show(); }
   prefs.putUChar("brightness", g_brightnessPercent);
   persistSettingsToSd();
 }
@@ -1529,7 +1658,7 @@ static void handleB(){
   server.send(200, "application/json", String("{\"brightness\":") + pct + "}");
 }
 
-static void handleStart(){ // GET /start?path=/file.fseq
+static void handleStart(){
   if (server.hasArg("path")){
     String p = server.arg("path"); if (!p.startsWith("/")) p="/"+p;
     String why;
@@ -1582,15 +1711,10 @@ static void handlePause(){
     return;
   }
 
-  if (!toggle) {
-    g_paused = wantPause && g_playing;
-  } else {
-    g_paused = !g_paused && g_playing;
-  }
+  if (!toggle) g_paused = wantPause && g_playing;
+  else g_paused = !g_paused && g_playing;
 
-  if (!g_paused) {
-    g_lastTickMs = millis();
-  }
+  if (!g_paused) g_lastTickMs = millis();
 
   server.send(200,"application/json",
               String("{\"paused\":") + (g_paused ? "true" : "false") +
@@ -1602,8 +1726,7 @@ static void handleHallDiag(){
     server.send(400, "application/json", "{\"error\":\"missing enable\"}");
     return;
   }
-  String v = server.arg("enable");
-  v.toLowerCase();
+  String v = server.arg("enable"); v.toLowerCase();
   bool enable = (v == "1" || v == "true" || v == "on" || v == "yes");
 
   if (enable) {
@@ -1702,53 +1825,39 @@ static void handleWifiCfg(){
   bool reconnect = false;
 
   if (server.hasArg("forget")) {
-    g_staSsid = "";
-    g_staPass = "";
+    g_staSsid = ""; g_staPass = "";
     prefs.putString("sta_ssid", g_staSsid);
     prefs.putString("sta_pass", g_staPass);
-    changed = true;
-    reconnect = true;
+    changed = true; reconnect = true;
   } else {
     if (server.hasArg("ssid")) {
-      String ssid = server.arg("ssid");
-      ssid.trim();
+      String ssid = server.arg("ssid"); ssid.trim();
       g_staSsid = ssid;
       prefs.putString("sta_ssid", g_staSsid);
-      changed = true;
-      reconnect = true;
+      changed = true; reconnect = true;
     }
     if (server.hasArg("pass")) {
       g_staPass = server.arg("pass");
       prefs.putString("sta_pass", g_staPass);
-      changed = true;
-      reconnect = true;
+      changed = true; reconnect = true;
     }
   }
 
   if (server.hasArg("station")) {
-    String station = server.arg("station");
-    station.trim();
+    String station = server.arg("station"); station.trim();
     if (!station.length()) station = defaultStationId();
     g_stationId = station;
     prefs.putString("station", g_stationId);
-    changed = true;
-    reconnect = true;
+    changed = true; reconnect = true;
   }
 
-  if (changed) {
-    persistSettingsToSd();
-  }
+  if (changed) persistSettingsToSd();
 
   applyStationHostname();
 
   if (reconnect) {
-    if (g_staSsid.length()) {
-      connectWifiStation();
-    } else {
-      WiFi.disconnect(false, true);
-      g_staConnecting = false;
-      markStationState(false);
-    }
+    if (g_staSsid.length()) connectWifiStation();
+    else { WiFi.disconnect(false, true); g_staConnecting = false; markStationState(false); }
   }
 
   server.send(200, "application/json", "{\"ok\":true}");
@@ -1756,18 +1865,16 @@ static void handleWifiCfg(){
 
 static void handleAutoplay(){
   if (!server.hasArg("enable")) {
-    server.send(400, "application/json", "{\"error\":\"missing enable\"}");
+    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
     return;
   }
-
   bool enable = parseBoolArg(server.arg("enable"));
   g_autoplayEnabled = enable;
   prefs.putBool("autoplay", g_autoplayEnabled);
   persistSettingsToSd();
   g_bootMs = millis();
 
-  server.send(200, "application/json",
-              String("{\"autoplay\":") + (g_autoplayEnabled ? "true" : "false") + "}");
+  server.send(200, "application/json", String("{\"autoplay\":") + (g_autoplayEnabled ? "true" : "false") + "}");
 }
 
 static void handleWatchdog(){
@@ -1775,15 +1882,12 @@ static void handleWatchdog(){
     server.send(400, "application/json", "{\"error\":\"missing enable\"}");
     return;
   }
-
   bool enable = parseBoolArg(server.arg("enable"));
   g_watchdogEnabled = enable;
   prefs.putBool("watchdog", g_watchdogEnabled);
   persistSettingsToSd();
   applyWatchdogSetting();
-
-  server.send(200, "application/json",
-              String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
+  server.send(200, "application/json", String("{\"watchdog\":") + (g_watchdogEnabled ? "true" : "false") + "}");
 }
 
 static void handleBgEffect(){
@@ -1795,51 +1899,31 @@ static void handleBgEffect(){
   }
 
   bool enable = g_bgEffectEnabled;
-  if (hasEnable) {
-    enable = parseBoolArg(server.arg("enable"));
-  }
+  if (hasEnable) enable = parseBoolArg(server.arg("enable"));
 
   String newPath = g_bgEffectPath;
   if (hasPath) {
     String raw = server.arg("path");
     String sanitized = sanitizeBgEffectPath(raw);
-    if (raw.length() && !sanitized.length()) {
-      server.send(400, "application/json", "{\"error\":\"invalid path\"}");
-      return;
-    }
+    if (raw.length() && !sanitized.length()) { server.send(400, "application/json", "{\"error\":\"invalid path\"}"); return; }
     newPath = sanitized;
   }
 
   bool enableChanged = (enable != g_bgEffectEnabled);
-  bool pathChanged = (newPath != g_bgEffectPath);
-  bool stateChanged = enableChanged || pathChanged;
+  bool pathChanged   = (newPath != g_bgEffectPath);
+  bool stateChanged  = enableChanged || pathChanged;
 
-  if (enableChanged) {
-    g_bgEffectEnabled = enable;
-    prefs.putBool("bge_enable", g_bgEffectEnabled);
-  }
-  if (pathChanged) {
-    g_bgEffectPath = newPath;
-    prefs.putString("bge_path", g_bgEffectPath);
-  }
-  if (stateChanged) {
-    persistSettingsToSd();
-  }
+  if (enableChanged) { g_bgEffectEnabled = enable; prefs.putBool("bge_enable", g_bgEffectEnabled); }
+  if (pathChanged)   { g_bgEffectPath    = newPath; prefs.putString("bge_path", g_bgEffectPath); }
+  if (stateChanged)  persistSettingsToSd();
+
   g_bootMs = millis();
 
   if (!g_bgEffectEnabled || !g_bgEffectPath.length()) {
     if (g_bgEffectActive) {
-      g_playing = false;
-      g_paused = false;
-      g_bgEffectActive = false;
+      g_playing = false; g_paused = false; g_bgEffectActive = false;
       g_bootMs = millis();
-      const uint8_t arms = activeArmCount();
-      for (uint8_t a=0; a<arms; ++a){
-        if (!strips[a]) continue;
-        uint16_t pix = strips[a]->numPixels();
-        for (uint16_t i=0; i<pix; ++i) strips[a]->setPixelColor(i,0,0,0);
-        strips[a]->show();
-      }
+      for (uint8_t a=0; a<activeArmCount(); ++a) armClear(a);
     }
     g_bgEffectNextAttemptMs = millis();
   } else {
@@ -1847,12 +1931,8 @@ static void handleBgEffect(){
       if (!g_playing || g_bgEffectActive) {
         String why;
         g_paused = false;
-        if (!openFseq(g_bgEffectPath, why)) {
-          Serial.printf("[BGE] open fail: %s\n", why.c_str());
-          g_bgEffectNextAttemptMs = millis() + 5000;
-        } else {
-          g_bgEffectNextAttemptMs = millis();
-        }
+        if (openFseq(g_bgEffectPath, why)) { g_bgEffectNextAttemptMs = millis(); }
+        else { Serial.printf("[BGE] open fail: %s\n", why.c_str()); g_bgEffectNextAttemptMs = millis() + 5000; }
       } else if (stateChanged) {
         g_bgEffectNextAttemptMs = millis();
       }
@@ -1869,7 +1949,6 @@ static void handleBgEffect(){
   server.send(200, "application/json", resp);
 }
 
-// Diagnostics
 static void handleFseqHeader(){
   String j="{\"ok\":false}";
   if (g_currentPath.length()) {
@@ -1901,12 +1980,8 @@ static void handleSdReinit(){
   bool mounted = (SD_MMC.cardType()!=CARD_NONE);
   SD_UNLOCK();
 
-  if (mounted) {
-    g_sdReady = true;
-    ok = true;
-  } else {
-    ok = mountSdmmc();
-  }
+  if (mounted) { g_sdReady = true; ok = true; }
+  else { ok = mountSdmmc(); }
 
   if (!ok) { server.send(500,"text/plain","SD not present"); return; }
   if (!g_currentPath.length()) { server.send(200,"text/plain","SD OK; no file"); return; }
@@ -1926,50 +2001,24 @@ static void handleSdConfig(){
 
   char *end=nullptr;
   long modeVal = strtol(modeStr.c_str(), &end, 10);
-  if (end == modeStr.c_str() || *end != '\0') {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}");
-    return;
-  }
-  if (!(modeVal == 0 || modeVal == 1 || modeVal == 4)) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported mode\"}");
-    return;
-  }
+  if (end == modeStr.c_str() || *end != '\0') { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}"); return; }
+  if (!(modeVal == 0 || modeVal == 1 || modeVal == 4)) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported mode\"}"); return; }
   SdBusPreference newMode = sanitizeSdMode((uint8_t)modeVal);
 
   end = nullptr;
   uint32_t freqVal = (uint32_t)strtoul(freqStr.c_str(), &end, 10);
-  if (end == freqStr.c_str() || *end != '\0' || !isValidSdFreq(freqVal)) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid frequency\"}");
-    return;
-  }
+  if (end == freqStr.c_str() || *end != '\0' || !isValidSdFreq(freqVal)) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid frequency\"}"); return; }
 
   bool changed = false;
-  if (newMode != g_sdPreferredBusWidth) {
-    g_sdPreferredBusWidth = newMode;
-    prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth);
-    changed = true;
-  }
-  if (freqVal != g_sdBaseFreqKHz) {
-    g_sdBaseFreqKHz = sanitizeSdFreq(freqVal);
-    g_sdFreqKHz = g_sdBaseFreqKHz;
-    prefs.putUInt("sdfreq", g_sdBaseFreqKHz);
-    changed = true;
-  }
-  if (changed) {
-    g_sdFailStreak = 0;
-    persistSettingsToSd();
-  }
+  if (newMode != g_sdPreferredBusWidth) { g_sdPreferredBusWidth = newMode; prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth); changed = true; }
+  if (freqVal != g_sdBaseFreqKHz) { g_sdBaseFreqKHz = sanitizeSdFreq(freqVal); g_sdFreqKHz = g_sdBaseFreqKHz; prefs.putUInt("sdfreq", g_sdBaseFreqKHz); changed = true; }
+  if (changed) { g_sdFailStreak = 0; persistSettingsToSd(); }
 
   bool card = cardPresent();
   bool remounted = false;
   bool reopened = false;
   if (card) {
-    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-      SD_MMC.end();
-      g_sdBusWidth = 0;
-      g_sdReady = false;
-      SD_UNLOCK();
-    }
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { SD_MMC.end(); g_sdBusWidth = 0; g_sdReady = false; SD_UNLOCK(); }
     delay(20);
     g_sdFreqKHz = g_sdBaseFreqKHz;
     remounted = mountSdmmc();
@@ -1978,15 +2027,10 @@ static void handleSdConfig(){
       if (g_currentPath.length()) {
         String why;
         reopened = openFseq(g_currentPath, why);
-        if (!reopened && why.length()) {
-          Serial.printf("[SD] reopen after config failed: %s\n", why.c_str());
-        }
+        if (!reopened && why.length()) Serial.printf("[SD] reopen after config failed: %s\n", why.c_str());
       }
     }
-  } else {
-    g_sdReady = false;
-    g_sdBusWidth = 0;
-  }
+  } else { g_sdReady = false; g_sdBusWidth = 0; }
 
   String json = "{\"ok\":true";
   json += ",\"ready\":" + String(g_sdReady?"true":"false");
@@ -2009,10 +2053,10 @@ static bool recoverSd(const char* reason) {
   if (!cardPresent()) {
     Serial.println("[SD] Card not present (CD HIGH). Waiting...");
     uint32_t t0 = millis();
-    while (!cardPresent() && millis() - t0 < 5000) {
-      delay(50);
-      server.handleClient();
-      feedWatchdog();
+    while (!cardPresent() && millis() - t0 < 5000) { 
+      delay(50); 
+      server.handleClient(); 
+      feedWatchdog(); 
     }
     if (!cardPresent()) return false;
   }
@@ -2021,7 +2065,8 @@ static bool recoverSd(const char* reason) {
 
   if (g_sdFailStreak == 1) {
     if (g_currentPath.length()) {
-      String why; ok = openFseq(g_currentPath, why);
+      String why; 
+      ok = openFseq(g_currentPath, why);
       Serial.printf("[SD] Reopen file: %s\n", ok?"OK": why.c_str());
       if (ok) { feedWatchdog(); return true; }
     }
@@ -2031,22 +2076,23 @@ static bool recoverSd(const char* reason) {
   SD_MMC.end();
   g_sdBusWidth = 0;
   g_sdReady = false;
-  pinMode(PIN_SD_CLK, OUTPUT); digitalWrite(PIN_SD_CLK, LOW); delay(5);
-  pinMode(PIN_SD_CLK, INPUT);
+  pinMode(PIN_SD_CLK, OUTPUT); 
+  digitalWrite(PIN_SD_CLK, LOW); 
+  delay(5);
+  pinMode(PIN_SD_CLK, INPUT);   // ← fixed here
   SD_UNLOCK();
   delay(50);
   feedWatchdog();
 
   if (g_sdFailStreak >= 2) {
     uint32_t lowered = nextLowerSdFreq(g_sdFreqKHz);
-    if (lowered != g_sdFreqKHz) {
-      g_sdFreqKHz = lowered;
-    }
+    if (lowered != g_sdFreqKHz) g_sdFreqKHz = lowered;
   }
 
   ok = mountSdmmc();
   if (ok && g_currentPath.length()) {
-    String why; ok = openFseq(g_currentPath, why);
+    String why; 
+    ok = openFseq(g_currentPath, why);
     Serial.printf("[SD] Reopen after remount: %s\n", ok?"OK": why.c_str());
   }
 
@@ -2055,18 +2101,14 @@ static bool recoverSd(const char* reason) {
   return ok;
 }
 
-/* -------------------- NEW: Strobe & per-arm phase handlers -------------------- */
+
+/* -------------------- Strobe & per-arm phase handlers -------------------- */
 static void handleStrobe() {
   bool haveEnable = server.hasArg("enable");
   bool haveDeg    = server.hasArg("deg");
   bool havePhase  = server.hasArg("phase");
-  if (!haveEnable && !haveDeg && !havePhase) {
-    server.send(400, "application/json", "{\"error\":\"missing parameters\"}");
-    return;
-  }
-  if (haveEnable) {
-    g_strobeEnable = parseBoolArg(server.arg("enable"));
-  }
+  if (!haveEnable && !haveDeg && !havePhase) { server.send(400, "application/json", "{\"error\":\"missing parameters\"}"); return; }
+  if (haveEnable) { g_strobeEnable = parseBoolArg(server.arg("enable")); }
   if (haveDeg) {
     g_strobeWidthDeg = server.arg("deg").toFloat();
     if (g_strobeWidthDeg < 0.1f) g_strobeWidthDeg = 0.1f;
@@ -2084,21 +2126,15 @@ static void handleStrobe() {
 }
 
 static void handleArmPhase() {
-  if (!server.hasArg("arm") || !server.hasArg("deg")) {
-    server.send(400, "application/json", "{\"error\":\"arm & deg required\"}");
-    return;
-  }
+  if (!server.hasArg("arm") || !server.hasArg("deg")) { server.send(400, "application/json", "{\"error\":\"arm & deg required\"}"); return; }
   int arm = server.arg("arm").toInt();
-  if (arm < 1 || arm > (int)activeArmCount()) {
-    server.send(400, "application/json", "{\"error\":\"arm out of range\"}");
-    return;
-  }
+  if (arm < 1 || arm > (int)activeArmCount()) { server.send(400, "application/json", "{\"error\":\"arm out of range\"}"); return; }
   g_armPhaseDeg[arm-1] = server.arg("deg").toFloat();
   server.send(200, "application/json",
               String("{\"arm\":") + arm + ",\"phase\":" + String(g_armPhaseDeg[arm-1],2) + "}");
 }
 
-/* -------------------- NEW: RPM config handler -------------------- */
+/* -------------------- RPM config handler -------------------- */
 static void handleRpmCfg(){
   bool changed = false;
 
@@ -2126,12 +2162,30 @@ static void handleRpmCfg(){
   if (changed) persistSettingsToSd();
 
   String edgeStr = (g_hallEdgeMode==1) ? "rising" : (g_hallEdgeMode==2 ? "change" : "falling");
-  String resp = String("{\"ok\":true,\"ppr\":") + g_pulsesPerRev +
-                ",\"edge\":\"" + edgeStr + "\"}";
+  String resp = String("{\"ok\":true,\"ppr\":") + g_pulsesPerRev + ",\"edge\":\"" + edgeStr + "\"}";
   server.send(200, "application/json", resp);
 }
 
-/* -------------------- OTA / Updates page handlers -------------------- */
+/* -------------------- Output mode switch -------------------- */
+static void setOutputMode(uint8_t mode) {
+  mode = (mode == OUT_PARALLEL) ? OUT_PARALLEL : OUT_SPI;
+  if (mode == g_outputMode) return;
+  g_outputMode = mode;
+  prefs.putUChar("outmode", g_outputMode);
+  persistSettingsToSd();
+  if (g_outputMode == OUT_PARALLEL) configureParallelPins();
+  blackoutAll();
+}
+static void handleOutMode() {
+  if (!server.hasArg("mode")) { server.send(400,"application/json","{\"error\":\"missing mode\"}"); return; }
+  String m = server.arg("mode"); m.toLowerCase();
+  if (m != "spi" && m != "parallel") { server.send(400,"application/json","{\"error\":\"mode must be spi|parallel\"}"); return; }
+  setOutputMode(m == "parallel" ? OUT_PARALLEL : OUT_SPI);
+  server.send(200,"application/json", String("{\"outmode\":\"") + (g_outputMode==OUT_PARALLEL?"parallel":"spi") + "\"}");
+}
+
+/* -------------------- OTA / Updates page -------------------- */
+// (unchanged OTA functions)
 static void handleOtaPage() {
   String html =
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -2154,25 +2208,18 @@ static void handleOtaPage() {
     "</div></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
-
-File   g_otaFile; // not actually used to store; we stream to Update
-size_t g_otaBytes = 0;
-
+File   g_otaFile; size_t g_otaBytes = 0;
 static void handleOtaData() {
   if (!otaAuthOK()) return;
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     g_otaBytes = 0;
     Serial.printf("[OTA] Direct start: %s\n", up.filename.c_str());
-    if (!Update.begin()) { // use max available
-      Serial.printf("[OTA] begin failed: %s\n", Update.errorString());
-    }
+    if (!Update.begin()) { Serial.printf("[OTA] begin failed: %s\n", Update.errorString()); }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.isRunning()) {
       size_t w = Update.write(up.buf, up.currentSize);
-      if (w != up.currentSize) {
-        Serial.printf("[OTA] write failed: %s\n", Update.errorString());
-      }
+      if (w != up.currentSize) Serial.printf("[OTA] write failed: %s\n", Update.errorString());
     }
     g_otaBytes += up.currentSize;
     feedWatchdog();
@@ -2181,22 +2228,14 @@ static void handleOtaData() {
     Serial.printf("[OTA] Direct end (%u bytes): %s\n", (unsigned)g_otaBytes, ok?"OK":"FAIL");
   }
 }
-
 static void handleOtaFinish() {
   if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
-  if (Update.isFinished()) {
-    server.send(200, "text/plain", "OTA complete, rebooting...");
-    delay(200);
-    ESP.restart();
-  } else {
-    server.send(500, "text/plain", String("OTA failed: ") + Update.errorString());
-  }
+  if (Update.isFinished()) { server.send(200, "text/plain", "OTA complete, rebooting..."); delay(200); ESP.restart(); }
+  else { server.send(500, "text/plain", String("OTA failed: ") + Update.errorString()); }
 }
 
 // Upload firmware.bin to SD (for boot-time apply)
-File   g_fwSdFile;
-size_t g_fwSdBytes = 0;
-
+File   g_fwSdFile; size_t g_fwSdBytes = 0;
 static void handleFwUploadData() {
   if (!otaAuthOK()) return;
   HTTPUpload& up = server.upload();
@@ -2224,25 +2263,18 @@ static void handleFwUploadData() {
     }
   }
 }
-
 static void handleFwUploadDone() {
   if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
   bool present = false;
-  if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-    present = SD_MMC.exists(OTA_FILE);
-    SD_UNLOCK();
-  }
+  if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { present = SD_MMC.exists(OTA_FILE); SD_UNLOCK(); }
   server.sendHeader("Location", present ? "/updates?uploaded=1" : "/updates?uploaded=0");
   server.send(302);
 }
-
-// Updates hub (Upload to SD + Reboot; Direct OTA link lives elsewhere)
 static void handleUpdatesPage() {
   bool canReboot = (server.hasArg("uploaded") && server.arg("uploaded") == "1");
   String html = WebPages::updatesPage(canReboot);
   server.send(200, "text/html; charset=utf-8", html);
 }
-
 static void handleReboot() {
   server.send(200, "text/plain", "Rebooting");
   delay(150);
@@ -2257,7 +2289,7 @@ static void startWifiAP(){
   WiFi.softAPConfig(AP_IP, AP_GW, AP_MASK);
   WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 4);
   applyStationHostname();
-  WiFi.setSleep(false); // keep AP awake during SD I/O
+  WiFi.setSleep(false);
   if (haveStation) connectWifiStation();
   if (MDNS.begin("pov")) MDNS.addService("http","tcp",80);
 
@@ -2280,12 +2312,15 @@ static void startWifiAP(){
   server.on("/watchdog",HTTP_POST, handleWatchdog);
   server.on("/bgeffect",HTTP_POST, handleBgEffect);
 
-  // NEW: strobe + per-arm phase tuning
+  // Strobe + per-arm phase
   server.on("/strobe",   HTTP_POST, handleStrobe);
   server.on("/armphase", HTTP_POST, handleArmPhase);
 
-  // NEW: RPM configuration (PPR + ISR edge)
+  // RPM configuration
   server.on("/rpm", HTTP_POST, handleRpmCfg);
+
+  // Output mode
+  server.on("/outmode", HTTP_POST, handleOutMode);
 
   // Diagnostics
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
@@ -2325,7 +2360,7 @@ static void startWifiAP(){
 void setup(){
   Serial.begin(115200);
   delay(800);
-  Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame)");
+  Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame) — DUAL-SPI lanes build");
   Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
   pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
@@ -2335,10 +2370,9 @@ void setup(){
   g_statusPixel.clear();
   g_statusPixel.show();
 
-  // Create SD mutex before any FS work
   g_sdMutex = xSemaphoreCreateMutex();
 
-  // Restore settings from NVS before mounting so SD options apply
+  // Restore settings from NVS first
   prefs.begin("display", false);
   PrefPresence present;
   present.sdMode = prefs.isKey("sdmode");
@@ -2376,46 +2410,35 @@ void setup(){
   {
     String storedBg = prefs.getString("bge_path", "");
     g_bgEffectPath = sanitizeBgEffectPath(storedBg);
-    if (storedBg.length() && !g_bgEffectPath.length()) {
-      prefs.putString("bge_path", g_bgEffectPath);
-    }
+    if (storedBg.length() && !g_bgEffectPath.length()) prefs.putString("bge_path", g_bgEffectPath);
   }
   g_bgEffectNextAttemptMs = millis();
 
-  // NEW: RPM prefs & ISR attach
+  // RPM prefs & ISR
   g_pulsesPerRev = prefs.getUChar("ppr", PULSES_PER_REV);
   if (g_pulsesPerRev < 1) g_pulsesPerRev = 1;
-  g_hallEdgeMode = prefs.getUChar("hedge", 0); // 0=FALLING
+  g_hallEdgeMode = prefs.getUChar("hedge", 0);
   attachHallInterrupt();
 
-  // NEW: strobe gate pin init (optional)
-  if (PIN_STROBE_GATE >= 0) {
-    pinMode(PIN_STROBE_GATE, OUTPUT);
-    digitalWrite(PIN_STROBE_GATE, LOW); // LOW = off (for typical N-MOSFET low-side)
-  }
+  // Output mode pref (default SPI)
+  g_outputMode = prefs.getUChar("outmode", (uint8_t)OUT_SPI);
+  if (g_outputMode != OUT_SPI && g_outputMode != OUT_PARALLEL) g_outputMode = OUT_SPI;
+  if (g_outputMode == OUT_PARALLEL) configureParallelPins();
+
+  if (PIN_STROBE_GATE >= 0) { pinMode(PIN_STROBE_GATE, OUTPUT); digitalWrite(PIN_STROBE_GATE, LOW); }
 
   bool card = cardPresent();
-  if (!card) {
-    Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
-  }
+  if (!card) Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
 
   if (card) {
     g_sdReady = mountSdmmc();
-    if (!g_sdReady) {
-      Serial.println("[SD] Mount failed; UI still available for diagnostics.");
-    }
+    if (!g_sdReady) Serial.println("[SD] Mount failed; UI still available for diagnostics.");
   }
 
-  if (g_sdReady) {
-    checkSdFirmwareUpdate(); // applies /firmware.bin if present
-  }
-
+  if (g_sdReady) checkSdFirmwareUpdate();
   if (g_sdReady) {
     ensureSettingsFromBackup(present);
-    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-      ensureBgEffectsDirLocked();
-      SD_UNLOCK();
-    }
+    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { ensureBgEffectsDirLocked(); SD_UNLOCK(); }
   }
 
   applyWatchdogSetting();
@@ -2441,6 +2464,7 @@ void setup(){
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u stride=%s\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
+  Serial.printf("[OUTMODE] %s\n", (g_outputMode==OUT_PARALLEL?"PARALLEL":"SPI"));
 
   startWifiAP();
 
@@ -2454,7 +2478,8 @@ void setup(){
     persistSettingsToSd();
   }
 
-  rebuildStrips();
+  rebuildStrips();       // Build two SPI lanes + routes
+  setDefaultArmPhases();
   blackoutAll();
 
   g_bootMs   = millis();
@@ -2474,63 +2499,43 @@ void loop(){
   server.handleClient();
   updateHallSensor();
 
-  // Frequent RPM smoothing
   static uint32_t lastRpmPoll = 0;
   uint32_t nowMs = millis();
-  if (nowMs - lastRpmPoll >= 250) {
-    (void)computeRpmSnapshot();
-    lastRpmPoll = nowMs;
-  }
+  if (nowMs - lastRpmPoll >= 250) { (void)computeRpmSnapshot(); lastRpmPoll = nowMs; }
 
   feedWatchdog();
 
-  // Auto-start background effect if configured
   if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_playing) {
     uint32_t now = millis();
     if (now >= g_bgEffectNextAttemptMs) {
       String why;
       g_paused = false;
-      if (openFseq(g_bgEffectPath, why)) {
-        Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str());
-        g_bgEffectNextAttemptMs = now;
-      } else {
-        Serial.printf("[BGE] open fail: %s\n", why.c_str());
-        g_bgEffectNextAttemptMs = now + 5000;
-      }
+      if (openFseq(g_bgEffectPath, why)) { Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); g_bgEffectNextAttemptMs = now; }
+      else { Serial.printf("[BGE] open fail: %s\n", why.c_str()); g_bgEffectNextAttemptMs = now + 5000; }
     }
   }
 
-  // Autoplay fallback after idle
   if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     g_paused = false;
-    if (openFseq("/test2.fseq", why)) {
-      Serial.println("[TIMEOUT] Auto-start /test2.fseq");
-    } else {
-      Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str());
-      g_bootMs = millis(); // try again later
-    }
+    if (openFseq("/test2.fseq", why)) { Serial.println("[TIMEOUT] Auto-start /test2.fseq"); }
+    else { Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str()); g_bootMs = millis(); }
   }
 
-  // If not playing, keep loop light
   if (!g_playing || g_paused) {
-    // Gate off while idle
     if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
     delay(1);
     feedWatchdog();
     return;
   }
 
-  // ---- Angular spoke & gating management ----
   const uint16_t spokeNow = currentSpokeIndex();
 
-  // HARD gate: pulse on only inside the window (software blanking otherwise)
   if (PIN_STROBE_GATE >= 0) {
-    bool on = inStrobeWindowForArm(spokeNow, 0); // arm 0 as timing reference
+    bool on = inStrobeWindowForArm(spokeNow, 0);
     digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
   }
 
-  // Update frame content at requested FPS, but draw it aligned to current spoke
   const uint32_t now = millis();
   if (now - g_lastTickMs >= g_framePeriodMs) {
     g_lastTickMs = now;
@@ -2557,9 +2562,53 @@ void loop(){
   }
 
   uint32_t nowUs = micros();
-  processHallSyncEvent(nowUs);
-  advancePredictedSpokes(nowUs);
-  processArmBlanking(nowUs);
+  if (g_strobeEnable) {
+    processHallSyncEvent(nowUs);
+
+    const uint16_t spokeNow2 = currentSpokeIndex();
+    const uint8_t arms = activeArmCount();
+
+    for (uint8_t a = 0; a < arms; ++a) {
+      const bool in = inStrobeWindowForArm(spokeNow2, a);
+
+      if (in && g_lastPulseSpoke[a] != spokeNow2) {
+        paintArmAt(a, spokeNow2, nowUs);
+        g_lastPulseSpoke[a] = spokeNow2;
+        g_armState[a].lit = true;
+      }
+
+      if (!in && g_armState[a].lit) blankArm(a);
+    }
+  } else {
+    processHallSyncEvent(nowUs);
+    advancePredictedSpokes(nowUs);
+    processArmBlanking(nowUs);
+  }
 
   feedWatchdog();
+}
+
+// ====== SPI/Parallel-aware blanker ======
+static void blankArm(uint8_t arm){
+  if (arm >= MAX_ARMS) return;
+
+  if (g_outputMode == OUT_PARALLEL) {
+    if (g_strobeEnable && PIN_STROBE_GATE >= 0) {
+      g_armState[arm].lit = false;
+      g_armState[arm].blankDeadlineUs = 0;
+      return;
+    }
+    if (arm == 0) {
+      configureParallelPins();
+      sk9822_tx_parallel_black();
+      const uint8_t arms = activeArmCount();
+      for (uint8_t a=0; a<arms; ++a) { g_armState[a].lit = false; g_armState[a].blankDeadlineUs = 0; }
+    }
+    return;
+  }
+
+  // SPI: clear that arm's segment only
+  armClear(arm);
+  g_armState[arm].lit = false;
+  g_armState[arm].blankDeadlineUs = 0;
 }
