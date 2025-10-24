@@ -1,6 +1,32 @@
 #pragma once
 #include <Arduino.h>
 
+// Shared constants for spinner geometry
+constexpr uint8_t  MAX_ARMS               = 4;
+constexpr uint16_t DEFAULT_PIXELS_PER_ARM = 144;
+constexpr uint16_t MAX_PIXELS_PER_ARM     = 1024;
+
+enum StrideMode : uint8_t { STRIDE_SPOKE = 0, STRIDE_LED = 1 };
+
+// Utility clamps reused across modules
+inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+inline uint8_t clampArmCount(int32_t v) {
+  if (v < 1) return 1;
+  if (v > MAX_ARMS) return MAX_ARMS;
+  return static_cast<uint8_t>(v);
+}
+
+inline uint16_t clampPixelsPerArm(int32_t v) {
+  if (v < 1) return 1;
+  if (v > MAX_PIXELS_PER_ARM) return MAX_PIXELS_PER_ARM;
+  return static_cast<uint16_t>(v);
+}
+
 enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
 
 // Presence flags for what exists in NVS (preferences)

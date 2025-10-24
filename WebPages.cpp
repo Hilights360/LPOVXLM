@@ -453,4 +453,61 @@ String updatesPage(bool canReboot) {
   return html;
 }
 
+String directOtaPage() {
+  String html =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Direct OTA</title>"
+    "<style>body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}""
+    ".card{max-width:680px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}""
+    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}""
+    "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}""
+    "input[type=file]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}""
+    ".muted{opacity:.75}"
+    "</style></head><body><div class='card'>"
+    "<h2 style='margin:0 0 .5rem 0'>Direct OTA (Flash Now)</h2>"
+    "<p class='muted'>Upload a compiled <b>.bin</b> firmware image. Device will reboot automatically.</p>"
+    "<form method='POST' action='/ota' enctype='multipart/form-data'>"
+    "<input type='file' name='fw' accept='.bin' required> "
+    "<button type='submit'>Flash Immediately</button>"
+    "</form>"
+    "<p style='margin-top:1rem'><a href='/'>Back</a> &middot; <a href='/updates'>Updates</a></p>"
+    "</div></body></html>";
+  return html;
+}
+
+namespace {
+String uploadRefreshPage(const String &backUrl, uint8_t seconds, const String &bodyHtml) {
+  String backEsc = htmlEscape(backUrl);
+  String html =
+      "<!doctype html><html><head><meta charset='utf-8'>"
+      "<meta http-equiv='refresh' content='" + String((unsigned)seconds) + ";url=" + backEsc + "'>"
+      "<style>body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1.5rem}""
+      "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}""
+      "</style></head><body>"
+      + bodyHtml +
+      "<p><a href='" + backEsc + "'>Return now</a></p>"
+      "</body></html>";
+  return html;
+}
+} // namespace
+
+String uploadRejectedPage(const String &backUrl) {
+  String body = "<p>Upload rejected. Only <b>.fseq</b> files are allowed.</p><p>Returning…</p>";
+  return uploadRefreshPage(backUrl, 2, body);
+}
+
+String uploadFailurePage(const String &backUrl) {
+  String body = "<p>Upload failed.</p><p>Returning…</p>";
+  return uploadRefreshPage(backUrl, 3, body);
+}
+
+String uploadSuccessPage(const String &backUrl,
+                         const String &filename,
+                         size_t bytesWritten) {
+  String nameEsc = htmlEscape(filename);
+  String body = "<p>Uploaded <b>" + nameEsc + "</b> (" + String((unsigned long)bytesWritten) + " bytes).</p><p>Refreshing…</p>";
+  return uploadRefreshPage(backUrl, 1, body);
+}
+
 } // namespace WebPages
