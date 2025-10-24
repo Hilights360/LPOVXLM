@@ -36,6 +36,7 @@
 #include <esp_task_wdt.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>  
 #include <math.h> // fabsf
 
 #include "QuadMap.h"
@@ -43,6 +44,7 @@
 #include "HtmlUtils.h"
 #include "WifiManager.h"
 #include "SD_Functions.h"
+
 
 // ---------- Optional zlib backends (auto-detect) ----------
 #if defined(__has_include)
@@ -309,6 +311,14 @@ uint8_t  g_armCount      = MAX_ARMS;
 uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
 static uint16_t g_lastPulseSpoke[MAX_ARMS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 
+// ================= Per-arm start channel mapping (optional) =================
+// If true, each arm can start at its own absolute channel (R of pixel 0).
+// When false, computed defaults are used from g_startChArm1 + stride rules.
+bool     g_usePerArmStart = false;            // NVS key: "usepa"
+uint32_t g_startChArm[MAX_ARMS] = {0,0,0,0};  // 1-based absolute channel for Arm1..Arm4 (R)
+static void computeDefaultArmStarts(uint32_t startArm1); // fwd decl
+
+
 //enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;
 
@@ -505,6 +515,9 @@ static void handleArmPhase();
 static void handleRpmCfg();
 static void handleReboot();
 static void handleOutMode(); // declared here; implemented later with setOutputMode()
+static void handleDiagMap();     // /diag/map?arm=1&pix=0&spoke=0
+static void handleFseqRanges();  // /fseq/ranges
+
 
 static bool otaAuthOK() { return true; } // stub (shared with SD module)
 
@@ -738,6 +751,31 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
   }
 }
 
+
+// Compute per-arm starting channels from g_startChArm1 according to stride.
+// Results are 1-based absolute channel numbers (R of pixel 0 for that arm).
+static void computeDefaultArmStarts(uint32_t startArm1) {
+  if (startArm1 < 1) startArm1 = 1;
+
+  const uint8_t arms = activeArmCount();
+  const uint16_t pix = armPixelCount();
+
+  // Clear all first
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) g_startChArm[a] = 0;
+
+  if (g_strideMode == STRIDE_SPOKE) {
+    // [Arm1 block][Arm2 block]...[ArmN block], each block = pix * 3 channels
+    for (uint8_t a = 0; a < arms; ++a) {
+      g_startChArm[a] = startArm1 + (uint32_t)a * (uint32_t)pix * 3u;
+    }
+  } else {
+    // STRIDE_LED: LED-interleaved per pixel; Arm K’s pixel0 R is + (K * 3)
+    for (uint8_t a = 0; a < arms; ++a) {
+      g_startChArm[a] = startArm1 + (uint32_t)a * 3u;
+    }
+  }
+}
+
 /* -------------------- Rebuild TWO-LANE strips and arm routes -------------------- */
 static void rebuildStrips(){
   // Dispose old lanes
@@ -787,6 +825,22 @@ static void resetArmRuntimeStates(){
   g_nextSpokeDeadlineUs = 0;
   g_spokeStep = 0;
 }
+//Diagnostic to see which SPI Lane is being used for what arm
+static void handleLaneDiag() {
+  g_playing = false; g_paused = false;
+  g_hallDiagEnabled = false; g_armTestEnabled = false;
+  blackoutAll();
+
+  const uint8_t arms = activeArmCount();
+  if (arms >= 1) armFillColor(0, 255,   0,   0); // Arm1 = RED
+  if (arms >= 2) armFillColor(1,   0, 255,   0); // Arm2 = GREEN
+  if (arms >= 3) armFillColor(2,   0,   0, 255); // Arm3 = BLUE
+  if (arms >= 4) armFillColor(3, 255, 255, 255); // Arm4 = WHITE
+  lanesShowAll();
+
+  server.send(200, "application/json", "{\"lanediag\":\"shown\"}");
+}
+
 
 /* -------------------- Parallel helpers (unchanged behavior) -------------------- */
 static void configureParallelPins() {
@@ -830,13 +884,14 @@ static void blackoutAll(){
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (arm >= MAX_ARMS) return;
 
+  // === Parallel fallback (unchanged) ===
   if (g_outputMode == OUT_PARALLEL) {
     if (arm == 0) {
       configureParallelPins();
       sk9822_tx_parallel_spoke(spokeIdx);
       const uint8_t arms = activeArmCount();
       const uint16_t sct = spokesCount();
-      for (uint8_t a=0; a<arms; ++a) {
+      for (uint8_t a = 0; a < arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
         g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
@@ -846,48 +901,87 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
     return;
   }
 
-  // === SPI (two-lane) path ===
+  // === SPI (two-lane) path — FIXED indexing ===
   const uint16_t spokes = spokesCount();
-  if (!spokes || !g_frameValid || !g_frameBuf || g_fh.channelCount == 0) {
+  const uint8_t  arms   = activeArmCount();
+  const uint16_t pixelCount = armPixelCount();
+
+  if (!g_frameValid || !g_frameBuf || g_fh.channelCount == 0 || arms == 0 || pixelCount == 0) {
     blankArm(arm);
     return;
   }
 
-  spokeIdx %= spokes;
+  // Many spinner FSEQ exports store ONE spoke per frame:
+  //   channelCount == arms * pixelsPerArm * 3
+  const uint32_t expectedPerSpoke = (uint32_t)arms * (uint32_t)pixelCount * 3u;
+  const bool perSpokeFrame = (g_fh.channelCount == expectedPerSpoke);
+
+  // Channels that belong to ONE spoke inside this frame
+  uint32_t chPerSpoke = expectedPerSpoke;
+  if (!perSpokeFrame) {
+    if (spokes > 0 && (g_fh.channelCount % spokes) == 0) {
+      chPerSpoke = g_fh.channelCount / spokes;
+    }
+  }
+
+  // Base (R) channel for THIS arm, pixel 0 (1-based → 0-based)
+  uint32_t baseChAbsR = 0;
+  if (g_usePerArmStart) {
+    baseChAbsR = (g_startChArm[arm] ? g_startChArm[arm]-1 : 0);
+  } else {
+    const uint32_t base = (g_startChArm1 ? g_startChArm1-1 : 0);
+    const uint32_t armBlockStride2 = (uint32_t)pixelCount * 3u;
+    baseChAbsR = (g_strideMode == STRIDE_SPOKE)
+      ? (base + (uint32_t)arm * armBlockStride2)
+      : (base + (uint32_t)arm * 3u);
+  }
+
+  // If a frame carries multiple spokes, add the spoke slice offset
+  if (!perSpokeFrame) {
+    const uint16_t s = (spokes ? spokes : 1);
+    baseChAbsR += ((uint32_t)(spokeIdx % s)) * chPerSpoke;
+  }
+
+  // Within a spoke, choose addressing pattern:
+  //  - STRIDE_SPOKE: [Arm1 block][Arm2 block]...[ArmN block] (each block = pixelsPerArm*3)
+  //  - STRIDE_LED:   LED-interleaved per pixel: [(A1 RGB)(A2 RGB)...(AN RGB)] then next pixel
+  const uint32_t armBlockStride   = (uint32_t)pixelCount * 3u; // bytes per arm within a spoke
+  const uint32_t ledInterleaved3A = (uint32_t)arms * 3u;       // bytes to next LED group when interleaved
+
+  if (spokes) spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
-  const uint16_t pixelCount   = armPixelCount();
-  const uint32_t fallbackPixels = pixelCount;
-  const uint32_t chPerSpoke =
-      (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
-  const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
-  const uint32_t baseChAbsR  = startChBase + (uint32_t)spokeIdx * chPerSpoke;
+  for (uint16_t i = 0; i < pixelCount; ++i) {
+    uint32_t ofs;
+    if (g_strideMode == STRIDE_SPOKE) {
+      ofs = (g_usePerArmStart ? 0u : (uint32_t)arm * armBlockStride) + (uint32_t)i * 3u;
+    } else { // STRIDE_LED
+      const uint32_t ledInterleaved3A2 = (uint32_t)arms * 3u;
+      ofs = (uint32_t)i * ledInterleaved3A2 + (g_usePerArmStart ? 0u : (uint32_t)arm * 3u);
+    }
 
-  // *** FIX: add per-arm channel offset inside each spoke ***
-  const uint32_t armOffset = (g_strideMode == STRIDE_SPOKE)
-      ? ((uint32_t)arm * (uint32_t)pixelCount * 3UL)  // [Arm1 block][Arm2 block][Arm3 block][Arm4 block]
-      : ((uint32_t)arm * 3UL);                        // LED-stride: per-LED groups are [A1 RGB][A2 RGB][A3 RGB][A4 RGB]
-
-  for (uint16_t i=0; i<pixelCount; ++i){
-    const uint32_t absR = baseChAbsR + armOffset + (uint32_t)i * blockStride;
+    const uint32_t absR = baseChAbsR + ofs;
     const int64_t  idxR = sparseTranslate(absR);
+
     uint8_t R=0,G=0,B=0;
-    if (idxR >= 0 && (idxR+2) < (int64_t)g_fh.channelCount) mapChannels(&g_frameBuf[idxR], R,G,B);
-    // brightness scaling (global)
+    if (idxR >= 0 && (idxR + 2) < (int64_t)g_fh.channelCount) {
+      mapChannels(&g_frameBuf[idxR], R, G, B);
+    }
+
     if (g_brightness < 255) {
       R = (uint8_t)((uint16_t)R * g_brightness / 255);
       G = (uint8_t)((uint16_t)G * g_brightness / 255);
       B = (uint8_t)((uint16_t)B * g_brightness / 255);
     }
-    armSetPixel(arm, i, R,G,B);
+    armSetPixel(arm, i, R, G, B);
   }
-  armShow(arm);
 
+  armShow(arm);
   g_armState[arm].lit = true;
   g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
+
 
 static void processArmBlanking(uint32_t nowUs){
   const uint8_t arms = activeArmCount();
@@ -1068,6 +1162,11 @@ static void handleStatus(){
   json += ",\"rpmEdge\":" + String((unsigned)g_hallEdgeMode);
   json += ",\"period_us\":" + String(g_lastPeriodUs);
   json += ",\"outmode\":\""; json += (g_outputMode==OUT_PARALLEL?"parallel":"spi"); json += "\"";
+  json += ",\"map\":{\"usePerArm\":" + String(g_usePerArmStart ? "true":"false") +
+          ",\"start\":" + String(g_startChArm1) +
+          ",\"start2\":" + String(g_startChArm[1]) +
+          ",\"start3\":" + String(g_startChArm[2]) +
+          ",\"start4\":" + String(g_startChArm[3]) + "}";
   json += "}";
   server.send(200,"application/json",json);
 }
@@ -1318,10 +1417,20 @@ static void handleMapCfg(){
       needRebuild = true;
     }
   }
-  if (server.hasArg("stride")) {
-    String s = server.arg("stride"); s.toLowerCase();
-    g_strideMode = (s == "led") ? STRIDE_LED : STRIDE_SPOKE;
-    prefs.putUChar("stride", (uint8_t)g_strideMode);
+  if (server.hasArg("useperarm")) {
+    g_usePerArmStart = parseBoolArg(server.arg("useperarm"));
+    prefs.putBool("usepa", g_usePerArmStart);
+  }
+  if (!g_usePerArmStart) {
+  computeDefaultArmStarts(g_startChArm1);
+}
+
+  bool perArmChanged = false;
+  if (server.hasArg("start2")) { uint32_t v=strtoul(server.arg("start2").c_str(),nullptr,10); g_startChArm[1]=v; prefs.putULong("start2",v); perArmChanged=true; }
+  if (server.hasArg("start3")) { uint32_t v=strtoul(server.arg("start3").c_str(),nullptr,10); g_startChArm[2]=v; prefs.putULong("start3",v); perArmChanged=true; }
+  if (server.hasArg("start4")) { uint32_t v=strtoul(server.arg("start4").c_str(),nullptr,10); g_startChArm[3]=v; prefs.putULong("start4",v); perArmChanged=true; }
+  if (!g_usePerArmStart && (server.hasArg("start") || server.hasArg("stride") || perArmChanged)) {
+    computeDefaultArmStarts(g_startChArm1);
   }
 
   if (needRebuild) rebuildStrips();
@@ -1488,6 +1597,66 @@ static void handleCBlocks(){
   }
   if (g_compCount>show) s+=",{\"more\":" + String(g_compCount-show) + "}";
   s+="]}";
+  server.send(200,"application/json",s);
+}
+
+static void handleDiagMap() {
+  if (!g_frameValid || !g_frameBuf) { server.send(409,"application/json","{\"error\":\"no frame\"}"); return; }
+  uint8_t arm = server.hasArg("arm") ? (uint8_t)constrain(server.arg("arm").toInt()-1,0,(int)activeArmCount()-1) : 0;
+long _pixReq   = server.hasArg("pix")   ? server.arg("pix").toInt()   : 0L;
+long _spokeReq = server.hasArg("spoke") ? server.arg("spoke").toInt() : (long)currentSpokeIndex();
+
+uint16_t pix   = (uint16_t)std::max<long>(0L, _pixReq);
+uint16_t spoke = (uint16_t)std::max<long>(0L, _spokeReq);
+
+
+  const uint8_t arms = activeArmCount();
+  const uint16_t pixelCount = armPixelCount();
+  const uint16_t spokes = spokesCount();
+  const uint32_t expectedPerSpoke = (uint32_t)arms * (uint32_t)pixelCount * 3u;
+  const bool perSpokeFrame = (g_fh.channelCount == expectedPerSpoke);
+
+  uint32_t chPerSpoke = expectedPerSpoke;
+  if (!perSpokeFrame && spokes>0 && (g_fh.channelCount % spokes)==0) chPerSpoke = g_fh.channelCount / spokes;
+
+  uint32_t base = 0;
+  if (g_usePerArmStart) base = (g_startChArm[arm] ? g_startChArm[arm]-1 : 0);
+  else {
+    const uint32_t armBlockStride = (uint32_t)pixelCount*3u;
+    base = (g_startChArm1 ? g_startChArm1-1 : 0) + (g_strideMode==STRIDE_SPOKE ? (uint32_t)arm*armBlockStride : (uint32_t)arm*3u);
+  }
+  if (!perSpokeFrame) base += ((uint32_t)(spoke % (spokes?spokes:1))) * chPerSpoke;
+
+  uint32_t ofs = (g_strideMode==STRIDE_SPOKE) ? (uint32_t)pix*3u : (uint32_t)pix*(uint32_t)arms*3u;
+  uint32_t absR = base + ofs;
+
+  int64_t idxR = sparseTranslate(absR);
+  uint8_t R=0,G=0,B=0;
+  if (idxR>=0 && (idxR+2)<(int64_t)g_fh.channelCount) mapChannels(&g_frameBuf[idxR], R,G,B);
+
+  String j = "{";
+  j += "\"arm\":" + String((int)arm+1)
+     + ",\"pix\":" + String(pix)
+     + ",\"spoke\":" + String(spoke)
+     + ",\"perSpokeFrame\":" + String(perSpokeFrame?"true":"false")
+     + ",\"chPerSpoke\":" + String(chPerSpoke)
+     + ",\"absR\":" + String(absR)
+     + ",\"idxR\":" + String((long)idxR)
+     + ",\"rgb\":[" + String(R) + "," + String(G) + "," + String(B) + "]"
+     + "}";
+  server.send(200,"application/json",j);
+}
+
+static void handleFseqRanges() {
+  String s = "{\"sparse\":" + String((int)g_fh.sparseCnt) + ",\"ranges\":[";
+  for (uint8_t i=0;i<g_fh.sparseCnt && i<24;i++) {
+    if (i) s += ",";
+    s += "{\"i\":" + String(i)
+       +  ",\"start\":" + String(g_ranges[i].start)
+       +  ",\"count\":" + String(g_ranges[i].count)
+       +  ",\"accum\":" + String(g_ranges[i].accum) + "}";
+  }
+  s += "]}";
   server.send(200,"application/json",s);
 }
 
@@ -1678,6 +1847,10 @@ static void startWifiAP(){
   server.on("/autoplay",HTTP_POST, handleAutoplay);
   server.on("/watchdog",HTTP_POST, handleWatchdog);
   server.on("/bgeffect",HTTP_POST, handleBgEffect);
+  
+//SPI Lane Diag
+  server.on("/lanediag", HTTP_POST, handleLaneDiag);
+
 
   // Strobe + per-arm phase
   server.on("/strobe",   HTTP_POST, handleStrobe);
@@ -1690,6 +1863,8 @@ static void startWifiAP(){
   server.on("/outmode", HTTP_POST, handleOutMode);
 
   // Diagnostics
+  server.on("/diag/map",    HTTP_GET,  handleDiagMap);
+  server.on("/fseq/ranges", HTTP_GET,  handleFseqRanges);
   server.on("/fseq/header", HTTP_GET,  handleFseqHeader);
   server.on("/fseq/cblocks",HTTP_GET,  handleCBlocks);
   server.on("/sd/reinit",   HTTP_POST, handleSdReinit);
@@ -1779,7 +1954,19 @@ void setup(){
     g_bgEffectPath = sanitizeBgEffectPath(storedBg);
     if (storedBg.length() && !g_bgEffectPath.length()) prefs.putString("bge_path", g_bgEffectPath);
   }
-  g_bgEffectNextAttemptMs = millis();
+  // Per-arm mapping prefs
+  g_usePerArmStart = prefs.getBool("usepa", false);
+  g_startChArm[0]  = g_startChArm1;
+  g_startChArm[1]  = prefs.getULong("start2", 0);
+  g_startChArm[2]  = prefs.getULong("start3", 0);
+  g_startChArm[3]  = prefs.getULong("start4", 0);
+  if (!g_usePerArmStart) {
+    computeDefaultArmStarts(g_startChArm1);
+  } else {
+    for (uint8_t a=0; a<activeArmCount(); ++a) {
+      if (g_startChArm[a]==0) { computeDefaultArmStarts(g_startChArm1); break; }
+    }
+  }
 
   // RPM prefs & ISR
   g_pulsesPerRev = prefs.getUChar("ppr", PULSES_PER_REV);
