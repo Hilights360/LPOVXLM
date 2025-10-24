@@ -803,6 +803,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   // === SPI (two-lane) path ===
   const uint16_t spokes = spokesCount();
+  const uint8_t  arms   = activeArmCount();
   if (!spokes || !g_frameValid || !g_frameBuf || g_fh.channelCount == 0) {
     blankArm(arm);
     return;
@@ -811,7 +812,9 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
+  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE)
+      ? 3UL
+      : ((arms > 0) ? (uint32_t)arms * 3UL : 3UL);
   const uint16_t pixelCount   = armPixelCount();
   const uint32_t fallbackPixels = pixelCount;
   const uint32_t chPerSpoke =
