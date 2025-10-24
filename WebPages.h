@@ -65,4 +65,11 @@ String rootPage(const String &statusClass,
 // Pass canReboot=true to enable the Reboot button (e.g., after successful upload)
 String updatesPage(bool canReboot);
 
+String directOtaPage();
+String uploadRejectedPage(const String &backUrl);
+String uploadFailurePage(const String &backUrl);
+String uploadSuccessPage(const String &backUrl,
+                         const String &filename,
+                         size_t bytesWritten);
+
 }  // namespace WebPages

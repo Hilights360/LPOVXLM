@@ -16,6 +16,11 @@
 //   * Per-arm drawing now routes pixels into lane segments with per-arm reverse support.
 //   * If you need different two reused ports, change LANE_CLK[] / LANE_DATA[] below.
 //   * OUT_SPI remains the default. Parallel mode left available but not used in this wiring.
+//
+// === Linkage fixes ===
+//  - g_brightness is now global (not static) so SD_Functions.cpp can link to it.
+//  - feedWatchdog() and openFseq(...) now have external linkage (not static).
+//  - ensureBgEffectsDirLocked() is defined here with external linkage so setup() links.
 
 #include "ConfigTypes.h"
 #include <Arduino.h>
@@ -37,6 +42,7 @@
 #include "WebPages.h"
 #include "HtmlUtils.h"
 #include "WifiManager.h"
+#include "SD_Functions.h"
 
 // ---------- Optional zlib backends (auto-detect) ----------
 #if defined(__has_include)
@@ -51,20 +57,12 @@
 // ---------- FreeRTOS mutex for SD serialization ----------
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-static SemaphoreHandle_t g_sdMutex = nullptr;
-static inline bool SD_LOCK(TickType_t to = portMAX_DELAY) {
-  return g_sdMutex && xSemaphoreTake(g_sdMutex, to) == pdTRUE;
-}
-static inline void SD_UNLOCK() { if (g_sdMutex) xSemaphoreGive(g_sdMutex); }
 
 // ---------- SK9822 / APA102 ----------
-static const uint8_t  MAX_ARMS               = 4;
-static const uint16_t DEFAULT_PIXELS_PER_ARM = 144;
-static const uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
 // ---------- NEW: Output mode (SPI vs Parallel-GPIO) ----------
 enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
-static uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
+uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
 
 // Parallel-GPIO driver state (kept for compatibility, not used in this wiring)
 #include "soc/gpio_struct.h"
@@ -166,7 +164,8 @@ extern uint16_t g_pixelsPerArm;
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
 // Brightness (0..255 computed from percent)
-static uint8_t g_brightness = 63;
+// was: static uint8_t g_brightness = 63;
+uint8_t g_brightness = 63;
 
 // Helpers for per-arm pixel routing into lanes
 static inline uint16_t armPixelCount() { return (g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM); }
@@ -246,24 +245,8 @@ static void applyWatchdogSetting() {
     Serial.println("[WDT] Disabled");
   }
 }
-static inline void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
-
-// ---------- SD-MMC pins ----------
-static const int PIN_SD_CLK = 10;
-static const int PIN_SD_CMD = 9;
-static const int PIN_SD_D0  = 8;
-static const int PIN_SD_D1  = 13;
-static const int PIN_SD_D2  = 12;
-static const int PIN_SD_D3  = 11;
-static const int PIN_SD_CD  = 14;  // LOW = inserted
-
-// SD dynamic timing & fail tracking
-static SdBusPreference g_sdPreferredBusWidth = SD_BUS_AUTO;
-static const uint32_t SD_FREQ_OPTIONS[] = { 8000, 4000, 2000, 1000, 400 };
-static const size_t   SD_FREQ_OPTION_COUNT = sizeof(SD_FREQ_OPTIONS) / sizeof(SD_FREQ_OPTIONS[0]);
-static uint32_t g_sdBaseFreqKHz = 8000;
-static uint32_t g_sdFreqKHz     = 8000;
-static int      g_sdFailStreak  = 0;
+// was: static inline void feedWatchdog() { ... }
+void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
 
 // Persistent scratch for zlib frames
 static uint8_t* s_ctmp = nullptr;
@@ -278,15 +261,10 @@ static const int SPOKES = 40;
 static const char* AP_SSID  = "POV-Spinner";
 static const char* AP_PASS  = "POV123456";
 static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
-static const char* SETTINGS_DIR  = "/config";
-static const char* SETTINGS_FILE = "/config/settings.ini";
-static const char* OTA_FILE      = "/firmware.bin";
-static const char* OTA_FAIL_FILE = "/firmware.failed";
-
 WebServer server(80);
 
-static bool   g_sdReady             = false;
-static uint8_t g_sdBusWidth         = 0;    // 0=not mounted, 1=1-bit, 4=4-bit
+//static bool   g_sdReady             = false;
+//static uint8_t g_sdBusWidth         = 0;    // 0=not mounted, 1=1-bit, 4=4-bit
 String        g_staSsid;
 String        g_staPass;
 String        g_stationId;
@@ -312,7 +290,7 @@ uint8_t  g_armCount      = MAX_ARMS;
 uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
 static uint16_t g_lastPulseSpoke[MAX_ARMS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 
-enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
+//enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;
 
 // Rotary index (0..spokes-1)
@@ -404,11 +382,17 @@ static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
 static void setDefaultArmPhases() {
   const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
   bool allZero = true;
-  for (uint8_t a=0; a<arms; ++a) if (fabsf(g_armPhaseDeg[a]) > 1e-3f) { allZero=false; break; }
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (fabsf(g_armPhaseDeg[a]) > 1e-3f) { allZero = false; break; }
+  }
   if (!allZero) return;
+
   const float sep = 360.0f / (float)arms;
-  for (uint8_t a=0; a<arms; ++a) g_armPhaseDeg[a] = a * sep;
+  for (uint8_t a = 0; a < arms; ++a) {
+    g_armPhaseDeg[a] = a * sep;
+  }
 }
+
 
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
@@ -453,14 +437,6 @@ static void updateHallSensor() {
 }
 
 /* -------------------- Web handlers (decls) -------------------- */
-static void handleFiles();
-static void handleDownload();
-static void handlePlayLink();
-static void handleDelete();
-static void handleMkdir();
-static void handleRename();
-static void handleUploadData();
-static void handleUploadDone();
 static void handleStatus();
 static void handleRoot();
 static void handleB();
@@ -473,24 +449,16 @@ static void handleMapCfg();
 static void handleWifiCfg();
 static void handleFseqHeader();
 static void handleCBlocks();
-static void handleSdReinit();
-static void handleSdConfig();
 static void handleAutoplay();
 static void handleWatchdog();
 static void handleBgEffect();
 static void handleStrobe();
 static void handleArmPhase();
 static void handleRpmCfg();
-static void handleUpdatesPage();
 static void handleReboot();
-static void handleOtaPage();
-static void handleOtaData();
-static void handleOtaFinish();
-static void handleFwUploadData();
-static void handleFwUploadDone();
 static void handleOutMode(); // declared here; implemented later with setOutputMode()
 
-static bool otaAuthOK() { return true; } // stub (add auth if desired)
+static bool otaAuthOK() { return true; } // stub (shared with SD module)
 
 /* -------------------- FSEQ v2 reader -------------------- */
 struct SparseRange { uint32_t start, count, accum; };
@@ -520,327 +488,27 @@ uint64_t     g_compBase    = 0;
 bool         g_compPerFrame= false;
 
 /* -------------------- Small helpers -------------------- */
-static inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
-static inline uint8_t  clampArmCount(int32_t v){ if(v<1) return 1; if(v>MAX_ARMS) return MAX_ARMS; return (uint8_t)v; }
-static inline uint16_t clampPixelsPerArm(int32_t v){ if(v<1) return 1; if(v>MAX_PIXELS_PER_ARM) return MAX_PIXELS_PER_ARM; return (uint16_t)v; }
 static inline uint8_t  activeArmCount(){ return (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount); }
-static inline SdBusPreference sanitizeSdMode(uint8_t mode){ if(mode==SD_BUS_1BIT) return SD_BUS_1BIT; if(mode==SD_BUS_4BIT) return SD_BUS_4BIT; return SD_BUS_AUTO; }
-static bool isValidSdFreq(uint32_t freq){ for(size_t i=0;i<SD_FREQ_OPTION_COUNT;++i){ if(SD_FREQ_OPTIONS[i]==freq) return true; } return false; }
-static inline uint32_t sanitizeSdFreq(uint32_t freq){ return isValidSdFreq(freq) ? freq : SD_FREQ_OPTIONS[0]; }
-static uint32_t nextLowerSdFreq(uint32_t freq){
-  for(size_t i=0;i<SD_FREQ_OPTION_COUNT;++i){
-    if (SD_FREQ_OPTIONS[i]==freq){
-      if (i+1 < SD_FREQ_OPTION_COUNT) return SD_FREQ_OPTIONS[i+1];
-      return SD_FREQ_OPTIONS[i];
-    }
-  }
-  return SD_FREQ_OPTIONS[SD_FREQ_OPTION_COUNT-1];
-}
 
-/* -------------------- Settings (SD) -------------------- */
-static bool ensureSettingsDirLocked() {
-  if (!SD_MMC.exists(SETTINGS_DIR)) {
-    if (!SD_MMC.mkdir(SETTINGS_DIR)) {
-      Serial.println("[CFG] Failed to create settings directory");
-      return false;
-    }
-  }
+// --- Binary read helpers (little-endian) ---
+static inline bool readU16(File &f, uint16_t &out) {
+  uint8_t b[2]; if (f.read(b,2)!=2) return false;
+  out = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
   return true;
 }
-static bool ensureBgEffectsDirLocked() {
-  if (!SD_MMC.exists(BG_EFFECTS_DIR)) {
-    if (!SD_MMC.mkdir(BG_EFFECTS_DIR)) {
-      Serial.println("[CFG] Failed to create BGEffects directory");
-      return false;
-    }
-  }
+static inline bool readU32(File &f, uint32_t &out) {
+  uint8_t b[4]; if (f.read(b,4)!=4) return false;
+  out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
   return true;
 }
-static bool saveSettingsBackupLocked() {
-  if (!ensureSettingsDirLocked()) return false;
-  SD_MMC.remove(SETTINGS_FILE);
-  File f = SD_MMC.open(SETTINGS_FILE, FILE_WRITE);
-  if (!f) { Serial.println("[CFG] Failed to open settings file for write"); return false; }
-  f.print("version=1\n");
-  f.print("brightness="); f.println((unsigned int)g_brightnessPercent);
-  f.print("fps=");        f.println((unsigned int)g_fps);
-  f.print("startch=");    f.println((unsigned long)g_startChArm1);
-  f.print("spokes=");     f.println((unsigned int)g_spokesTotal);
-  f.print("arms=");       f.println((unsigned int)g_armCount);
-  f.print("pixels=");     f.println((unsigned int)g_pixelsPerArm);
-  f.print("stride=");     f.println((unsigned int)g_strideMode);
-  f.print("ssid=");       f.println(g_staSsid);
-  f.print("pass=");       f.println(g_staPass);
-  f.print("station=");    f.println(g_stationId);
-  f.print("sdmode=");     f.println((unsigned int)g_sdPreferredBusWidth);
-  f.print("sdfreq=");     f.println((unsigned long)g_sdBaseFreqKHz);
-  f.print("autoplay=");   f.println(g_autoplayEnabled ? 1 : 0);
-  f.print("watchdog=");   f.println(g_watchdogEnabled ? 1 : 0);
-  f.print("bge_enable="); f.println(g_bgEffectEnabled ? 1 : 0);
-  f.print("bge_path=");   f.println(g_bgEffectPath);
-  f.print("outmode=");    f.println((unsigned int)g_outputMode);
-  f.close();
+static inline bool readU64(File &f, uint64_t &out) {
+  uint8_t b[8]; if (f.read(b,8)!=8) return false;
+  out =  ((uint64_t)b[0])        | ((uint64_t)b[1] << 8)  | ((uint64_t)b[2] << 16) | ((uint64_t)b[3] << 24)
+       | ((uint64_t)b[4] << 32)  | ((uint64_t)b[5] << 40) | ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
   return true;
 }
 
-static bool loadSettingsBackupLocked(SettingsData& out) {
-  File f = SD_MMC.open(SETTINGS_FILE, FILE_READ);
-  if (!f) return false;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.replace("\r", "");
-    if (!line.length()) continue;
-    int eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    String key = line.substring(0, eq);
-    String value = line.substring(eq + 1);
-    if (key == "brightness") { out.hasBrightness = true; out.brightness = (uint8_t)clampU32(value.toInt(),0,100); }
-    else if (key == "fps")   { out.hasFps = true; out.fps = (uint16_t)clampU32(value.toInt(),1,120); }
-    else if (key == "startch") { out.hasStartCh = true; out.startCh = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
-    else if (key == "spokes") { out.hasSpokes = true; out.spokes = (uint16_t)clampU32(value.toInt(),1,65535); }
-    else if (key == "arms")   { out.hasArms = true; out.arms = clampArmCount(value.toInt()); }
-    else if (key == "pixels") { out.hasPixels = true; out.pixels = clampPixelsPerArm(value.toInt()); }
-    else if (key == "stride") { out.hasStride = true; out.stride = (uint8_t)clampU32(value.toInt(),0,1); }
-    else if (key == "ssid")   { out.hasStaSsid = true; out.staSsid = value; }
-    else if (key == "pass")   { out.hasStaPass = true; out.staPass = value; }
-    else if (key == "station") { out.hasStation = true; out.stationId = value; }
-    else if (key == "sdmode") { out.hasSdMode = true; out.sdMode = (uint8_t)clampU32(value.toInt(),0,4); }
-    else if (key == "sdfreq") { out.hasSdFreq = true; out.sdFreq = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
-    else if (key == "autoplay") { out.hasAutoplay = true; out.autoplay = (value.toInt() != 0); }
-    else if (key == "watchdog") { out.hasWatchdog = true; out.watchdog = (value.toInt() != 0); }
-    else if (key == "bge_enable") { out.hasBgEffectEnable = true; out.bgEffectEnable = (value.toInt() != 0); }
-    else if (key == "bge_path") { out.hasBgEffectPath = true; out.bgEffectPath = value; }
-    else if (key == "outmode") { out.hasOutMode = true; out.outMode = (uint8_t)clampU32(value.toInt(),0,1); }
-  }
-  f.close();
-  return true;
-}
-
-static void persistSettingsToSd() {
-  if (!g_sdReady || !g_sdMutex) return;
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
-  bool ok = saveSettingsBackupLocked();
-  SD_UNLOCK();
-  if (!ok) Serial.println("[CFG] Failed to persist settings to SD");
-}
-
-static void ensureSettingsFromBackup(const PrefPresence& present) {
-  if (!g_sdReady || !g_sdMutex) return;
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
-  SettingsData data;
-  bool ok = loadSettingsBackupLocked(data);
-  SD_UNLOCK();
-  if (!ok) return;
-
-  if (!present.brightness && data.hasBrightness) {
-    g_brightnessPercent = clampU32(data.brightness,0,100);
-    g_brightness        = (uint8_t)((255 * g_brightnessPercent) / 100);
-    prefs.putUChar("brightness", g_brightnessPercent);
-  }
-  if (!present.fps && data.hasFps) {
-    g_fps = data.fps ? data.fps : 40;
-    prefs.putUShort("fps", g_fps);
-  }
-  if (!present.startCh && data.hasStartCh) {
-    g_startChArm1 = data.startCh ? data.startCh : 1;
-    prefs.putULong("startch", g_startChArm1);
-  }
-  if (!present.spokes && data.hasSpokes) {
-    g_spokesTotal = data.spokes ? data.spokes : 1;
-    prefs.putUShort("spokes", g_spokesTotal);
-  }
-  if (!present.arms && data.hasArms) {
-    g_armCount = clampArmCount(data.arms);
-    prefs.putUChar("arms", g_armCount);
-  }
-  if (!present.pixels && data.hasPixels) {
-    g_pixelsPerArm = clampPixelsPerArm(data.pixels);
-    prefs.putUShort("pixels", g_pixelsPerArm);
-  }
-  if (!present.stride && data.hasStride) {
-    g_strideMode = (StrideMode)((data.stride==0)?STRIDE_SPOKE:STRIDE_LED);
-    prefs.putUChar("stride", (uint8_t)g_strideMode);
-  }
-  if ((!present.staSsid || !g_staSsid.length()) && data.hasStaSsid) {
-    g_staSsid = data.staSsid;
-    prefs.putString("sta_ssid", g_staSsid);
-  }
-  if ((!present.staPass || !g_staPass.length()) && data.hasStaPass) {
-    g_staPass = data.staPass;
-    prefs.putString("sta_pass", g_staPass);
-  }
-  if ((!present.station || !g_stationId.length()) && data.hasStation) {
-    g_stationId = data.stationId;
-    prefs.putString("station", g_stationId);
-  }
-  if (!present.autoplay && data.hasAutoplay) {
-    g_autoplayEnabled = data.autoplay;
-    prefs.putBool("autoplay", g_autoplayEnabled);
-  }
-  if (!present.watchdog && data.hasWatchdog) {
-    g_watchdogEnabled = data.watchdog;
-    prefs.putBool("watchdog", g_watchdogEnabled);
-  }
-  if (!present.bgEffectEnable && data.hasBgEffectEnable) {
-    g_bgEffectEnabled = data.bgEffectEnable;
-    prefs.putBool("bge_enable", g_bgEffectEnabled);
-  }
-  if (!present.bgEffectPath && data.hasBgEffectPath) {
-    g_bgEffectPath = sanitizeBgEffectPath(data.bgEffectPath);
-    prefs.putString("bge_path", g_bgEffectPath);
-    g_bgEffectNextAttemptMs = millis();
-  }
-  if (!present.sdMode && data.hasSdFreq) {
-    g_sdPreferredBusWidth = sanitizeSdMode(data.sdMode);
-    prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth);
-  }
-  if (!present.sdFreq && data.hasSdFreq) {
-    g_sdBaseFreqKHz = sanitizeSdFreq(data.sdFreq);
-    g_sdFreqKHz = g_sdBaseFreqKHz;
-    prefs.putUInt("sdfreq", g_sdBaseFreqKHz);
-  }
-  if (!present.outMode && data.hasOutMode) {
-    g_outputMode = (data.outMode==OUT_PARALLEL)?OUT_PARALLEL:OUT_SPI;
-    prefs.putUChar("outmode", g_outputMode);
-  }
-}
-
-static void checkSdFirmwareUpdate() {
-  if (!g_sdReady || !g_sdMutex) return;
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
-  File f = SD_MMC.open(OTA_FILE, FILE_READ);
-  if (!f) { SD_UNLOCK(); return; }
-  size_t size = f.size();
-  if (!size) {
-    f.close();
-    SD_MMC.remove(OTA_FILE);
-    SD_UNLOCK();
-    Serial.println("[OTA] Empty firmware.bin removed");
-    return;
-  }
-  Serial.printf("[OTA] Found %s (%u bytes)\n", OTA_FILE, (unsigned)size);
-  if (!Update.begin(size)) {
-    Serial.printf("[OTA] Update begin failed: %s\n", Update.errorString());
-    f.close();
-    SD_MMC.remove(OTA_FAIL_FILE);
-    SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
-    SD_UNLOCK();
-    return;
-  }
-  uint8_t buf[4096];
-  while (f.available()) {
-    size_t rd = f.read(buf, sizeof(buf));
-    if (!rd) break;
-    if (Update.write(buf, rd) != rd) {
-      Serial.printf("[OTA] Write failed: %s\n", Update.errorString());
-      Update.end();
-      f.close();
-      SD_MMC.remove(OTA_FAIL_FILE);
-      SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
-      SD_UNLOCK();
-      return;
-    }
-    feedWatchdog();
-  }
-  f.close();
-  if (!Update.end()) {
-    Serial.printf("[OTA] Update end failed: %s\n", Update.errorString());
-    SD_MMC.remove(OTA_FAIL_FILE);
-    SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
-    SD_UNLOCK();
-    return;
-  }
-  if (!Update.isFinished()) {
-    Serial.println("[OTA] Update incomplete");
-    SD_MMC.remove(OTA_FAIL_FILE);
-    SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
-    SD_UNLOCK();
-    return;
-  }
-  Serial.println("[OTA] Update successful, rebooting...");
-  SD_MMC.remove(OTA_FILE);
-  SD_UNLOCK();
-  delay(200);
-  ESP.restart();
-}
-
-/* -------------------- SD helpers -------------------- */
-static bool cardPresent(){ pinMode(PIN_SD_CD, INPUT_PULLUP); return digitalRead(PIN_SD_CD)==LOW; }
-static void sd_preflight() {
-  pinMode(PIN_SD_CMD, INPUT_PULLUP);
-  pinMode(PIN_SD_D0,  INPUT_PULLUP);
-  pinMode(PIN_SD_D1,  INPUT_PULLUP);
-  pinMode(PIN_SD_D2,  INPUT_PULLUP);
-  pinMode(PIN_SD_D3,  INPUT_PULLUP);
-  delay(2);
-  Serial.printf("[SD] Preflight CMD@%d=%d  D0@%d=%d  D1@%d=%d  D2@%d=%d  D3@%d=%d (expect 1s)\n",
-                PIN_SD_CMD, digitalRead(PIN_SD_CMD),
-                PIN_SD_D0,  digitalRead(PIN_SD_D0),
-                PIN_SD_D1,  digitalRead(PIN_SD_D1),
-                PIN_SD_D2,  digitalRead(PIN_SD_D2),
-                PIN_SD_D3,  digitalRead(PIN_SD_D3));
-}
-static bool mountSdmmc(){
-  if (!SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] mount lock timeout"); return false; }
-  g_sdFreqKHz = sanitizeSdFreq(g_sdFreqKHz);
-  g_sdBaseFreqKHz = sanitizeSdFreq(g_sdBaseFreqKHz);
-
-  uint8_t attempts[2] = { 4, 1 };
-  size_t attemptCount = 0;
-  if (g_sdPreferredBusWidth == SD_BUS_AUTO) { attempts[0] = 4; attempts[1] = 1; attemptCount = 2; }
-  else if (g_sdPreferredBusWidth == SD_BUS_4BIT) { attempts[0] = 4; attemptCount = 1; }
-  else { attempts[0] = 1; attemptCount = 1; }
-
-  bool ok = false;
-  sd_preflight();
-  g_sdBusWidth = 0;
-
-  for (size_t i=0; i<attemptCount; ++i) {
-    feedWatchdog();
-    uint8_t mode = attempts[i];
-    if (i > 0) { SD_MMC.end(); delay(2); }
-    if (mode == 4) {
-      SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, PIN_SD_D1, PIN_SD_D2, PIN_SD_D3);
-      ok = SD_MMC.begin("/sdcard", false /*4-bit*/, false /*no-format*/, g_sdFreqKHz);
-    } else {
-      SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1);
-      ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, g_sdFreqKHz);
-    }
-    Serial.printf("[SD] Mounted (%ubit request=%u) @ %lu kHz: %s\n",
-                  (unsigned)mode, (unsigned)g_sdPreferredBusWidth,
-                  (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
-    if (ok) { g_sdBusWidth = mode; break; }
-  }
-  SD_UNLOCK();
-  g_sdReady = ok;
-  return ok;
-}
-
-/* -------------------- Endianness readers -------------------- */
-static bool readU16(File& f, uint16_t& v){ uint8_t b[2]; if(f.read(b,2)!=2) return false; v=(uint16_t)(b[0]|(b[1]<<8)); return true; }
-static bool readU32(File& f, uint32_t& v){ uint8_t b[4]; if(f.read(b,4)!=4) return false; v=(uint32_t)(b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24)); return true; }
-static bool readU64(File& f, uint64_t& v){ uint8_t b[8]; if(f.read(b,8)!=8) return false;
-  v=(uint64_t)b[0]|((uint64_t)b[1]<<8)|((uint64_t)b[2]<<16)|((uint64_t)b[3]<<24)|
-    ((uint64_t)b[4]<<32)|((uint64_t)b[5]<<40)|((uint64_t)b[6]<<48)|((uint64_t)b[7]<<56);
-  return true;
-}
-
-/* -------------------- zlib inflate wrapper -------------------- */
-static bool zlib_decompress(const uint8_t* in, size_t in_len, uint8_t* out, size_t out_len){
-#if defined(MZ_OK)
-  mz_ulong dst = (mz_ulong)out_len;
-  int rc = mz_uncompress((unsigned char*)out, &dst,
-                         (const unsigned char*)in, (mz_ulong)in_len);
-  return (rc == MZ_OK) && (dst == (mz_ulong)out_len);
-#elif defined(Z_OK)
-  uLongf dst = (uLongf)out_len;
-  int rc = uncompress((Bytef*)out, &dst, (const Bytef*)in, (uLong)in_len);
-  return (rc == Z_OK) && (dst == (uLongf)out_len);
-#else
-  (void)in; (void)in_len; (void)out; (void)out_len; return false;
-#endif
-}
 
 /* -------------------- FSEQ open/close/load -------------------- */
 static void freeFseq(){
@@ -873,7 +541,8 @@ static int64_t sparseTranslate(uint32_t absCh) {
   return -1;
 }
 
-static bool openFseq(const String& path, String& why){
+// was: static bool openFseq(const String& path, String& why)
+bool openFseq(const String& path, String& why){
   freeFseq();
   if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { why="sd busy"; return false; }
   bool ok = false;
@@ -1265,260 +934,6 @@ static void advancePredictedSpokes(uint32_t nowUs){
 
 /* -------------------- Web: Files page + ops -------------------- */
 // (unchanged file handlers – omitted comments to keep size down)
-static void listFseqInDir_locked(const char* path, String& optionsHtml, uint8_t depth = 0) {
-  File dir = SD_MMC.open(path);
-  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
-  File ent;
-  while ((ent = dir.openNextFile())) {
-    String name = ent.name();
-    if (ent.isDirectory()) {
-      if (depth == 0) listFseqInDir_locked(name.c_str(), optionsHtml, depth + 1);
-    } else if (isFseqName(name)) {
-      optionsHtml += "<option value='"; optionsHtml += name; optionsHtml += "'>";
-      optionsHtml += name; optionsHtml += "</option>";
-    }
-    ent.close();
-  }
-  dir.close();
-}
-static void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth = 0) {
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip list"); return; }
-  listFseqInDir_locked(path, optionsHtml, depth);
-  SD_UNLOCK();
-}
-static void listBgEffects_locked(String& optionsHtml, const String& current) {
-  File dir = SD_MMC.open(BG_EFFECTS_DIR);
-  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
-  File ent;
-  while ((ent = dir.openNextFile())) {
-    if (ent.isDirectory()) { ent.close(); continue; }
-    String name = ent.name();
-    if (!isFseqName(name)) { ent.close(); continue; }
-    bool selected = (name == current);
-    String valueEsc = htmlEscape(name);
-    String labelEsc = htmlEscape(bgEffectDisplayName(name));
-    optionsHtml += "<option value='";
-    optionsHtml += valueEsc;
-    optionsHtml += "'";
-    if (selected) optionsHtml += " selected";
-    optionsHtml += ">";
-    optionsHtml += labelEsc;
-    optionsHtml += "</option>";
-    ent.close();
-  }
-  dir.close();
-}
-static void listBgEffects(String& optionsHtml, const String& current) {
-  optionsHtml += "<option value=''";
-  if (!current.length()) optionsHtml += " selected";
-  optionsHtml += ">(none)</option>";
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip bge list"); return; }
-  listBgEffects_locked(optionsHtml, current);
-  SD_UNLOCK();
-}
-static void handleFiles() {
-  String path = server.hasArg("path") ? server.arg("path") : "/";
-  if (!path.length() || path[0] != '/') path = "/" + path;
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
-  File dir = SD_MMC.open(path);
-  if (!dir || !dir.isDirectory()) {
-    if (dir) dir.close(); SD_UNLOCK();
-    server.send(404, "text/plain", "Directory not found");
-    return;
-  }
-
-  String parent = dirnameOf(path);
-  String pathEsc = htmlEscape(path);
-  String parentEnc = urlEncode(parent);
-  String pathEnc = urlEncode(path);
-  String backPlain = String("/files?path=") + path;
-  String backParam = String("/files?path=") + pathEnc;
-  String backEncoded = urlEncode(backPlain);
-
-  String pathAttrEsc = htmlEscape(path);
-  String backAttrEsc = htmlEscape(backPlain);
-  String html = WebPages::filesPageHeader(pathEsc, parentEnc, pathEnc, backEncoded, pathAttrEsc, backAttrEsc);
-
-  File ent;
-  while ((ent = dir.openNextFile())) {
-    String name = ent.name();
-    String esc = htmlEscape(name);
-    String enc = urlEncode(name);
-    if (ent.isDirectory()) {
-      String base = name; int slash = base.lastIndexOf('/'); if (slash >= 0) base = base.substring(slash + 1);
-      String baseEsc = htmlEscape(base);
-      html += WebPages::filesDirectoryRow(esc, enc, esc, baseEsc, backParam);
-    } else {
-      uint64_t sz = ent.size();
-      String base = name; int slash = base.lastIndexOf('/'); if (slash >= 0) base = base.substring(slash + 1);
-      String baseEsc = htmlEscape(base);
-      html += WebPages::filesFileRow(esc, enc, sz, esc, baseEsc, backParam);
-    }
-    ent.close();
-  }
-  dir.close();
-  SD_UNLOCK();
-
-  html += WebPages::filesPageFooter();
-  server.send(200, "text/html; charset=utf-8", html);
-}
-static void handleDownload() {
-  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
-  String path = server.arg("path"); if (!path.startsWith("/")) path = "/" + path;
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { server.send(503,"text/plain","SD busy"); return; }
-  File f = SD_MMC.open(path, FILE_READ);
-  if (!f || f.isDirectory()) { if (f) f.close(); SD_UNLOCK(); server.send(404, "text/plain", "not found"); return; }
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + htmlEscape(path.substring(path.lastIndexOf('/')+1)) + "\"");
-  server.streamFile(f, "application/octet-stream");
-  f.close();
-  SD_UNLOCK();
-}
-static void handlePlayLink() {
-  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
-  String path = server.arg("path");
-  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
-  if (!path.startsWith("/")) path = "/" + path;
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
-  bool ok = SD_MMC.exists(path) && isFseqName(path);
-  SD_UNLOCK();
-  if (!ok) { server.sendHeader("Location", back); server.send(302, "text/plain", "Not a .fseq or missing"); return; }
-
-  String why; openFseq(path, why);
-  server.sendHeader("Location", back);
-  server.send(302, "text/plain", "OK");
-}
-static void handleDelete() {
-  if (!server.hasArg("path")) { server.send(400, "text/plain", "missing path"); return; }
-  String path = server.arg("path");
-  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
-  if (!path.startsWith("/")) path = "/" + path;
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
-  File f = SD_MMC.open(path);
-  bool ok=false;
-  if (f) {
-    if (f.isDirectory()) { f.close(); ok = SD_MMC.rmdir(path); }
-    else { f.close(); ok = SD_MMC.remove(path); }
-  }
-  SD_UNLOCK();
-  server.sendHeader("Location", back);
-  server.send(ok?302:500, "text/plain", ok?"Deleted":"Delete failed");
-}
-static void handleMkdir() {
-  if (!server.hasArg("path") || !server.hasArg("name")) { server.send(400, "text/plain", "args"); return; }
-  String base = server.hasArg("path") ? server.arg("path") : "/";
-  String name = server.arg("name");
-  if (!base.startsWith("/")) base = "/" + base;
-  if (name.indexOf('/')>=0 || !name.length()) { server.send(400, "text/plain", "bad name"); return; }
-  if (!base.endsWith("/")) base += "/";
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
-  bool ok = SD_MMC.mkdir(base + name);
-  SD_UNLOCK();
-
-  server.sendHeader("Location", String("/files?path=") + urlEncode(base.substring(0, base.length()-1)));
-  server.send(ok?302:500, "text/plain", ok?"Created":"Create failed");
-}
-static void handleRename() {
-  if (!server.hasArg("path") || !server.hasArg("to")) { server.send(400, "text/plain", "args"); return; }
-  String p = server.arg("path");
-  String to = server.arg("to");
-  String back = server.hasArg("back") ? server.arg("back") : "/files?path=/";
-  if (!p.startsWith("/")) p = "/" + p;
-  if (to.indexOf('/')>=0 || !to.length()) { server.sendHeader("Location", back); server.send(302, "text/plain", "bad name"); return; }
-
-  String dir = dirnameOf(p);
-  String dst = (dir == "/") ? ("/" + to) : (dir + "/" + to);
-
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.sendHeader("Location", back); server.send(302,"text/plain","SD busy"); return; }
-  bool ok = SD_MMC.rename(p, dst);
-  SD_UNLOCK();
-
-  server.sendHeader("Location", back);
-  server.send(ok?302:500, "text/plain", ok?"Renamed":"Rename failed");
-}
-
-// Upload state for .fseq
-File   g_uploadFile;
-String g_uploadFilename;
-size_t g_uploadBytes = 0;
-
-static void handleUploadData() {
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    g_uploadBytes = 0;
-
-    String dir = server.hasArg("dir") ? server.arg("dir") : "/";
-    if (dir.indexOf("..") >= 0) dir = "/";
-    if (!dir.startsWith("/")) dir = "/" + dir;
-
-    g_uploadFilename = up.filename;
-    if (!g_uploadFilename.length()) g_uploadFilename = "upload.fseq";
-    int slash = g_uploadFilename.lastIndexOf('/'); if (slash >= 0) g_uploadFilename = g_uploadFilename.substring(slash + 1);
-    g_uploadFilename = joinPath(dir, g_uploadFilename);
-
-    if (!isFseqName(g_uploadFilename)) {
-      Serial.printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
-    } else {
-      if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[UPLOAD] SD busy"); return; }
-      File d = SD_MMC.open(dir);
-      bool okdir = d && d.isDirectory(); if (d) d.close();
-      if (!okdir) {
-        Serial.printf("[UPLOAD] Target dir missing: %s\n", dir.c_str());
-      } else {
-        if (SD_MMC.exists(g_uploadFilename)) SD_MMC.remove(g_uploadFilename);
-        g_uploadFile = SD_MMC.open(g_uploadFilename, FILE_WRITE);
-        Serial.printf("[UPLOAD] START %s\n", g_uploadFilename.c_str());
-      }
-      SD_UNLOCK();
-    }
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_uploadFile) {
-      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-        g_uploadFile.write(up.buf, up.currentSize);
-        SD_UNLOCK();
-        g_uploadBytes += up.currentSize;
-        feedWatchdog();
-      }
-    }
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (g_uploadFile) {
-      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_uploadFile.close(); SD_UNLOCK(); }
-      Serial.printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes);
-    } else {
-      Serial.println("[UPLOAD] Aborted/invalid file");
-    }
-  }
-}
-static void handleUploadDone() {
-  String back = server.hasArg("back") ? server.arg("back") : "/";
-  bool ok=false;
-  if (isFseqName(g_uploadFilename)) {
-    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-      ok = SD_MMC.exists(g_uploadFilename);
-      SD_UNLOCK();
-    }
-  }
-  if (!isFseqName(g_uploadFilename)) {
-    server.send(415, "text/html",
-      "<meta http-equiv='refresh' content='2;url=" + back + "'>"
-      "<body style='font-family:system-ui'><p>Upload rejected. Only <b>.fseq</b> files are allowed.</p><p>Returning…</p></body>");
-    return;
-  }
-  if (!ok) {
-    server.send(500, "text/html",
-      "<meta http-equiv='refresh' content='3;url=" + back + "'>"
-      "<body style='font-family:system-ui'><p>Upload failed.</p><p>Returning…</p></body>");
-    return;
-  }
-  server.send(200, "text/html",
-    "<meta http-equiv='refresh' content='1;url=" + back + "'>"
-    "<body style='font-family:system-ui'><p>Uploaded <b>" + htmlEscape(g_uploadFilename) + "</b> (" + String(g_uploadBytes) + " bytes).</p><p>Refreshing…</p></body>");
-}
-
 /* -------------------- Web: Control page & API -------------------- */
 static inline const char* statusText() { if (g_paused && g_playing) return "Paused"; if (g_playing) return "Playing"; return "Stopped"; }
 static inline const char* statusClass(){ if (g_paused && g_playing) return "badge pause"; if (g_playing) return "badge play"; return "badge stop"; }
@@ -1974,76 +1389,6 @@ static void handleCBlocks(){
   server.send(200,"application/json",s);
 }
 
-static void handleSdReinit(){
-  bool ok=false;
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { server.send(503,"text/plain","SD busy"); return; }
-  bool mounted = (SD_MMC.cardType()!=CARD_NONE);
-  SD_UNLOCK();
-
-  if (mounted) { g_sdReady = true; ok = true; }
-  else { ok = mountSdmmc(); }
-
-  if (!ok) { server.send(500,"text/plain","SD not present"); return; }
-  if (!g_currentPath.length()) { server.send(200,"text/plain","SD OK; no file"); return; }
-  String why;
-  if (openFseq(g_currentPath, why)) server.send(200,"text/plain","SD OK; file reopened");
-  else server.send(500,"text/plain", String("reopen fail: ")+why);
-}
-
-static void handleSdConfig(){
-  if (!server.hasArg("mode") || !server.hasArg("freq")) {
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing parameters\"}");
-    return;
-  }
-
-  String modeStr = server.arg("mode");
-  String freqStr = server.arg("freq");
-
-  char *end=nullptr;
-  long modeVal = strtol(modeStr.c_str(), &end, 10);
-  if (end == modeStr.c_str() || *end != '\0') { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}"); return; }
-  if (!(modeVal == 0 || modeVal == 1 || modeVal == 4)) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported mode\"}"); return; }
-  SdBusPreference newMode = sanitizeSdMode((uint8_t)modeVal);
-
-  end = nullptr;
-  uint32_t freqVal = (uint32_t)strtoul(freqStr.c_str(), &end, 10);
-  if (end == freqStr.c_str() || *end != '\0' || !isValidSdFreq(freqVal)) { server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid frequency\"}"); return; }
-
-  bool changed = false;
-  if (newMode != g_sdPreferredBusWidth) { g_sdPreferredBusWidth = newMode; prefs.putUChar("sdmode", (uint8_t)g_sdPreferredBusWidth); changed = true; }
-  if (freqVal != g_sdBaseFreqKHz) { g_sdBaseFreqKHz = sanitizeSdFreq(freqVal); g_sdFreqKHz = g_sdBaseFreqKHz; prefs.putUInt("sdfreq", g_sdBaseFreqKHz); changed = true; }
-  if (changed) { g_sdFailStreak = 0; persistSettingsToSd(); }
-
-  bool card = cardPresent();
-  bool remounted = false;
-  bool reopened = false;
-  if (card) {
-    if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { SD_MMC.end(); g_sdBusWidth = 0; g_sdReady = false; SD_UNLOCK(); }
-    delay(20);
-    g_sdFreqKHz = g_sdBaseFreqKHz;
-    remounted = mountSdmmc();
-    if (remounted) {
-      g_sdFailStreak = 0;
-      if (g_currentPath.length()) {
-        String why;
-        reopened = openFseq(g_currentPath, why);
-        if (!reopened && why.length()) Serial.printf("[SD] reopen after config failed: %s\n", why.c_str());
-      }
-    }
-  } else { g_sdReady = false; g_sdBusWidth = 0; }
-
-  String json = "{\"ok\":true";
-  json += ",\"ready\":" + String(g_sdReady?"true":"false");
-  json += ",\"currentWidth\":" + String((unsigned)g_sdBusWidth);
-  json += ",\"desiredMode\":" + String((unsigned)g_sdPreferredBusWidth);
-  json += ",\"baseFreq\":" + String((unsigned long)g_sdBaseFreqKHz);
-  json += ",\"freq\":" + String((unsigned long)g_sdFreqKHz);
-  if (remounted) json += ",\"remounted\":true";
-  if (reopened) json += ",\"fileReopened\":true";
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
   Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
@@ -2186,99 +1531,18 @@ static void handleOutMode() {
 
 /* -------------------- OTA / Updates page -------------------- */
 // (unchanged OTA functions)
-static void handleOtaPage() {
-  String html =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Direct OTA</title>"
-    "<style>body{font:16px system-ui,Segoe UI,Roboto,Arial;background:#0b1320;color:#e8ecf1;margin:0;padding:1rem}"
-    ".card{max-width:680px;margin:0 auto;background:#121b2d;padding:1rem;border-radius:12px}"
-    "a{color:#a7c3ff;text-decoration:none}a:hover{text-decoration:underline}"
-    "button{padding:.6rem 1rem;border:0;border-radius:10px;background:#1c2b4a;color:#e8ecf1;cursor:pointer}"
-    "input[type=file]{padding:.5rem;border-radius:10px;border:1px solid #253756;background:#0e1627;color:#e8ecf1}"
-    ".muted{opacity:.75}"
-    "</style></head><body><div class='card'>"
-    "<h2 style='margin:0 0 .5rem 0'>Direct OTA (Flash Now)</h2>"
-    "<p class='muted'>Upload a compiled <b>.bin</b> firmware image. Device will reboot automatically.</p>"
-    "<form method='POST' action='/ota' enctype='multipart/form-data'>"
-    "<input type='file' name='fw' accept='.bin' required> "
-    "<button type='submit'>Flash Immediately</button>"
-    "</form>"
-    "<p style='margin-top:1rem'><a href='/'>Back</a> &middot; <a href='/updates'>Updates</a></p>"
-    "</div></body></html>";
-  server.send(200, "text/html; charset=utf-8", html);
-}
-File   g_otaFile; size_t g_otaBytes = 0;
-static void handleOtaData() {
-  if (!otaAuthOK()) return;
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    g_otaBytes = 0;
-    Serial.printf("[OTA] Direct start: %s\n", up.filename.c_str());
-    if (!Update.begin()) { Serial.printf("[OTA] begin failed: %s\n", Update.errorString()); }
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (Update.isRunning()) {
-      size_t w = Update.write(up.buf, up.currentSize);
-      if (w != up.currentSize) Serial.printf("[OTA] write failed: %s\n", Update.errorString());
-    }
-    g_otaBytes += up.currentSize;
-    feedWatchdog();
-  } else if (up.status == UPLOAD_FILE_END) {
-    bool ok = Update.end(true);
-    Serial.printf("[OTA] Direct end (%u bytes): %s\n", (unsigned)g_otaBytes, ok?"OK":"FAIL");
-  }
-}
-static void handleOtaFinish() {
-  if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
-  if (Update.isFinished()) { server.send(200, "text/plain", "OTA complete, rebooting..."); delay(200); ESP.restart(); }
-  else { server.send(500, "text/plain", String("OTA failed: ") + Update.errorString()); }
-}
-
-// Upload firmware.bin to SD (for boot-time apply)
-File   g_fwSdFile; size_t g_fwSdBytes = 0;
-static void handleFwUploadData() {
-  if (!otaAuthOK()) return;
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    g_fwSdBytes = 0;
-    if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[FWSD] SD busy at START"); return; }
-    if (SD_MMC.exists(OTA_FILE)) SD_MMC.remove(OTA_FILE);
-    g_fwSdFile = SD_MMC.open(OTA_FILE, FILE_WRITE);
-    SD_UNLOCK();
-    Serial.println("[FWSD] START -> /firmware.bin");
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_fwSdFile) {
-      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
-        g_fwSdFile.write(up.buf, up.currentSize);
-        SD_UNLOCK();
-        g_fwSdBytes += up.currentSize;
-      }
-    }
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (g_fwSdFile) {
-      if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_fwSdFile.close(); SD_UNLOCK(); }
-      Serial.printf("[FWSD] DONE (%u bytes)\n", (unsigned)g_fwSdBytes);
-    } else {
-      Serial.println("[FWSD] Aborted/invalid");
-    }
-  }
-}
-static void handleFwUploadDone() {
-  if (!otaAuthOK()) { server.send(401,"text/plain","Unauthorized"); return; }
-  bool present = false;
-  if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { present = SD_MMC.exists(OTA_FILE); SD_UNLOCK(); }
-  server.sendHeader("Location", present ? "/updates?uploaded=1" : "/updates?uploaded=0");
-  server.send(302);
-}
-static void handleUpdatesPage() {
-  bool canReboot = (server.hasArg("uploaded") && server.arg("uploaded") == "1");
-  String html = WebPages::updatesPage(canReboot);
-  server.send(200, "text/html; charset=utf-8", html);
-}
 static void handleReboot() {
   server.send(200, "text/plain", "Rebooting");
   delay(150);
   ESP.restart();
+}
+
+/* -------------------- Utility made external for setup() -------------------- */
+// Ensure /BGEffects exists. Caller must hold SD lock if needed.
+void ensureBgEffectsDirLocked() {
+  if (!SD_MMC.exists("/BGEffects")) {
+    SD_MMC.mkdir("/BGEffects");
+  }
 }
 
 /* -------------------- Server, Setup, Loop -------------------- */
