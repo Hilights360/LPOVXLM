@@ -16,6 +16,11 @@
 //   * Per-arm drawing now routes pixels into lane segments with per-arm reverse support.
 //   * If you need different two reused ports, change LANE_CLK[] / LANE_DATA[] below.
 //   * OUT_SPI remains the default. Parallel mode left available but not used in this wiring.
+//
+// === Linkage fixes ===
+//  - g_brightness is now global (not static) so SD_Functions.cpp can link to it.
+//  - feedWatchdog() and openFseq(...) now have external linkage (not static).
+//  - ensureBgEffectsDirLocked() is defined here with external linkage so setup() links.
 
 #include "ConfigTypes.h"
 #include <Arduino.h>
@@ -57,7 +62,7 @@
 
 // ---------- NEW: Output mode (SPI vs Parallel-GPIO) ----------
 enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
-static uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
+uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
 
 // Parallel-GPIO driver state (kept for compatibility, not used in this wiring)
 #include "soc/gpio_struct.h"
@@ -159,7 +164,8 @@ extern uint16_t g_pixelsPerArm;
 Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
 
 // Brightness (0..255 computed from percent)
-static uint8_t g_brightness = 63;
+// was: static uint8_t g_brightness = 63;
+uint8_t g_brightness = 63;
 
 // Helpers for per-arm pixel routing into lanes
 static inline uint16_t armPixelCount() { return (g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM); }
@@ -239,7 +245,8 @@ static void applyWatchdogSetting() {
     Serial.println("[WDT] Disabled");
   }
 }
-static inline void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
+// was: static inline void feedWatchdog() { ... }
+void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
 
 // Persistent scratch for zlib frames
 static uint8_t* s_ctmp = nullptr;
@@ -256,8 +263,8 @@ static const char* AP_PASS  = "POV123456";
 static const IPAddress AP_IP(192,168,4,1), AP_GW(192,168,4,1), AP_MASK(255,255,255,0);
 WebServer server(80);
 
-static bool   g_sdReady             = false;
-static uint8_t g_sdBusWidth         = 0;    // 0=not mounted, 1=1-bit, 4=4-bit
+//static bool   g_sdReady             = false;
+//static uint8_t g_sdBusWidth         = 0;    // 0=not mounted, 1=1-bit, 4=4-bit
 String        g_staSsid;
 String        g_staPass;
 String        g_stationId;
@@ -283,7 +290,7 @@ uint8_t  g_armCount      = MAX_ARMS;
 uint16_t g_pixelsPerArm  = DEFAULT_PIXELS_PER_ARM;
 static uint16_t g_lastPulseSpoke[MAX_ARMS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 
-enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
+//enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
 StrideMode g_strideMode = STRIDE_SPOKE;
 
 // Rotary index (0..spokes-1)
@@ -375,11 +382,17 @@ static inline bool inStrobeWindowForArm(uint16_t spokeCenter, uint8_t arm) {
 static void setDefaultArmPhases() {
   const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
   bool allZero = true;
-  for (uint8_t a=0; a<arms; ++a) if (fabsf(g_armPhaseDeg[a]) > 1e-3f) { allZero=false; break; }
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (fabsf(g_armPhaseDeg[a]) > 1e-3f) { allZero = false; break; }
+  }
   if (!allZero) return;
+
   const float sep = 360.0f / (float)arms;
-  for (uint8_t a=0; a<arms; ++a) g_armPhaseDeg[a] = a * sep;
+  for (uint8_t a = 0; a < arms; ++a) {
+    g_armPhaseDeg[a] = a * sep;
+  }
 }
+
 
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
@@ -478,6 +491,25 @@ bool         g_compPerFrame= false;
 static inline int32_t  clampI32(int32_t v, int32_t lo, int32_t hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 static inline uint8_t  activeArmCount(){ return (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount); }
 
+// --- Binary read helpers (little-endian) ---
+static inline bool readU16(File &f, uint16_t &out) {
+  uint8_t b[2]; if (f.read(b,2)!=2) return false;
+  out = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+  return true;
+}
+static inline bool readU32(File &f, uint32_t &out) {
+  uint8_t b[4]; if (f.read(b,4)!=4) return false;
+  out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+  return true;
+}
+static inline bool readU64(File &f, uint64_t &out) {
+  uint8_t b[8]; if (f.read(b,8)!=8) return false;
+  out =  ((uint64_t)b[0])        | ((uint64_t)b[1] << 8)  | ((uint64_t)b[2] << 16) | ((uint64_t)b[3] << 24)
+       | ((uint64_t)b[4] << 32)  | ((uint64_t)b[5] << 40) | ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
+  return true;
+}
+
+
 /* -------------------- FSEQ open/close/load -------------------- */
 static void freeFseq(){
   if (g_fseq) g_fseq.close();
@@ -509,7 +541,8 @@ static int64_t sparseTranslate(uint32_t absCh) {
   return -1;
 }
 
-static bool openFseq(const String& path, String& why){
+// was: static bool openFseq(const String& path, String& why)
+bool openFseq(const String& path, String& why){
   freeFseq();
   if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { why="sd busy"; return false; }
   bool ok = false;
@@ -1502,6 +1535,14 @@ static void handleReboot() {
   server.send(200, "text/plain", "Rebooting");
   delay(150);
   ESP.restart();
+}
+
+/* -------------------- Utility made external for setup() -------------------- */
+// Ensure /BGEffects exists. Caller must hold SD lock if needed.
+void ensureBgEffectsDirLocked() {
+  if (!SD_MMC.exists("/BGEffects")) {
+    SD_MMC.mkdir("/BGEffects");
+  }
 }
 
 /* -------------------- Server, Setup, Loop -------------------- */

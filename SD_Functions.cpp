@@ -46,6 +46,7 @@ extern bool g_bgEffectEnabled;
 extern bool g_bgEffectActive;
 extern String g_bgEffectPath;
 extern uint32_t g_bgEffectNextAttemptMs;
+enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
 extern uint8_t g_outputMode;
 extern uint8_t g_brightnessPercent;
 extern uint8_t g_brightness;

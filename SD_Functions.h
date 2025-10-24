@@ -26,6 +26,7 @@ extern uint8_t g_sdBusWidth;
 
 bool SD_LOCK(TickType_t timeout = portMAX_DELAY);
 void SD_UNLOCK();
+void ensureBgEffectsDirLocked();
 
 SdBusPreference sanitizeSdMode(uint8_t mode);
 bool isValidSdFreq(uint32_t freq);
