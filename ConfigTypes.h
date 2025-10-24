@@ -6,8 +6,6 @@ constexpr uint8_t  MAX_ARMS               = 4;
 constexpr uint16_t DEFAULT_PIXELS_PER_ARM = 144;
 constexpr uint16_t MAX_PIXELS_PER_ARM     = 1024;
 
-enum StrideMode : uint8_t { STRIDE_SPOKE = 0, STRIDE_LED = 1 };
-
 // Utility clamps reused across modules
 inline uint32_t clampU32(uint32_t v, uint32_t lo, uint32_t hi) {
   if (v < lo) return lo;
@@ -37,7 +35,6 @@ struct PrefPresence {
   bool spokes=false;
   bool arms=false;
   bool pixels=false;
-  bool stride=false;
   bool staSsid=false;
   bool staPass=false;
   bool station=false;
@@ -58,7 +55,6 @@ struct SettingsData {
   bool hasSpokes=false;     uint16_t spokes=0;
   bool hasArms=false;       uint8_t  arms=0;
   bool hasPixels=false;     uint16_t pixels=0;
-  bool hasStride=false;     uint8_t  stride=0;
   bool hasStaSsid=false;    String   staSsid;
   bool hasStaPass=false;    String   staPass;
   bool hasStation=false;    String   stationId;

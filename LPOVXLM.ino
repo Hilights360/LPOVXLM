@@ -317,14 +317,11 @@ static uint16_t g_lastPulseSpoke[MAX_ARMS] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
 
 // ================= Per-arm start channel mapping (optional) =================
 // If true, each arm can start at its own absolute channel (R of pixel 0).
-// When false, computed defaults are used from g_startChArm1 + stride rules.
+// When false, computed defaults are derived from g_startChArm1 sequentially per arm.
 bool     g_usePerArmStart = false;            // NVS key: "usepa"
 uint32_t g_startChArm[MAX_ARMS] = {0,0,0,0};  // 1-based absolute channel for Arm1..Arm4 (R)
 static void computeDefaultArmStarts(uint32_t startArm1); // fwd decl
 
-
-//enum StrideMode : uint8_t { STRIDE_SPOKE=0, STRIDE_LED=1 };
-StrideMode g_strideMode = STRIDE_SPOKE;
 
 // Rotary index (0..spokes-1)
 volatile uint16_t g_indexPosition = 0;
@@ -757,7 +754,7 @@ static bool loadNextFrame(){
   return true;
 }
 
-/* -------------------- Color & stride mapping -------------------- */
+/* -------------------- Color mapping -------------------- */
 enum ColorMap { MAP_RGB, MAP_RBG, MAP_GBR, MAP_GRB, MAP_BRG, MAP_BGR };
 ColorMap g_colorMap = MAP_RGB;
 
@@ -773,7 +770,7 @@ static inline void mapChannels(const uint8_t* p, uint8_t& r, uint8_t& g, uint8_t
 }
 
 
-// Compute per-arm starting channels from g_startChArm1 according to stride.
+// Compute per-arm starting channels from g_startChArm1 assuming sequential arm blocks.
 // Results are 1-based absolute channel numbers (R of pixel 0 for that arm).
 static void computeDefaultArmStarts(uint32_t startArm1) {
   if (startArm1 < 1) startArm1 = 1;
@@ -784,16 +781,9 @@ static void computeDefaultArmStarts(uint32_t startArm1) {
   // Clear all first
   for (uint8_t a = 0; a < MAX_ARMS; ++a) g_startChArm[a] = 0;
 
-  if (g_strideMode == STRIDE_SPOKE) {
-    // [Arm1 block][Arm2 block]...[ArmN block], each block = pix * 3 channels
-    for (uint8_t a = 0; a < arms; ++a) {
-      g_startChArm[a] = startArm1 + (uint32_t)a * (uint32_t)pix * 3u;
-    }
-  } else {
-    // STRIDE_LED: LED-interleaved per pixel; Arm K’s pixel0 R is + (K * 3)
-    for (uint8_t a = 0; a < arms; ++a) {
-      g_startChArm[a] = startArm1 + (uint32_t)a * 3u;
-    }
+  const uint32_t armBlock = (uint32_t)pix * 3u;
+  for (uint8_t a = 0; a < arms; ++a) {
+    g_startChArm[a] = startArm1 + (uint32_t)a * armBlock;
   }
 }
 
@@ -945,16 +935,13 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
     }
   }
 
-  // Base (R) channel for THIS arm, pixel 0 (1-based → 0-based)
-  uint32_t baseChAbsR = 0;
+  const uint32_t armBlockStride = (uint32_t)pixelCount * 3u; // bytes per arm within a spoke
+  const uint32_t defaultArmStart = (g_startChArm1 ? g_startChArm1 - 1 : 0) + (uint32_t)arm * armBlockStride;
+
+  uint32_t baseChAbsR = defaultArmStart;
   if (g_usePerArmStart) {
-    baseChAbsR = (g_startChArm[arm] ? g_startChArm[arm]-1 : 0);
-  } else {
-    const uint32_t base = (g_startChArm1 ? g_startChArm1-1 : 0);
-    const uint32_t armBlockStride2 = (uint32_t)pixelCount * 3u;
-    baseChAbsR = (g_strideMode == STRIDE_SPOKE)
-      ? (base + (uint32_t)arm * armBlockStride2)
-      : (base + (uint32_t)arm * 3u);
+    uint32_t configured = g_startChArm[arm];
+    if (configured > 0) baseChAbsR = configured - 1;
   }
 
   // If a frame carries multiple spokes, add the spoke slice offset
@@ -963,25 +950,11 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
     baseChAbsR += ((uint32_t)(spokeIdx % s)) * chPerSpoke;
   }
 
-  // Within a spoke, choose addressing pattern:
-  //  - STRIDE_SPOKE: [Arm1 block][Arm2 block]...[ArmN block] (each block = pixelsPerArm*3)
-  //  - STRIDE_LED:   LED-interleaved per pixel: [(A1 RGB)(A2 RGB)...(AN RGB)] then next pixel
-  const uint32_t armBlockStride   = (uint32_t)pixelCount * 3u; // bytes per arm within a spoke
-  const uint32_t ledInterleaved3A = (uint32_t)arms * 3u;       // bytes to next LED group when interleaved
-
   if (spokes) spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
   for (uint16_t i = 0; i < pixelCount; ++i) {
-    uint32_t ofs;
-    if (g_strideMode == STRIDE_SPOKE) {
-      ofs = (g_usePerArmStart ? 0u : (uint32_t)arm * armBlockStride) + (uint32_t)i * 3u;
-    } else { // STRIDE_LED
-      const uint32_t ledInterleaved3A2 = (uint32_t)arms * 3u;
-      ofs = (uint32_t)i * ledInterleaved3A2 + (g_usePerArmStart ? 0u : (uint32_t)arm * 3u);
-    }
-
-    const uint32_t absR = baseChAbsR + ofs;
+    const uint32_t absR = baseChAbsR + (uint32_t)i * 3u;
     const int64_t  idxR = sparseTranslate(absR);
 
     uint8_t R=0,G=0,B=0;
@@ -1160,7 +1133,6 @@ static void handleStatus(){
     +",\"arms\":"+String(g_armCount)
     +",\"pixels\":"+String(g_pixelsPerArm)
     +",\"index\":"+String(g_indexPosition)
-    +",\"stride\":\""+String(g_strideMode==STRIDE_SPOKE?"spoke":"led")+"\"";
   json += ",\"sd\":{\"ready\":";
   json += (g_sdReady?"true":"false");
   json += ",\"currentWidth\":" + String((unsigned)g_sdBusWidth);
@@ -1211,7 +1183,7 @@ static void handleRoot() {
                                    g_staSsid, staStatus, staIp, g_stationId,
                                    g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                    MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                   g_strideMode == STRIDE_SPOKE, g_fps, g_brightnessPercent,
+                                   g_fps, g_brightnessPercent,
                                    (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
@@ -1447,14 +1419,14 @@ static void handleMapCfg(){
     prefs.putBool("usepa", g_usePerArmStart);
   }
   if (!g_usePerArmStart) {
-  computeDefaultArmStarts(g_startChArm1);
-}
+    computeDefaultArmStarts(g_startChArm1);
+  }
 
   bool perArmChanged = false;
   if (server.hasArg("start2")) { uint32_t v=strtoul(server.arg("start2").c_str(),nullptr,10); g_startChArm[1]=v; prefs.putULong("start2",v); perArmChanged=true; }
   if (server.hasArg("start3")) { uint32_t v=strtoul(server.arg("start3").c_str(),nullptr,10); g_startChArm[2]=v; prefs.putULong("start3",v); perArmChanged=true; }
   if (server.hasArg("start4")) { uint32_t v=strtoul(server.arg("start4").c_str(),nullptr,10); g_startChArm[3]=v; prefs.putULong("start4",v); perArmChanged=true; }
-  if (!g_usePerArmStart && (server.hasArg("start") || server.hasArg("stride") || perArmChanged)) {
+  if (!g_usePerArmStart && (server.hasArg("start") || perArmChanged)) {
     computeDefaultArmStarts(g_startChArm1);
   }
 
@@ -1466,8 +1438,7 @@ static void handleMapCfg(){
     String("{\"start\":") + g_startChArm1 +
     ",\"spokes\":" + g_spokesTotal +
     ",\"arms\":" + (int)g_armCount +
-    ",\"pixels\":" + g_pixelsPerArm +
-    ",\"stride\":\"" + (g_strideMode==STRIDE_SPOKE ? "spoke" : "led") + "\"}"
+    ",\"pixels\":" + g_pixelsPerArm + "}"
   );
 }
 
@@ -1644,16 +1615,18 @@ uint16_t spoke = (uint16_t)std::max<long>(0L, _spokeReq);
   uint32_t chPerSpoke = expectedPerSpoke;
   if (!perSpokeFrame && spokes>0 && (g_fh.channelCount % spokes)==0) chPerSpoke = g_fh.channelCount / spokes;
 
-  uint32_t base = 0;
-  if (g_usePerArmStart) base = (g_startChArm[arm] ? g_startChArm[arm]-1 : 0);
-  else {
-    const uint32_t armBlockStride = (uint32_t)pixelCount*3u;
-    base = (g_startChArm1 ? g_startChArm1-1 : 0) + (g_strideMode==STRIDE_SPOKE ? (uint32_t)arm*armBlockStride : (uint32_t)arm*3u);
+  const uint32_t armBlockStride = (uint32_t)pixelCount * 3u;
+  const uint32_t defaultArmStart = (g_startChArm1 ? g_startChArm1 - 1 : 0) + (uint32_t)arm * armBlockStride;
+
+  uint32_t base = defaultArmStart;
+  if (g_usePerArmStart) {
+    uint32_t configured = g_startChArm[arm];
+    if (configured > 0) base = configured - 1;
   }
+
   if (!perSpokeFrame) base += ((uint32_t)(spoke % (spokes?spokes:1))) * chPerSpoke;
 
-  uint32_t ofs = (g_strideMode==STRIDE_SPOKE) ? (uint32_t)pix*3u : (uint32_t)pix*(uint32_t)arms*3u;
-  uint32_t absR = base + ofs;
+  uint32_t absR = base + (uint32_t)pix * 3u;
 
   int64_t idxR = sparseTranslate(absR);
   uint8_t R=0,G=0,B=0;
@@ -1959,8 +1932,6 @@ void setup(){
   g_armCount = clampArmCount(prefs.getUChar("arms", MAX_ARMS));
   present.pixels = prefs.isKey("pixels");
   g_pixelsPerArm = clampPixelsPerArm(prefs.getUShort("pixels", DEFAULT_PIXELS_PER_ARM));
-  present.stride = prefs.isKey("stride");
-  g_strideMode = (StrideMode)prefs.getUChar("stride", (uint8_t)STRIDE_SPOKE);
   present.staSsid = prefs.isKey("sta_ssid");
   g_staSsid = prefs.getString("sta_ssid", "");
   present.staPass = prefs.isKey("sta_pass");
@@ -2030,7 +2001,6 @@ void setup(){
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
   g_pixelsPerArm = clampPixelsPerArm(g_pixelsPerArm);
-  if (g_strideMode != STRIDE_LED && g_strideMode != STRIDE_SPOKE) g_strideMode = STRIDE_SPOKE;
   if (!g_stationId.length()) g_stationId = defaultStationId();
 
   Serial.println(F("[Quadrant self-check]"));
@@ -2040,9 +2010,9 @@ void setup(){
   }
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
-  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u stride=%s\n",
+  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
-                (unsigned)g_pixelsPerArm, (g_strideMode==STRIDE_SPOKE?"SPOKE":"LED"));
+                (unsigned)g_pixelsPerArm);
   Serial.printf("[OUTMODE] %s\n", (g_outputMode==OUT_PARALLEL?"PARALLEL":"SPI"));
 
   startWifiAP();

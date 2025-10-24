@@ -160,7 +160,6 @@ String rootPage(const String &statusClass,
                 uint16_t pixelsPerArm,
                 uint8_t maxArms,
                 uint16_t maxPixelsPerArm,
-                bool strideIsSpoke,
                 uint16_t fps,
                 uint8_t brightnessPercent,
                 uint8_t sdPreferredMode,
@@ -178,9 +177,6 @@ String rootPage(const String &statusClass,
                 bool bgEffectActive,
                 const String &bgEffectCurrentEscaped,
                 const String &bgEffectOptionsHtml) {
-  const char *spokeSel = strideIsSpoke ? "selected" : "";
-  const char *ledSel   = strideIsSpoke ? "" : "selected";
-
   const char *sdAutoSel = (sdPreferredMode == 0) ? "selected" : "";
   const char *sd4Sel    = (sdPreferredMode == 4) ? "selected" : "";
   const char *sd1Sel    = (sdPreferredMode == 1) ? "selected" : "";
@@ -284,7 +280,7 @@ String rootPage(const String &statusClass,
           "<div><label>Total Spokes</label><input id='spokes' type='number' min='1' value='" + String(spokes) + "'></div>"
           "<div><label>Arm Count</label><input id='arms' type='number' min='1' max='" + String((int)maxArms) + "' value='" + String((int)arms) + "'></div>"
           "<div><label>Pixels per Arm</label><input id='pixels' type='number' min='1' max='" + String((int)maxPixelsPerArm) + "' value='" + String(pixelsPerArm) + "'></div>"
-          "<div><label>Stride</label><select id='stride'><option value='spoke' " + String(spokeSel) + ">SPOKE</option><option value='led' " + String(ledSel) + ">LED</option></select></div>"
+          "<div class='hint' style='flex-basis:100%'>Channels for each spoke are read sequentially (Arm 1 through Arm " + String((int)arms) + ").</div>"
           "<div style='align-self:end'><button id='applymap'>Apply Layout</button></div>"
           "</div>"
           "<div class='sep'></div>";
@@ -415,8 +411,7 @@ if(applymap){
     const sp=+document.getElementById('spokes').value||40;
     const ar=+document.getElementById('arms').value||1;
     const px=+document.getElementById('pixels').value||1;
-    const st=(document.getElementById('stride').value)||'spoke';
-    fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px+'&stride='+st,{method:'POST'}).then(()=>location.reload());
+    fetch('/mapcfg?start='+sc+'&spokes='+sp+'&arms='+ar+'&pixels='+px,{method:'POST'}).then(()=>location.reload());
   };
 }
 
