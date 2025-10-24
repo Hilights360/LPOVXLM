@@ -344,6 +344,7 @@ struct ArmRuntimeState {
   bool     lit = false;
 };
 static ArmRuntimeState g_armState[MAX_ARMS];
+static bool            g_enableArmBlanking   = false;
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
@@ -700,6 +701,12 @@ bool openFseq(const String& path, String& why){
     g_frameValid = false;
     if (!loadNextFrame()) { why = "frame load"; ok = false; }
     else {
+      if (g_fh.stepTimeMs > 0) {
+        g_framePeriodMs = (uint32_t)g_fh.stepTimeMs;
+        uint32_t fpsCalc = (1000u + g_framePeriodMs / 2u) / g_framePeriodMs;
+        if (fpsCalc == 0) fpsCalc = 1;
+        g_fps = (uint16_t)fpsCalc;
+      }
       g_lastTickMs = millis();
       g_playing = true;
       g_paused = false;
@@ -915,8 +922,12 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
       for (uint8_t a = 0; a < arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-        if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+        if (g_enableArmBlanking) {
+          g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+          if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+        } else {
+          g_armState[a].blankDeadlineUs = 0;
+        }
       }
     }
     return;
@@ -999,12 +1010,17 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-  if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  if (g_enableArmBlanking) {
+    g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+    if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  } else {
+    g_armState[arm].blankDeadlineUs = 0;
+  }
 }
 
 
 static void processArmBlanking(uint32_t nowUs){
+  if (!g_enableArmBlanking) return;
   const uint8_t arms = activeArmCount();
   for (uint8_t a=0; a<arms; ++a){
     if (!g_armState[a].lit) continue;
@@ -1045,13 +1061,13 @@ static void processHallSyncEvent(uint32_t nowUs){
     if (!g_strobeEnable) {
       paintArmAt(a, base, nowUs);
     } else {
-      if (g_armState[a].lit) blankArm(a);
+      if (g_enableArmBlanking && g_armState[a].lit) blankArm(a);
       g_lastPulseSpoke[a] = 0xFFFF;
     }
   }
   for (uint8_t a = arms; a < MAX_ARMS; ++a){
     g_armState[a].baseSpoke = 0;
-    if (g_armState[a].lit) blankArm(a);
+    if (g_enableArmBlanking && g_armState[a].lit) blankArm(a);
   }
 
   uint64_t revolutionUs = 0;
@@ -2147,17 +2163,25 @@ void loop(){
 
     const uint16_t spokeNow2 = currentSpokeIndex();
     const uint8_t arms = activeArmCount();
+    const uint16_t spokes = spokesCount();
+    const uint16_t baseRef = (spokes ? (g_armState[0].baseSpoke % spokes) : 0);
 
     for (uint8_t a = 0; a < arms; ++a) {
       const bool in = inStrobeWindowForArm(spokeNow2, a);
+      uint16_t targetSpoke = spokeNow2;
+      if (spokes) {
+        const uint16_t baseArm = g_armState[a].baseSpoke % spokes;
+        const uint16_t offset = (baseArm + spokes - baseRef) % spokes;
+        targetSpoke = (spokeNow2 + offset) % spokes;
+      }
 
-      if (in && g_lastPulseSpoke[a] != spokeNow2) {
-        paintArmAt(a, spokeNow2, nowUs);
-        g_lastPulseSpoke[a] = spokeNow2;
+      if (in && g_lastPulseSpoke[a] != targetSpoke) {
+        paintArmAt(a, targetSpoke, nowUs);
+        g_lastPulseSpoke[a] = targetSpoke;
         g_armState[a].lit = true;
       }
 
-      if (!in && g_armState[a].lit) blankArm(a);
+      if (g_enableArmBlanking && !in && g_armState[a].lit) blankArm(a);
     }
   } else {
     processHallSyncEvent(nowUs);
