@@ -420,9 +420,22 @@ static void setDefaultArmPhases() {
   }
   if (!allZero) return;
 
-  const float sep = 360.0f / (float)arms;
+  const uint16_t spokes = spokesCount();
+  if (!spokes) {
+    for (uint8_t a = 0; a < arms; ++a) g_armPhaseDeg[a] = 0.0f;
+    return;
+  }
+
+  const int startIdx0 = spoke1BasedToIdx0(START_SPOKE_1BASED, (int)spokes);
+  const int baseIdx0  = armSpokeIdx0(0, startIdx0, (int)spokes, (int)arms);
+  const float spokeDeg = 360.0f / (float)spokes;
+
   for (uint8_t a = 0; a < arms; ++a) {
-    g_armPhaseDeg[a] = a * sep;
+    const int targetIdx0 = armSpokeIdx0((int)a, startIdx0, (int)spokes, (int)arms);
+    int delta = targetIdx0 - baseIdx0;
+    delta %= (int)spokes;
+    if (delta < 0) delta += (int)spokes;
+    g_armPhaseDeg[a] = (float)delta * spokeDeg;
   }
 }
 
@@ -700,6 +713,12 @@ bool openFseq(const String& path, String& why){
     g_frameValid = false;
     if (!loadNextFrame()) { why = "frame load"; ok = false; }
     else {
+      if (g_fh.stepTimeMs > 0) {
+        g_framePeriodMs = (uint32_t)g_fh.stepTimeMs;
+      } else {
+        g_framePeriodMs = (g_fps ? (1000UL / g_fps) : 25UL);
+      }
+      if (g_framePeriodMs == 0) g_framePeriodMs = 1;
       g_lastTickMs = millis();
       g_playing = true;
       g_paused = false;
@@ -999,20 +1018,13 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-  if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  g_armState[arm].blankDeadlineUs = 0;
 }
 
 
 static void processArmBlanking(uint32_t nowUs){
+  (void)nowUs;
   const uint8_t arms = activeArmCount();
-  for (uint8_t a=0; a<arms; ++a){
-    if (!g_armState[a].lit) continue;
-    uint32_t blankAt = g_armState[a].blankDeadlineUs;
-    if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a);
-    }
-  }
   for (uint8_t a=arms; a<MAX_ARMS; ++a){
     if (g_armState[a].lit) blankArm(a);
   }
@@ -1045,7 +1057,7 @@ static void processHallSyncEvent(uint32_t nowUs){
     if (!g_strobeEnable) {
       paintArmAt(a, base, nowUs);
     } else {
-      if (g_armState[a].lit) blankArm(a);
+      g_armState[a].lit = false;
       g_lastPulseSpoke[a] = 0xFFFF;
     }
   }
@@ -2147,17 +2159,29 @@ void loop(){
 
     const uint16_t spokeNow2 = currentSpokeIndex();
     const uint8_t arms = activeArmCount();
+    const uint16_t spokes = spokesCount();
+    const uint16_t refBase = (arms > 0 && spokes) ? (g_armState[0].baseSpoke % spokes) : 0;
 
     for (uint8_t a = 0; a < arms; ++a) {
       const bool in = inStrobeWindowForArm(spokeNow2, a);
+      uint16_t spokeForArm = spokeNow2;
+      if (spokes) {
+        const uint16_t base = g_armState[a].baseSpoke % spokes;
+        int32_t raw = (int32_t)base + (int32_t)spokeNow2 - (int32_t)refBase;
+        raw %= (int32_t)spokes;
+        if (raw < 0) raw += (int32_t)spokes;
+        spokeForArm = (uint16_t)raw;
+      }
 
-      if (in && g_lastPulseSpoke[a] != spokeNow2) {
-        paintArmAt(a, spokeNow2, nowUs);
-        g_lastPulseSpoke[a] = spokeNow2;
+      if (in && g_lastPulseSpoke[a] != spokeForArm) {
+        paintArmAt(a, spokeForArm, nowUs);
+        g_lastPulseSpoke[a] = spokeForArm;
         g_armState[a].lit = true;
       }
 
-      if (!in && g_armState[a].lit) blankArm(a);
+      if (!in) {
+        g_armState[a].lit = false;
+      }
     }
   } else {
     processHallSyncEvent(nowUs);
