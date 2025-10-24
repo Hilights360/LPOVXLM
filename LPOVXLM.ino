@@ -812,18 +812,40 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   spokeIdx %= spokes;
   g_armState[arm].currentSpoke = spokeIdx;
 
-  const uint32_t blockStride = (g_strideMode == STRIDE_SPOKE) ? 3UL : (spokes ? spokes * 3UL : 3UL);
   const uint16_t pixelCount   = armPixelCount();
-  const uint32_t fallbackPixels = pixelCount;
+  const uint32_t fallbackPixels = pixelCount ? pixelCount : 1;
   const uint32_t chPerSpoke =
       (spokes > 0 && g_fh.channelCount) ? (g_fh.channelCount / spokes) : (fallbackPixels * 3u);
+  const uint8_t  armsActive = activeArmCount();
+  const uint32_t pixelChannels = (uint32_t)pixelCount * 3UL;
+
+  uint32_t blockStride = 3UL;
+  uint32_t armOffset = 0;
+
+  if (g_strideMode == STRIDE_SPOKE) {
+    // Spoke stride: spokes may contain one block that all arms share or a
+    // concatenation of per-arm blocks. Derive how many blocks actually exist
+    // so we avoid indexing beyond the frame buffer when only a single block
+    // was stored in the FSEQ file.
+    uint32_t armsRepresented = (pixelChannels > 0) ? (chPerSpoke / pixelChannels) : 0;
+    if (armsRepresented == 0) armsRepresented = 1;
+    if (armsRepresented > armsActive) armsRepresented = armsActive;
+    uint32_t armGroup = (arm < armsRepresented) ? arm : (armsRepresented - 1);
+    armOffset = armGroup * pixelChannels;
+  } else {
+    // LED stride: pixels are interleaved per arm. Detect how many arm slots
+    // are encoded for each pixel so we can clamp the offset safely.
+    uint32_t perPixelStride = (pixelCount > 0) ? (chPerSpoke / pixelCount) : 0;
+    if (perPixelStride < 3UL) perPixelStride = 3UL;
+    uint32_t armsRepresented = perPixelStride / 3UL;
+    if (armsRepresented == 0) armsRepresented = 1;
+    if (armsRepresented > armsActive) armsRepresented = armsActive;
+    blockStride = perPixelStride;
+    uint32_t armGroup = (arm < armsRepresented) ? arm : (armsRepresented - 1);
+    armOffset = armGroup * 3UL;
+  }
   const uint32_t startChBase = (g_startChArm1 > 0 ? g_startChArm1 - 1 : 0);
   const uint32_t baseChAbsR  = startChBase + (uint32_t)spokeIdx * chPerSpoke;
-
-  // *** FIX: add per-arm channel offset inside each spoke ***
-  const uint32_t armOffset = (g_strideMode == STRIDE_SPOKE)
-      ? ((uint32_t)arm * (uint32_t)pixelCount * 3UL)  // [Arm1 block][Arm2 block][Arm3 block][Arm4 block]
-      : ((uint32_t)arm * 3UL);                        // LED-stride: per-LED groups are [A1 RGB][A2 RGB][A3 RGB][A4 RGB]
 
   for (uint16_t i=0; i<pixelCount; ++i){
     const uint32_t absR = baseChAbsR + armOffset + (uint32_t)i * blockStride;
