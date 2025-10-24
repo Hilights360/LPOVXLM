@@ -348,6 +348,7 @@ static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
 static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
+static bool            g_autoBlankingEnabled = false; // disable runtime blanking while debugging
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
@@ -608,6 +609,11 @@ static void freeFseq(){
   g_playing = false;
   g_paused = false;
   g_currentPath = "";
+
+  if (g_fps == 0) g_fps = 1;
+  uint32_t basePeriod = 1000UL / g_fps;
+  if (basePeriod == 0) basePeriod = 1;
+  g_framePeriodMs = basePeriod;
 }
 
 static int64_t sparseTranslate(uint32_t absCh) {
@@ -698,6 +704,14 @@ bool openFseq(const String& path, String& why){
   if (ok) {
     resetArmRuntimeStates();
     g_frameValid = false;
+    uint32_t period = (g_fh.stepTimeMs ? (uint32_t)g_fh.stepTimeMs : 0u);
+    if (period == 0) {
+      uint16_t fps = g_fps;
+      if (fps == 0) fps = 40;
+      period = (fps ? (uint32_t)(1000UL / fps) : 25u);
+      if (period == 0) period = 1;
+    }
+    g_framePeriodMs = period;
     if (!loadNextFrame()) { why = "frame load"; ok = false; }
     else {
       g_lastTickMs = millis();
@@ -950,11 +964,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (g_usePerArmStart) {
     baseChAbsR = (g_startChArm[arm] ? g_startChArm[arm]-1 : 0);
   } else {
-    const uint32_t base = (g_startChArm1 ? g_startChArm1-1 : 0);
-    const uint32_t armBlockStride2 = (uint32_t)pixelCount * 3u;
-    baseChAbsR = (g_strideMode == STRIDE_SPOKE)
-      ? (base + (uint32_t)arm * armBlockStride2)
-      : (base + (uint32_t)arm * 3u);
+    baseChAbsR = (g_startChArm1 ? g_startChArm1-1 : 0);
   }
 
   // If a frame carries multiple spokes, add the spoke slice offset
@@ -975,10 +985,15 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   for (uint16_t i = 0; i < pixelCount; ++i) {
     uint32_t ofs;
     if (g_strideMode == STRIDE_SPOKE) {
-      ofs = (g_usePerArmStart ? 0u : (uint32_t)arm * armBlockStride) + (uint32_t)i * 3u;
+      ofs = (uint32_t)i * 3u;
+      if (!g_usePerArmStart) {
+        ofs += (uint32_t)arm * armBlockStride;
+      }
     } else { // STRIDE_LED
-      const uint32_t ledInterleaved3A2 = (uint32_t)arms * 3u;
-      ofs = (uint32_t)i * ledInterleaved3A2 + (g_usePerArmStart ? 0u : (uint32_t)arm * 3u);
+      ofs = (uint32_t)i * ledInterleaved3A;
+      if (!g_usePerArmStart) {
+        ofs += (uint32_t)arm * 3u;
+      }
     }
 
     const uint32_t absR = baseChAbsR + ofs;
@@ -999,12 +1014,24 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
-  if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  if (g_autoBlankingEnabled) {
+    g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+    if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
+  } else {
+    g_armState[arm].blankDeadlineUs = 0;
+  }
 }
 
 
 static void processArmBlanking(uint32_t nowUs){
+  if (!g_autoBlankingEnabled) {
+    const uint8_t arms = activeArmCount();
+    for (uint8_t a=arms; a<MAX_ARMS; ++a){
+      if (g_armState[a].lit) blankArm(a);
+    }
+    return;
+  }
+
   const uint8_t arms = activeArmCount();
   for (uint8_t a=0; a<arms; ++a){
     if (!g_armState[a].lit) continue;
