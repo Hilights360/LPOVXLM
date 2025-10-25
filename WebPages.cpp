@@ -161,6 +161,7 @@ String rootPage(const String &statusClass,
                 uint8_t maxArms,
                 uint16_t maxPixelsPerArm,
                 uint16_t fps,
+                uint8_t displayDutyPercent,
                 uint8_t brightnessPercent,
                 uint8_t sdPreferredMode,
                 uint32_t sdBaseFreqKHz,
@@ -287,7 +288,13 @@ String rootPage(const String &statusClass,
   html += "<h3>Playback Speed</h3>"
           "<label>FPS: <span id='fpsv'>" + String(fps) + "</span></label>"
           "<input id='fps' type='range' min='1' max='120' value='" + String(fps) + "'>"
-          "<div class='row'><button id='applyfps'>Apply</button><button id='fps10'>10 FPS</button><button id='fps40'>40 FPS</button><button id='fps60'>60 FPS</button></div>"
+          "<div class='row'><button id='applyfps'>Apply</button><button id='fps10'>10 FPS</button><button id='fps20'>20 FPS</button><button id='fps40'>40 FPS</button></div>"
+          "<div class='sep'></div>";
+
+  html += "<h3>Arm Display Time</h3>"
+          "<label>Display Duty: <span id='dutyv'>" + String((unsigned)displayDutyPercent) + "%</span></label>"
+          "<input id='duty' type='range' min='0' max='100' value='" + String((unsigned)displayDutyPercent) + "'>"
+          "<div class='row'><button id='applyduty'>Apply</button></div>"
           "<div class='sep'></div>";
 
   html += "<h3>Brightness</h3>"
@@ -367,6 +374,8 @@ String rootPage(const String &statusClass,
 <script>
 const fps=document.getElementById('fps'), fpsv=document.getElementById('fpsv');
 if(fps){fps.oninput=()=>fpsv.textContent=fps.value;}
+const duty=document.getElementById('duty'), dutyv=document.getElementById('dutyv');
+if(duty){duty.oninput=()=>dutyv.textContent=duty.value+'%';}
 const r=document.getElementById('rng'), v=document.getElementById('v');
 if(r){r.oninput=()=>v.textContent=r.value+'%';}
 
@@ -374,10 +383,13 @@ function post(u){fetch(u,{method:'POST'}).then(()=>location.reload());}
 
 const applyfps=document.getElementById('applyfps');
 if(applyfps){applyfps.onclick=()=>post('/speed?fps='+fps.value);}
-const fps10=document.getElementById('fps10'), fps40=document.getElementById('fps40'), fps60=document.getElementById('fps60');
+const fps10=document.getElementById('fps10'), fps20=document.getElementById('fps20'), fps40=document.getElementById('fps40');
 if(fps10){fps10.onclick=()=>post('/speed?fps=10');}
+if(fps20){fps20.onclick=()=>post('/speed?fps=20');}
 if(fps40){fps40.onclick=()=>post('/speed?fps=40');}
-if(fps60){fps60.onclick=()=>post('/speed?fps=60');}
+
+const applyDuty=document.getElementById('applyduty');
+if(applyDuty){applyDuty.onclick=()=>post('/duty?percent='+duty.value);}
 
 const setB=document.getElementById('set'), low=document.getElementById('low'), med=document.getElementById('med'), hi=document.getElementById('hi');
 if(setB){setB.onclick=()=>post('/b?value='+r.value);}
