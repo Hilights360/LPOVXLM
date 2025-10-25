@@ -1095,18 +1095,23 @@ static uint32_t computeRpmSnapshot() {
       g_rpmAccumulatedPulses += delta;
       g_rpmLastCount = countNow;
 
-      if (g_pulsesPerRev > 0) {
-        uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)g_pulsesPerRev;
+      uint32_t ppr = g_pulsesPerRev ? g_pulsesPerRev : 1;
+      uint32_t pulsesNeeded = ppr * 2u; // average over two full revolutions
+
+      if (g_rpmAccumulatedPulses >= pulsesNeeded && g_rpmAccumulatedUs > 0) {
+        uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)ppr;
         uint64_t num   = (uint64_t)g_rpmAccumulatedPulses * 60000000ULL;
         uint32_t inst  = (denom ? (uint32_t)((num + denom / 2) / denom) : 0);
         if (inst > 0) {
           g_rpmUi = (g_rpmUi * 3 + inst) / 4;
           g_lastRpmUpdateMs = millis();
         }
-      }
 
-      g_rpmAccumulatedUs = 0;
-      g_rpmAccumulatedPulses = 0;
+        g_rpmAccumulatedUs = 0;
+        g_rpmAccumulatedPulses = 0;
+      } else {
+        if (g_rpmAccumulatedUs > 6000000ULL) g_rpmAccumulatedUs = 6000000ULL;
+      }
     } else {
       if (g_rpmAccumulatedUs > 6000000ULL) g_rpmAccumulatedUs = 6000000ULL;
     }
