@@ -7,13 +7,13 @@
 //   - Lane 0 (reuses prior Arm1 pins): CLK=47, DATA=45 drives Arm1 then Arm2
 //       Arm1 = outside-fed (normal direction; index 0 at the outside)
 //       Arm2 = center-fed   (reversed direction; index 0 at the center input)
-//   - Lane 1 (reuses prior Arm3 pins): CLK=38, DATA=39 drives Arm3 then Arm4
+//   - Lane 1 (reuses prior Arm3 pins): CLK=35, DATA=36 drives Arm3 then Arm4
 //       Arm3 = outside-fed (normal)
 //       Arm4 = center-fed   (reversed)
 //
 // Notes:
-//   * All timing / strobe / Hall logic unchanged.
-//   * Per-arm drawing now routes pixels into lane segments with per-arm reverse support.
+//   * All timing / strobe / Hall logic unchanged EXCEPT default strobe now OFF (see g_strobeEnable).
+//   * Per-arm drawing routes pixels into lane segments with per-arm reverse support.
 //   * If you need different two reused ports, change LANE_CLK[] / LANE_DATA[] below.
 //   * OUT_SPI remains the default. Parallel mode left available but not used in this wiring.
 //
@@ -161,8 +161,8 @@ static const uint8_t NUM_LANES = 2;
 Arm 1 is outside fed and feeds Arm 2 from the center and it extends 90 degrees from Arm 1 Clockwise as viewed from the Pixels. 
 Arm 3 and 4 follow suit with Arm 3 being outside fed and 4 fed from the center. Arm 3 has been moved to the Port for 
 Arm 2 to keep from drawing too much current accross the entire PCB*/
-static const int LANE_CLK[NUM_LANES]  = { 47, 35 }; // old Arm1 CLK, old Arm3 CLK
-static const int LANE_DATA[NUM_LANES] = { 45, 36 }; // old Arm1 DATA, old Arm3 DATA
+static const int LANE_CLK[NUM_LANES]  = { 47, 35 }; // old Arm1 CLK, old Arm4 CLK
+static const int LANE_DATA[NUM_LANES] = { 45, 36 }; // old Arm1 DATA, old Arm4 DATA
 
 // Lane DotStar objects (each lane drives two arms chained)
 static Adafruit_DotStar* g_lanes[NUM_LANES] = { nullptr, nullptr };
@@ -361,7 +361,7 @@ static bool loadNextFrame();
 /* -------------------- Strobe gating / angular timing -------------------- */
 static const int PIN_STROBE_GATE = -1; // -1 to disable gate pin
 
-static volatile bool  g_strobeEnable   = true;
+static volatile bool  g_strobeEnable   = false;   // DEFAULT NOW OFF (previously true)
 static volatile float g_strobeWidthDeg = 3.0f;
 static volatile float g_strobePhaseDeg = 0.0f;
 static float g_armPhaseDeg[MAX_ARMS] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -534,6 +534,7 @@ static void handleReboot();
 static void handleOutMode(); // declared here; implemented later with setOutputMode()
 static void handleDiagMap();     // /diag/map?arm=1&pix=0&spoke=0
 static void handleFseqRanges();  // /fseq/ranges
+static void handleLaneDiag();    // /lanediag
 
 
 static bool otaAuthOK() { return true; } // stub (shared with SD module)
@@ -910,7 +911,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
     return;
   }
 
-  // === SPI (two-lane) path — FIXED indexing ===
+  // === SPI (two-lane) path — indexing ===
   const uint16_t spokes = spokesCount();
   const uint8_t  arms   = activeArmCount();
   const uint16_t pixelCount = armPixelCount();
@@ -1719,17 +1720,20 @@ static void handleStrobe() {
   bool haveDeg    = server.hasArg("deg");
   bool havePhase  = server.hasArg("phase");
   if (!haveEnable && !haveDeg && !havePhase) { server.send(400, "application/json", "{\"error\":\"missing parameters\"}"); return; }
-  if (haveEnable) { g_strobeEnable = parseBoolArg(server.arg("enable")); }
+  if (haveEnable) { g_strobeEnable = parseBoolArg(server.arg("enable")); prefs.putBool("strb_e", g_strobeEnable); }
   if (haveDeg) {
     g_strobeWidthDeg = server.arg("deg").toFloat();
     if (g_strobeWidthDeg < 0.1f) g_strobeWidthDeg = 0.1f;
     if (g_strobeWidthDeg > 10.0f) g_strobeWidthDeg = 10.0f;
+    prefs.putFloat("strb_deg", g_strobeWidthDeg);
   }
   if (havePhase) {
     g_strobePhaseDeg = server.arg("phase").toFloat();
     while (g_strobePhaseDeg < -180.f) g_strobePhaseDeg += 360.f;
     while (g_strobePhaseDeg >  180.f) g_strobePhaseDeg -= 360.f;
+    prefs.putFloat("strb_ph", g_strobePhaseDeg);
   }
+  persistSettingsToSd();
   server.send(200, "application/json",
               String("{\"strobe\":{\"enable\":") + (g_strobeEnable ? "true":"false") +
               ",\"deg\":" + String(g_strobeWidthDeg,2) +
@@ -1843,9 +1847,8 @@ static void startWifiAP(){
   server.on("/watchdog",HTTP_POST, handleWatchdog);
   server.on("/bgeffect",HTTP_POST, handleBgEffect);
   
-//SPI Lane Diag
+  // SPI Lane Diag
   server.on("/lanediag", HTTP_POST, handleLaneDiag);
-
 
   // Strobe + per-arm phase
   server.on("/strobe",   HTTP_POST, handleStrobe);
@@ -1972,6 +1975,11 @@ void setup(){
   if (g_outputMode != OUT_SPI && g_outputMode != OUT_PARALLEL) g_outputMode = OUT_SPI;
   if (g_outputMode == OUT_PARALLEL) configureParallelPins();
 
+  // Strobe prefs (NEW): defaults to disabled
+  g_strobeEnable   = prefs.getBool("strb_e", false);
+  g_strobeWidthDeg = prefs.getFloat("strb_deg", 3.0f);
+  g_strobePhaseDeg = prefs.getFloat("strb_ph", 0.0f);
+
   if (PIN_STROBE_GATE >= 0) { pinMode(PIN_STROBE_GATE, OUTPUT); digitalWrite(PIN_STROBE_GATE, LOW); }
 
   bool card = cardPresent();
@@ -2011,6 +2019,7 @@ void setup(){
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm);
   Serial.printf("[OUTMODE] %s\n", (g_outputMode==OUT_PARALLEL?"PARALLEL":"SPI"));
+  Serial.printf("[STROBE] enable=%d width=%.2f phase=%.2f\n", (int)g_strobeEnable, g_strobeWidthDeg, g_strobePhaseDeg);
 
   startWifiAP();
 
