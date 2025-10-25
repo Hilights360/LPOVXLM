@@ -109,7 +109,8 @@ volatile uint32_t        g_lastPeriodUs      = 0;   // last valid pulse period (
 volatile uint32_t        g_pulseCount        = 0;   // total pulses seen
 volatile uint32_t        g_lastPulseUsIsr    = 0;   // last pulse timestamp (us) in ISR
 static uint32_t          g_rpmUi             = 0;   // filtered RPM for UI/status
-static uint32_t          g_lastRpmUpdateMs   = 0;
+static uint32_t          g_lastRpmUpdateMs   = 0;   // ms timestamp of last RPM activity
+static const uint8_t     RPM_AVERAGE_REVS    = 2;   // revolutions to average per measurement
 
 // --- NEW: RPM configuration & counting-based measurement ---
 static volatile uint8_t  g_pulsesPerRev   = PULSES_PER_REV; // runtime-configurable PPR
@@ -1076,6 +1077,9 @@ static inline const char* statusClass(){ if (g_paused && g_playing) return "badg
 
 static uint32_t computeRpmSnapshot() {
   uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
+  uint32_t pulsesPerRev = (g_pulsesPerRev ? g_pulsesPerRev : 1u);
+  uint32_t targetPulses = pulsesPerRev * RPM_AVERAGE_REVS;
   if (g_rpmSampleUs == 0) {
     g_rpmSampleUs  = nowUs;
     g_rpmLastCount = g_pulseCount;
@@ -1094,30 +1098,45 @@ static uint32_t computeRpmSnapshot() {
     if (delta > 0) {
       g_rpmAccumulatedPulses += delta;
       g_rpmLastCount = countNow;
-
-      if (g_pulsesPerRev > 0) {
-        uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)g_pulsesPerRev;
+      g_lastRpmUpdateMs = nowMs;
+      if (g_rpmAccumulatedPulses >= targetPulses && g_rpmAccumulatedUs > 0) {
+        uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)pulsesPerRev;
         uint64_t num   = (uint64_t)g_rpmAccumulatedPulses * 60000000ULL;
-        uint32_t inst  = (denom ? (uint32_t)((num + denom / 2) / denom) : 0);
+        uint32_t inst  = (uint32_t)((num + denom / 2) / denom);
         if (inst > 0) {
           g_rpmUi = (g_rpmUi * 3 + inst) / 4;
-          g_lastRpmUpdateMs = millis();
         }
+        g_rpmAccumulatedUs = 0;
+        g_rpmAccumulatedPulses = 0;
       }
-
-      g_rpmAccumulatedUs = 0;
-      g_rpmAccumulatedPulses = 0;
-    } else {
-      if (g_rpmAccumulatedUs > 6000000ULL) g_rpmAccumulatedUs = 6000000ULL;
     }
   }
 
-  if (millis() - g_lastRpmUpdateMs > 2000) {
-    g_rpmUi = 0;
+  uint32_t staleThresholdMs = 2000;
+  if (g_rpmAccumulatedPulses > 0 && g_rpmAccumulatedPulses < targetPulses && g_rpmAccumulatedUs > 0) {
+    uint64_t avgPulseUs = g_rpmAccumulatedUs / g_rpmAccumulatedPulses;
+    uint64_t expectedUs = avgPulseUs * (uint64_t)(targetPulses - g_rpmAccumulatedPulses);
+    uint32_t expectedMs = (uint32_t)(expectedUs / 1000ULL);
+    uint32_t bufferedMs = expectedMs + 500u;
+    if (bufferedMs > staleThresholdMs) staleThresholdMs = bufferedMs;
+  }
+
+  if (nowMs - g_lastRpmUpdateMs > staleThresholdMs) {
+    if (g_rpmAccumulatedPulses > 0 && g_rpmAccumulatedUs > 0) {
+      uint64_t denom = (uint64_t)g_rpmAccumulatedUs * (uint64_t)pulsesPerRev;
+      uint64_t num   = (uint64_t)g_rpmAccumulatedPulses * 60000000ULL;
+      uint32_t inst  = (uint32_t)((num + denom / 2) / denom);
+      if (inst > 0) {
+        g_rpmUi = (g_rpmUi * 3 + inst) / 4;
+      }
+    } else {
+      g_rpmUi = 0;
+    }
     g_rpmAccumulatedUs = 0;
     g_rpmAccumulatedPulses = 0;
     g_rpmSampleUs = nowUs;
     g_rpmLastCount = g_pulseCount;
+    g_lastRpmUpdateMs = nowMs;
   }
   return g_rpmUi;
 }
