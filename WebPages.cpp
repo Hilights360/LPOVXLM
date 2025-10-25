@@ -162,6 +162,7 @@ String rootPage(const String &statusClass,
                 uint16_t maxPixelsPerArm,
                 uint16_t fps,
                 uint8_t brightnessPercent,
+                uint8_t armDisplayPercent,
                 uint8_t sdPreferredMode,
                 uint32_t sdBaseFreqKHz,
                 uint8_t sdActiveWidth,
@@ -286,14 +287,20 @@ String rootPage(const String &statusClass,
 
   html += "<h3>Playback Speed</h3>"
           "<label>FPS: <span id='fpsv'>" + String(fps) + "</span></label>"
-          "<input id='fps' type='range' min='1' max='120' value='" + String(fps) + "'>"
-          "<div class='row'><button id='applyfps'>Apply</button><button id='fps10'>10 FPS</button><button id='fps40'>40 FPS</button><button id='fps60'>60 FPS</button></div>"
+          "<input id='fps' type='range' min='1' max='60' value='" + String(fps) + "'>"
+          "<div class='row'><button id='applyfps'>Apply</button><button id='fps10'>10 FPS</button><button id='fps20'>20 FPS</button><button id='fps40'>40 FPS</button></div>"
           "<div class='sep'></div>";
 
   html += "<h3>Brightness</h3>"
           "<label>Value: <span id='v'>" + String(brightnessPercent) + "%</span></label>"
           "<input id='rng' type='range' min='0' max='100' value='" + String(brightnessPercent) + "'>"
           "<div class='row'><button id='set'>Apply</button><button id='low'>10%</button><button id='med'>40%</button><button id='hi'>100%</button></div>"
+          "<div class='sep'></div>";
+
+  html += "<h3>Arm Display Time</h3>"
+          "<label>Display Time: <span id='armdispv'>" + String((unsigned)armDisplayPercent) + "%</span></label>"
+          "<input id='armdisp' type='range' min='0' max='100' value='" + String((unsigned)armDisplayPercent) + "'>"
+          "<div class='row'><button id='applyarmdisp'>Apply</button><button id='armdisp25'>25%</button><button id='armdisp50'>50%</button><button id='armdisp75'>75%</button></div>"
           "<div class='sep'></div>";
 
   html += "<h3>SD Card</h3>"
@@ -374,10 +381,19 @@ function post(u){fetch(u,{method:'POST'}).then(()=>location.reload());}
 
 const applyfps=document.getElementById('applyfps');
 if(applyfps){applyfps.onclick=()=>post('/speed?fps='+fps.value);}
-const fps10=document.getElementById('fps10'), fps40=document.getElementById('fps40'), fps60=document.getElementById('fps60');
+const fps10=document.getElementById('fps10'), fps20=document.getElementById('fps20'), fps40=document.getElementById('fps40');
 if(fps10){fps10.onclick=()=>post('/speed?fps=10');}
+if(fps20){fps20.onclick=()=>post('/speed?fps=20');}
 if(fps40){fps40.onclick=()=>post('/speed?fps=40');}
-if(fps60){fps60.onclick=()=>post('/speed?fps=60');}
+
+const armdisp=document.getElementById('armdisp'), armdispv=document.getElementById('armdispv');
+if(armdisp){armdisp.oninput=()=>armdispv.textContent=armdisp.value+'%';}
+const applyarmdisp=document.getElementById('applyarmdisp');
+if(applyarmdisp && armdisp){applyarmdisp.onclick=()=>post('/displaypct?value='+armdisp.value);}
+const armdisp25=document.getElementById('armdisp25'), armdisp50=document.getElementById('armdisp50'), armdisp75=document.getElementById('armdisp75');
+if(armdisp25){armdisp25.onclick=()=>{if(armdisp){armdisp.value=25; armdisp.dispatchEvent(new Event('input'));} post('/displaypct?value=25');};}
+if(armdisp50){armdisp50.onclick=()=>{if(armdisp){armdisp.value=50; armdisp.dispatchEvent(new Event('input'));} post('/displaypct?value=50');};}
+if(armdisp75){armdisp75.onclick=()=>{if(armdisp){armdisp.value=75; armdisp.dispatchEvent(new Event('input'));} post('/displaypct?value=75');};}
 
 const setB=document.getElementById('set'), low=document.getElementById('low'), med=document.getElementById('med'), hi=document.getElementById('hi');
 if(setB){setB.onclick=()=>post('/b?value='+r.value);}

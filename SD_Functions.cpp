@@ -50,6 +50,7 @@ enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
 extern uint8_t g_outputMode;
 extern uint8_t g_brightnessPercent;
 extern uint8_t g_brightness;
+extern uint8_t g_armDisplayPercent;
 extern uint16_t g_fps;
 extern uint32_t g_startChArm1;
 extern uint16_t g_spokesTotal;
@@ -95,6 +96,7 @@ bool saveSettingsBackupLocked() {
     return false;
   }
   f.print("brightness="); f.println((unsigned)g_brightnessPercent);
+  f.print("displaypct="); f.println((unsigned)g_armDisplayPercent);
   f.print("fps=");        f.println((unsigned)g_fps);
   f.print("startch=");    f.println((unsigned long)g_startChArm1);
   f.print("spokes=");     f.println((unsigned)g_spokesTotal);
@@ -126,7 +128,8 @@ bool loadSettingsBackupLocked(SettingsData &out) {
     String key = line.substring(0, eq);
     String value = line.substring(eq + 1);
     if (key == "brightness") { out.hasBrightness = true; out.brightness = (uint8_t)clampU32(value.toInt(),0,100); }
-    else if (key == "fps")   { out.hasFps = true; out.fps = (uint16_t)clampU32(value.toInt(),1,120); }
+    else if (key == "displaypct") { out.hasDisplayPct = true; out.displayPct = (uint8_t)clampU32(value.toInt(),0,100); }
+    else if (key == "fps")   { out.hasFps = true; out.fps = (uint16_t)clampU32(value.toInt(),1,60); }
     else if (key == "startch") { out.hasStartCh = true; out.startCh = (uint32_t)strtoul(value.c_str(), nullptr, 10); }
     else if (key == "spokes") { out.hasSpokes = true; out.spokes = (uint16_t)clampU32(value.toInt(),1,65535); }
     else if (key == "arms")   { out.hasArms = true; out.arms = clampArmCount(value.toInt()); }
@@ -207,6 +210,10 @@ void ensureSettingsFromBackup(const PrefPresence &present) {
   if (!present.fps && data.hasFps) {
     g_fps = data.fps ? data.fps : 40;
     prefs.putUShort("fps", g_fps);
+  }
+  if (!present.displayPct && data.hasDisplayPct) {
+    g_armDisplayPercent = (uint8_t)clampU32(data.displayPct, 0, 100);
+    prefs.putUChar("displaypct", g_armDisplayPercent);
   }
   if (!present.startCh && data.hasStartCh) {
     g_startChArm1 = data.startCh ? data.startCh : 1;
