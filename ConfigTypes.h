@@ -30,6 +30,7 @@ enum SdBusPreference : uint8_t { SD_BUS_AUTO=0, SD_BUS_1BIT=1, SD_BUS_4BIT=4 };
 // Presence flags for what exists in NVS (preferences)
 struct PrefPresence {
   bool brightness=false;
+  bool armDisplay=false;
   bool fps=false;
   bool startCh=false;
   bool spokes=false;
@@ -50,6 +51,7 @@ struct PrefPresence {
 // Values loaded from /config/settings.ini (SD backup)
 struct SettingsData {
   bool hasBrightness=false; uint8_t  brightness=0;
+  bool hasArmDisplay=false; uint8_t  armDisplay=0;
   bool hasFps=false;        uint16_t fps=0;
   bool hasStartCh=false;    uint32_t startCh=0;
   bool hasSpokes=false;     uint16_t spokes=0;
