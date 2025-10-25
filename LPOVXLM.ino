@@ -301,6 +301,7 @@ uint32_t      g_staConnectStartMs   = 0;
 // ---------- Persisted settings (NVS = flash) ----------
 Preferences prefs;
 uint8_t  g_brightnessPercent = 25;
+uint8_t  g_displayDutyPercent = 60;
 uint16_t g_fps               = 40;
 uint32_t g_framePeriodMs     = 25;
 bool     g_autoplayEnabled   = true;
@@ -344,7 +345,8 @@ static ArmRuntimeState g_armState[MAX_ARMS];
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
+static const uint32_t  ARM_BLANK_MIN_US      = 40;  // microseconds each spoke stays lit at minimum
+static const uint32_t  ARM_BLANK_FALLBACK_US = 1000; // fallback if spoke duration unknown
 static bool            g_frameValid          = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
@@ -354,6 +356,7 @@ static inline bool microsReached(uint32_t now, uint32_t target) {
 static void resetArmRuntimeStates();
 static void blankArm(uint8_t arm);
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs);
+static uint32_t computeArmHoldDurationUs();
 static void processArmBlanking(uint32_t nowUs);
 static void processHallSyncEvent(uint32_t nowUs);
 static void advancePredictedSpokes(uint32_t nowUs);
@@ -892,8 +895,29 @@ static void blackoutAll(){
   resetArmRuntimeStates();
 }
 
+static uint32_t computeArmHoldDurationUs(){
+  uint32_t base = g_spokeDurationUs;
+  if (base == 0) {
+    const uint16_t spokes = spokesCount();
+    if (spokes > 0 && g_lastPeriodUs > 0) {
+      uint8_t ppr = g_pulsesPerRev ? g_pulsesPerRev : 1;
+      uint64_t revUs = (uint64_t)g_lastPeriodUs * (uint64_t)ppr;
+      base = (uint32_t)(revUs / (uint64_t)spokes);
+    }
+  }
+  if (base == 0) base = ARM_BLANK_FALLBACK_US;
+
+  uint32_t duty = g_displayDutyPercent;
+  if (duty > 100) duty = 100;
+  uint64_t hold = ((uint64_t)base * (uint64_t)duty) / 100ULL;
+  if (hold < ARM_BLANK_MIN_US) hold = ARM_BLANK_MIN_US;
+  return (uint32_t)hold;
+}
+
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (arm >= MAX_ARMS) return;
+
+  const uint32_t holdUs = computeArmHoldDurationUs();
 
   // === Parallel fallback (unchanged) ===
   if (g_outputMode == OUT_PARALLEL) {
@@ -905,7 +929,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
       for (uint8_t a = 0; a < arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+        g_armState[a].blankDeadlineUs = nowUs + holdUs;
         if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
       }
     }
@@ -973,7 +997,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+  g_armState[arm].blankDeadlineUs = nowUs + holdUs;
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
 
@@ -1147,6 +1171,7 @@ static void handleStatus(){
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
     +",\"fps\":"+String(g_fps)
+    +",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
     +",\"arms\":"+String(g_armCount)
@@ -1202,7 +1227,7 @@ static void handleRoot() {
                                    g_staSsid, staStatus, staIp, g_stationId,
                                   g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                   MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                  g_fps, g_brightnessPercent,
+                                  g_fps, g_displayDutyPercent, g_brightnessPercent,
                                   (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
@@ -1210,6 +1235,22 @@ static void handleRoot() {
                                    bgOptions);
 
   server.send(200, "text/html; charset=utf-8", html);
+}
+
+static void applyDisplayDuty(uint8_t pct){
+  if (pct > 100) pct = 100;
+  g_displayDutyPercent = pct;
+  prefs.putUChar("duty", g_displayDutyPercent);
+  persistSettingsToSd();
+
+  uint32_t now = micros();
+  uint32_t hold = computeArmHoldDurationUs();
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (!g_armState[a].lit) continue;
+    g_armState[a].blankDeadlineUs = now + hold;
+    if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+  }
 }
 
 static void applyBrightness(uint8_t pct){
@@ -1231,6 +1272,21 @@ static void handleB(){
   if (pct > 100) pct = 100;
   applyBrightness((uint8_t)pct);
   server.send(200, "application/json", String("{\"brightness\":") + pct + "}");
+}
+
+static void handleDuty(){
+  int pct = -1;
+  bool provided = false;
+  if (server.hasArg("percent")) { pct = server.arg("percent").toInt(); provided = true; }
+  else if (server.hasArg("p"))  { pct = server.arg("p").toInt(); provided = true; }
+  else if (server.hasArg("v"))  { pct = server.arg("v").toInt(); provided = true; }
+  else if (server.hasArg("value")) { pct = server.arg("value").toInt(); provided = true; }
+
+  if (!provided) { server.send(400, "text/plain", "missing"); return; }
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  applyDisplayDuty((uint8_t)pct);
+  server.send(200, "application/json", String("{\"duty\":") + (unsigned)g_displayDutyPercent + "}");
 }
 
 static void handleStart(){
@@ -1854,6 +1910,7 @@ static void startWifiAP(){
   // Playback & settings
   server.on("/play",    HTTP_GET,  handlePlayLink);
   server.on("/b",       HTTP_POST, handleB);
+  server.on("/duty",    HTTP_POST, handleDuty);
   server.on("/start",   HTTP_GET,  handleStart);
   server.on("/stop",    HTTP_POST, handleStop);
   server.on("/pause",   HTTP_POST, handlePause);
@@ -1941,6 +1998,9 @@ void setup(){
   g_sdFreqKHz = g_sdBaseFreqKHz;
   present.brightness = prefs.isKey("brightness");
   g_brightnessPercent = prefs.getUChar("brightness", 25);
+  present.duty = prefs.isKey("duty");
+  g_displayDutyPercent = prefs.getUChar("duty", 60);
+  if (g_displayDutyPercent > 100) g_displayDutyPercent = 100;
   present.fps = prefs.isKey("fps");
   g_fps = prefs.getUShort("fps", 40);
   present.startCh = prefs.isKey("startch");
@@ -2112,8 +2172,15 @@ void loop(){
   }
 
   const uint32_t now = millis();
-  if (now - g_lastTickMs >= g_framePeriodMs) {
-    g_lastTickMs = now;
+  const uint32_t periodMs = g_framePeriodMs ? g_framePeriodMs : 1;
+  uint32_t elapsed = now - g_lastTickMs;
+  if (elapsed >= periodMs) {
+    uint32_t periods = elapsed / periodMs;
+    if (periods == 0) periods = 1;
+    g_lastTickMs += periods * periodMs;
+    if ((uint32_t)(now - g_lastTickMs) >= periodMs) {
+      g_lastTickMs = now;
+    }
 
     if (!loadNextFrame()) {
       ++g_sdFailStreak;
