@@ -38,6 +38,7 @@ struct PrefPresence {
   bool staSsid=false;
   bool staPass=false;
   bool station=false;
+  bool displayPct=false;
   bool sdMode=false;
   bool sdFreq=false;
   bool autoplay=false;
@@ -50,6 +51,7 @@ struct PrefPresence {
 // Values loaded from /config/settings.ini (SD backup)
 struct SettingsData {
   bool hasBrightness=false; uint8_t  brightness=0;
+  bool hasDisplayPct=false; uint8_t displayPct=0;
   bool hasFps=false;        uint16_t fps=0;
   bool hasStartCh=false;    uint32_t startCh=0;
   bool hasSpokes=false;     uint16_t spokes=0;

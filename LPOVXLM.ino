@@ -344,15 +344,36 @@ static ArmRuntimeState g_armState[MAX_ARMS];
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
-static const uint32_t  ARM_BLANK_DELAY_US    = 80; // microseconds each spoke stays lit
-static bool            g_frameValid          = false;
+static const uint32_t  DEFAULT_ARM_DISPLAY_US     = 80;  // fallback microseconds each spoke stays lit
+static const uint8_t   DEFAULT_ARM_DISPLAY_PERCENT = 20; // default % of spoke duration to stay lit
+uint8_t                g_armDisplayPercent        = DEFAULT_ARM_DISPLAY_PERCENT;
+static bool            g_frameValid               = false;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
   return (int32_t)(now - target) >= 0;
 }
 
+static inline uint32_t computeArmDisplayWindowUs() {
+  uint32_t pct = g_armDisplayPercent;
+  if (pct == 0) return 1;
+
+  uint32_t spokeUs = g_spokeDurationUs;
+  uint64_t window = 0;
+  if (spokeUs > 0) {
+    window = ((uint64_t)spokeUs * (uint64_t)pct) / 100ULL;
+    if (window > spokeUs) window = spokeUs;
+  } else {
+    window = ((uint64_t)DEFAULT_ARM_DISPLAY_US * (uint64_t)pct) /
+             (uint64_t)DEFAULT_ARM_DISPLAY_PERCENT;
+  }
+  if (window == 0) window = 1;
+  if (window > UINT32_MAX) window = UINT32_MAX;
+  return (uint32_t)window;
+}
+
 static void resetArmRuntimeStates();
 static void blankArm(uint8_t arm);
+static void blackoutAll();
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs);
 static void processArmBlanking(uint32_t nowUs);
 static void processHallSyncEvent(uint32_t nowUs);
@@ -521,6 +542,7 @@ static void handlePause();
 static void handleHallDiag();
 static void handleArmTest();
 static void handleSpeed();
+static void handleDisplayWindow();
 static void handleMapCfg();
 static void handleWifiCfg();
 static void handleFseqHeader();
@@ -900,12 +922,13 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
     if (arm == 0) {
       configureParallelPins();
       sk9822_tx_parallel_spoke(spokeIdx);
+      const uint32_t displayWindow = computeArmDisplayWindowUs();
       const uint8_t arms = activeArmCount();
       const uint16_t sct = spokesCount();
       for (uint8_t a = 0; a < arms; ++a) {
         g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
         g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+        g_armState[a].blankDeadlineUs = nowUs + displayWindow;
         if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
       }
     }
@@ -973,7 +996,8 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   armShow(arm);
   g_armState[arm].lit = true;
-  g_armState[arm].blankDeadlineUs = nowUs + ARM_BLANK_DELAY_US;
+  const uint32_t displayWindow = computeArmDisplayWindowUs();
+  g_armState[arm].blankDeadlineUs = nowUs + displayWindow;
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
 
@@ -1147,6 +1171,7 @@ static void handleStatus(){
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
     +",\"fps\":"+String(g_fps)
+    +",\"displayPct\":"+String(g_armDisplayPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
     +",\"arms\":"+String(g_armCount)
@@ -1199,10 +1224,10 @@ static void handleRoot() {
   String staIp = (staConnected) ? WiFi.localIP().toString() : String("-");
   String html = WebPages::rootPage(String(statusClass()), String(statusText()), curEsc, options,
                                    String(AP_SSID), apIp, String("pov.local"),
-                                   g_staSsid, staStatus, staIp, g_stationId,
-                                  g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
+                                  g_staSsid, staStatus, staIp, g_stationId,
+                                 g_startChArm1, g_spokesTotal, g_armCount, g_pixelsPerArm,
                                   MAX_ARMS, MAX_PIXELS_PER_ARM,
-                                  g_fps, g_brightnessPercent,
+                                  g_fps, g_brightnessPercent, g_armDisplayPercent,
                                   (uint8_t)g_sdPreferredBusWidth, g_sdBaseFreqKHz,
                                    g_sdBusWidth, g_sdFreqKHz, g_sdReady,
                                    g_playing, g_paused, g_autoplayEnabled, g_hallDiagEnabled,
@@ -1399,6 +1424,23 @@ static void handleSpeed() {
   g_lastTickMs = millis();
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
+}
+
+static void handleDisplayWindow() {
+  int pct = -1;
+  if (server.hasArg("percent")) pct = server.arg("percent").toInt();
+  else if (server.hasArg("p")) pct = server.arg("p").toInt();
+  else if (server.hasArg("value")) pct = server.arg("value").toInt();
+
+  if (pct < 0) { server.send(400, "text/plain", "missing percent"); return; }
+  if (pct > 100) pct = 100;
+
+  g_armDisplayPercent = (uint8_t)pct;
+  prefs.putUChar("disp_pct", g_armDisplayPercent);
+  persistSettingsToSd();
+  blackoutAll();
+  Serial.printf("[ARM] display window set to %d%% of spoke\n", pct);
+  server.send(200, "application/json", String("{\"displayPct\":") + pct + "}");
 }
 
 static void handleMapCfg(){
@@ -1860,6 +1902,7 @@ static void startWifiAP(){
   server.on("/halldiag", HTTP_POST, handleHallDiag);
   server.on("/armtest", HTTP_POST, handleArmTest);
   server.on("/speed",   HTTP_POST, handleSpeed);
+  server.on("/armwindow", HTTP_POST, handleDisplayWindow);
   server.on("/mapcfg",  HTTP_POST, handleMapCfg);
   server.on("/wifi",    HTTP_POST, handleWifiCfg);
   server.on("/autoplay",HTTP_POST, handleAutoplay);
@@ -1941,6 +1984,8 @@ void setup(){
   g_sdFreqKHz = g_sdBaseFreqKHz;
   present.brightness = prefs.isKey("brightness");
   g_brightnessPercent = prefs.getUChar("brightness", 25);
+  present.displayPct = prefs.isKey("disp_pct");
+  g_armDisplayPercent = (uint8_t)clampU32(prefs.getUChar("disp_pct", DEFAULT_ARM_DISPLAY_PERCENT), 0, 100);
   present.fps = prefs.isKey("fps");
   g_fps = prefs.getUShort("fps", 40);
   present.startCh = prefs.isKey("startch");
@@ -2033,6 +2078,7 @@ void setup(){
     Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
   }
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
+  Serial.printf("[ARM DISPLAY] %u%% of spoke duration\n", g_armDisplayPercent);
   Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
