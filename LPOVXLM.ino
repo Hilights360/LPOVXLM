@@ -305,7 +305,7 @@ Preferences prefs;
 uint8_t  g_brightnessPercent = 25;
 uint8_t  g_displayDutyPercent = 60;
 uint16_t g_fps               = 40;
-uint32_t g_framePeriodMs     = 25;
+uint32_t g_framePeriodUs     = 25000;
 bool     g_autoplayEnabled   = true;
 bool     g_bgEffectEnabled   = false;
 bool     g_bgEffectActive    = false;
@@ -330,7 +330,9 @@ volatile uint16_t g_indexPosition = 0;
 // Playback state
 volatile bool  g_playing = false, g_paused = false;
 String         g_currentPath;
-uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
+uint32_t       g_frameIndex = 0;
+uint32_t       g_nextFrameIndex = 0;
+uint32_t       g_lastTickUs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
@@ -348,19 +350,36 @@ static uint16_t        g_spokeStep           = 0;
 static const uint32_t  ARM_BLANK_MIN_US      = 40;   // minimum ON microseconds per spoke
 static const uint32_t  ARM_BLANK_FALLBACK_US = 1000; // fallback if duration unknown
 static bool            g_frameValid          = false;
+static bool            g_frameBackReady      = false;
+static uint32_t        g_frameBackIndex      = 0;
+static uint32_t        g_lastPrefetchAttemptUs = 0;
+static uint32_t        g_lastFrameSwapUs     = 0;
+static uint32_t        g_fpsWindowStartUs    = 0;
+static uint32_t        g_fpsWindowIntervals  = 0;
+static uint64_t        g_fpsWindowAccumUs    = 0;
+static uint32_t        g_lastActualFpsTimes100 = 0;
+static uint32_t        g_lastAverageFrameUs  = 0;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
   return (int32_t)(now - target) >= 0;
 }
+
+enum SdResult { SD_RESULT_OK, SD_RESULT_BUSY, SD_RESULT_ERROR };
 
 static void resetArmRuntimeStates();
 static void blankArm(uint8_t arm);
 static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs);
 static uint32_t computeArmHoldDurationUs();
 static void processArmBlanking(uint32_t nowUs);
+static SdResult loadFrame(uint32_t idx, uint8_t* dest, TickType_t timeoutTicks);
+static bool primeInitialFrame();
+static SdResult prefetchNextFrame(TickType_t timeoutTicks);
+static bool swapPrefetchedFrame(uint32_t nowUs);
+static SdResult maybePrefetchFrame(uint32_t nowUs, bool force);
+static void recordFrameSwap(uint32_t nowUs);
+static void handlePlaybackSdFailure(const char* reason);
 static void processHallSyncEvent(uint32_t nowUs);
 static void advancePredictedSpokes(uint32_t nowUs);
-static bool loadNextFrame();
 
 /* -------------------- Strobe gating / angular timing -------------------- */
 static const int PIN_STROBE_GATE = -1; // -1 to disable gate pin
@@ -562,7 +581,9 @@ struct FseqHeader {
 File         g_fseq;
 FseqHeader   g_fh;
 SparseRange* g_ranges      = nullptr;
-uint8_t*     g_frameBuf    = nullptr;
+uint8_t*     g_frameBufFront = nullptr;
+uint8_t*     g_frameBufBack  = nullptr;
+uint8_t*     g_frameBuf      = nullptr;
 CompBlock*   g_cblocks     = nullptr;
 uint32_t     g_compCount   = 0;
 uint64_t     g_compBase    = 0;
@@ -594,14 +615,26 @@ static inline bool readU64(File &f, uint64_t &out) {
 static void freeFseq(){
   if (g_fseq) g_fseq.close();
   if (g_ranges){ free(g_ranges); g_ranges=nullptr; }
-  if (g_frameBuf){ free(g_frameBuf); g_frameBuf=nullptr; }
+  if (g_frameBufFront){ free(g_frameBufFront); g_frameBufFront=nullptr; }
+  if (g_frameBufBack){ free(g_frameBufBack); g_frameBufBack=nullptr; }
+  g_frameBuf = nullptr;
   if (g_cblocks){ free(g_cblocks); g_cblocks=nullptr; }
   if (s_ctmp){ free(s_ctmp); s_ctmp=nullptr; s_ctmp_size=0; }
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
   g_bgEffectActive = false;
   memset(&g_fh,0,sizeof(g_fh));
   g_frameValid = false;
+  g_frameBackReady = false;
   g_frameIndex = 0;
+  g_nextFrameIndex = 0;
+  g_frameBackIndex = 0;
+  g_lastPrefetchAttemptUs = 0;
+  g_lastFrameSwapUs = 0;
+  g_fpsWindowStartUs = 0;
+  g_fpsWindowIntervals = 0;
+  g_fpsWindowAccumUs = 0;
+  g_lastActualFpsTimes100 = 0;
+  g_lastAverageFrameUs = 0;
   resetArmRuntimeStates();
   g_playing = false;
   g_paused = false;
@@ -681,11 +714,15 @@ bool openFseq(const String& path, String& why){
     } else { why="zstd unsupported"; break; }
 
     if (g_fh.channelCount==0){ why="zero chans"; break; }
-    g_frameBuf = (uint8_t*)malloc(g_fh.channelCount);
-    if (!g_frameBuf){ why="oom frame"; break; }
+    g_frameBufFront = (uint8_t*)malloc(g_fh.channelCount);
+    if (!g_frameBufFront){ why="oom frame"; break; }
+    g_frameBufBack = (uint8_t*)malloc(g_fh.channelCount);
+    if (!g_frameBufBack){ why="oom frame2"; break; }
+    g_frameBuf = g_frameBufFront;
 
     g_currentPath = path;
     g_frameIndex = 0;
+    g_nextFrameIndex = 0;
     g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
 
     ok = true;
@@ -695,9 +732,12 @@ bool openFseq(const String& path, String& why){
   if (ok) {
     resetArmRuntimeStates();
     g_frameValid = false;
-    if (!loadNextFrame()) { why = "frame load"; ok = false; }
+    g_frameBackReady = false;
+    g_lastPrefetchAttemptUs = 0;
+    if (!primeInitialFrame()) { why = "frame load"; ok = false; }
     else {
-      g_lastTickMs = millis();
+      (void)prefetchNextFrame(pdMS_TO_TICKS(50));
+      g_lastTickUs = micros();
       g_playing = true;
       g_paused = false;
       Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
@@ -710,17 +750,17 @@ bool openFseq(const String& path, String& why){
   return ok;
 }
 
-static bool loadFrame(uint32_t idx){
-  if (!g_fseq || !g_fh.frameCount) return false;
+static SdResult loadFrame(uint32_t idx, uint8_t* dest, TickType_t timeoutTicks){
+  if (!g_fseq || !g_fh.frameCount || !dest) return SD_RESULT_ERROR;
   idx %= g_fh.frameCount;
 
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  if (!g_sdMutex || !SD_LOCK(timeoutTicks)) return SD_RESULT_BUSY;
   bool ok=false;
 
   if (g_fh.compType == 0){
     const uint64_t base = (uint64_t)g_fh.chanDataOffset + (uint64_t)idx * (uint64_t)g_fh.channelCount;
     if (g_fseq.seek(base, SeekSet))
-      ok = (g_fseq.read(g_frameBuf, g_fh.channelCount) == g_fh.channelCount);
+      ok = (g_fseq.read(dest, g_fh.channelCount) == g_fh.channelCount);
   }
 #if defined(MZ_OK) || defined(Z_OK)
   else if (g_fh.compType == 2 && g_compPerFrame){
@@ -731,27 +771,124 @@ static bool loadFrame(uint32_t idx){
       if (clen && clen <= 8*1024*1024) {
         if (s_ctmp_size < clen) {
           uint8_t* nb = (uint8_t*)realloc(s_ctmp, clen);
-          if (!nb) { SD_UNLOCK(); return false; }
+          if (!nb) { SD_UNLOCK(); return SD_RESULT_ERROR; }
           s_ctmp = nb; s_ctmp_size = clen;
         }
         size_t got = g_fseq.read(s_ctmp, clen);
-        if (got == clen) ok = zlib_decompress(s_ctmp, clen, g_frameBuf, g_fh.channelCount);
+        if (got == clen) ok = zlib_decompress(s_ctmp, clen, dest, g_fh.channelCount);
       }
     }
   }
 #endif
   SD_UNLOCK();
-  return ok;
+  return ok ? SD_RESULT_OK : SD_RESULT_ERROR;
 }
 
-static bool loadNextFrame(){
-  if (!g_fseq || !g_fh.frameCount) return false;
-  uint32_t count = g_fh.frameCount;
-  uint32_t idx = g_frameIndex % count;
-  if (!loadFrame(idx)) return false;
-  g_frameIndex = (idx + 1) % count;
+static bool primeInitialFrame(){
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufFront) return false;
+  g_nextFrameIndex = 0;
+  SdResult res = loadFrame(0, g_frameBufFront, pdMS_TO_TICKS(2000));
+  if (res != SD_RESULT_OK) return false;
+  g_frameBuf = g_frameBufFront;
+  g_frameIndex = 0;
+  if (g_fh.frameCount > 0) {
+    g_nextFrameIndex = (g_frameIndex + 1) % g_fh.frameCount;
+  } else {
+    g_nextFrameIndex = 0;
+  }
   g_frameValid = true;
+  g_frameBackReady = false;
+  g_frameBackIndex = 0;
+  g_lastFrameSwapUs = 0;
+  g_fpsWindowStartUs = 0;
+  g_fpsWindowIntervals = 0;
+  g_fpsWindowAccumUs = 0;
+  g_lastActualFpsTimes100 = 0;
+  g_lastAverageFrameUs = 0;
   return true;
+}
+
+static SdResult prefetchNextFrame(TickType_t timeoutTicks){
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufBack) return SD_RESULT_ERROR;
+  if (g_frameBackReady) return SD_RESULT_OK;
+  uint32_t idx = g_nextFrameIndex % g_fh.frameCount;
+  SdResult res = loadFrame(idx, g_frameBufBack, timeoutTicks);
+  if (res == SD_RESULT_OK) {
+    g_frameBackReady = true;
+    g_frameBackIndex = idx;
+    g_nextFrameIndex = (idx + 1) % g_fh.frameCount;
+  }
+  return res;
+}
+
+static bool swapPrefetchedFrame(uint32_t nowUs){
+  if (!g_frameBackReady || !g_frameBufFront || !g_frameBufBack) return false;
+  uint8_t* tmp = g_frameBufFront;
+  g_frameBufFront = g_frameBufBack;
+  g_frameBufBack = tmp;
+  g_frameBuf = g_frameBufFront;
+  g_frameIndex = g_frameBackIndex;
+  g_frameBackReady = false;
+  g_frameValid = true;
+  recordFrameSwap(nowUs);
+  return true;
+}
+
+static SdResult maybePrefetchFrame(uint32_t nowUs, bool force){
+  if (!g_playing || g_paused) return SD_RESULT_OK;
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufBack) return SD_RESULT_BUSY;
+  if (g_frameBackReady) return SD_RESULT_OK;
+  const uint32_t PREFETCH_RETRY_US = 5000;
+  if (!force && g_lastPrefetchAttemptUs != 0) {
+    if ((uint32_t)(nowUs - g_lastPrefetchAttemptUs) < PREFETCH_RETRY_US) return SD_RESULT_BUSY;
+  }
+  g_lastPrefetchAttemptUs = nowUs;
+  return prefetchNextFrame(pdMS_TO_TICKS(50));
+}
+
+static void recordFrameSwap(uint32_t nowUs){
+  if (!g_fpsWindowStartUs) g_fpsWindowStartUs = nowUs;
+  if (g_lastFrameSwapUs) {
+    uint32_t delta = nowUs - g_lastFrameSwapUs;
+    g_fpsWindowAccumUs += delta;
+    ++g_fpsWindowIntervals;
+  }
+  g_lastFrameSwapUs = nowUs;
+
+  const uint32_t WINDOW_US = 1000000;
+  uint32_t elapsedUs = nowUs - g_fpsWindowStartUs;
+  if (elapsedUs >= WINDOW_US && g_fpsWindowIntervals > 0) {
+    uint64_t actualTimes100ULL = ((uint64_t)g_fpsWindowIntervals * 1000000ULL * 100ULL) / (elapsedUs ? elapsedUs : 1ULL);
+    uint32_t actualTimes100 = (uint32_t)actualTimes100ULL;
+    uint32_t avgUs = (uint32_t)(g_fpsWindowAccumUs / g_fpsWindowIntervals);
+    g_lastActualFpsTimes100 = actualTimes100;
+    g_lastAverageFrameUs = avgUs;
+    Serial.printf("[FPS] target=%u actual=%u.%02u avgFrame=%luus\n",
+                  g_fps,
+                  actualTimes100 / 100,
+                  actualTimes100 % 100,
+                  (unsigned long)avgUs);
+    g_fpsWindowStartUs = nowUs;
+    g_fpsWindowIntervals = 0;
+    g_fpsWindowAccumUs = 0;
+  }
+}
+
+static void handlePlaybackSdFailure(const char* reason){
+  ++g_sdFailStreak;
+  Serial.printf("[PLAY] %s — streak=%d\n", reason, g_sdFailStreak);
+  if (!recoverSd(reason)) {
+    if (g_sdFailStreak >= 6) {
+      Serial.println("[SD] Unrecoverable — pausing playback.");
+      g_playing = false;
+      g_bgEffectActive = false;
+      g_bgEffectNextAttemptMs = millis();
+      g_sdFailStreak = 0;
+      g_frameValid = false;
+      blackoutAll();
+    }
+  }
+  feedWatchdog();
 }
 
 /* -------------------- Color mapping -------------------- */
@@ -1001,7 +1138,6 @@ static void processArmBlanking(uint32_t nowUs){
   for (uint8_t a=arms; a<MAX_ARMS; ++a){
     if (g_armState[a].lit) blankArm(a);
   }
-  lanesCommit(); // commit clears once per pass
 }
 
 static void processHallSyncEvent(uint32_t nowUs){
@@ -1040,9 +1176,6 @@ static void processHallSyncEvent(uint32_t nowUs){
     if (g_armState[a].lit) blankArm(a);
   }
 
-  // Commit initial base paint when strobe is OFF
-  if (!g_strobeEnable) lanesCommit();
-
   uint64_t revolutionUs = 0;
   if (g_lastPeriodUs > 0) {
     uint8_t ppr = g_pulsesPerRev ? g_pulsesPerRev : 1;
@@ -1080,7 +1213,6 @@ static void advancePredictedSpokes(uint32_t nowUs){
       uint16_t spoke = (base + g_spokeStep) % spokes;
       paintArmAt(a, spoke, nowUs);
     }
-    lanesCommit();  // single commit per stepped spoke
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
   }
 }
@@ -1163,8 +1295,16 @@ static void handleStatus(){
     +",\"paused\":"+(g_paused?"true":"false")
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
-    +",\"fps\":"+String(g_fps)
-    +",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
+    +",\"fps\":"+String(g_fps);
+  uint32_t actualInt = g_lastActualFpsTimes100 / 100;
+  uint32_t actualFrac = g_lastActualFpsTimes100 % 100;
+  json += ",\"fpsActual\":" + String(actualInt);
+  json += ".";
+  if (actualFrac < 10) json += "0";
+  json += String(actualFrac);
+  json += ",\"framePeriodUs\":" + String(g_framePeriodUs);
+  json += ",\"frameAvgUs\":" + String(g_lastAverageFrameUs);
+  json += ",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
     +",\"arms\":"+String(g_armCount)
@@ -1295,7 +1435,7 @@ static void handleStart(){
     g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
-  g_playing=true; g_paused=false; g_lastTickMs=millis();
+  g_playing=true; g_paused=false; g_lastTickUs = micros();
   g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
 }
@@ -1345,7 +1485,7 @@ static void handlePause(){
   if (!toggle) g_paused = wantPause && g_playing;
   else g_paused = !g_paused && g_playing;
 
-  if (!g_paused) g_lastTickMs = millis();
+  if (!g_paused) g_lastTickUs = micros();
 
   server.send(200,"application/json",
               String("{\"paused\":") + (g_paused ? "true" : "false") +
@@ -1442,11 +1582,11 @@ static void handleSpeed() {
   if (val < 1) val = 1;
   if (val > 120) val = 120;
   g_fps = (uint16_t)val;
-  g_framePeriodMs = (uint32_t) (1000UL / g_fps);
+  g_framePeriodUs = (g_fps > 0) ? (uint32_t)((1000000UL + g_fps / 2) / g_fps) : 1000000UL;
   prefs.putUShort("fps", g_fps);
   persistSettingsToSd();
-  g_lastTickMs = millis();
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  g_lastTickUs = micros();
+  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
@@ -2070,7 +2210,7 @@ void setup(){
   if (g_brightnessPercent > 100) g_brightnessPercent = 100;
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
   if (!g_fps) g_fps = 40;
-  g_framePeriodMs = 1000UL / g_fps;
+  g_framePeriodUs = (g_fps > 0) ? (uint32_t)((1000000UL + g_fps / 2) / g_fps) : 1000000UL;
   if (!g_startChArm1) g_startChArm1 = 1;
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
@@ -2083,7 +2223,7 @@ void setup(){
     Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
   }
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm);
@@ -2154,6 +2294,16 @@ void loop(){
     return;
   }
 
+  uint32_t nowUsFrame = micros();
+
+  SdResult prefetchResult = maybePrefetchFrame(nowUsFrame, false);
+  if (prefetchResult == SD_RESULT_ERROR) {
+    handlePlaybackSdFailure("prefetch failed");
+    return;
+  } else if (prefetchResult == SD_RESULT_OK) {
+    g_sdFailStreak = 0;
+  }
+
   const uint16_t spokeNow = currentSpokeIndex();
 
   if (PIN_STROBE_GATE >= 0) {
@@ -2161,36 +2311,29 @@ void loop(){
     digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
   }
 
-  const uint32_t now = millis();
-  const uint32_t periodMs = g_framePeriodMs ? g_framePeriodMs : 1;
-  uint32_t elapsed = now - g_lastTickMs;
-  if (elapsed >= periodMs) {
-    uint32_t periods = elapsed / periodMs;
+  const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 1000;
+  uint32_t elapsedUs = nowUsFrame - g_lastTickUs;
+  if (elapsedUs >= periodUs) {
+    uint32_t periods = elapsedUs / periodUs;
     if (periods == 0) periods = 1;
-    g_lastTickMs += periods * periodMs;
-    if ((uint32_t)(now - g_lastTickMs) >= periodMs) {
-      g_lastTickMs = now;
+    g_lastTickUs += periods * periodUs;
+    if ((uint32_t)(nowUsFrame - g_lastTickUs) >= periodUs) {
+      g_lastTickUs = nowUsFrame;
     }
 
-    if (!loadNextFrame()) {
-      ++g_sdFailStreak;
-      Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
-      if (!recoverSd("frame read failed")) {
-        if (g_sdFailStreak >= 6) {
-          Serial.println("[SD] Unrecoverable — pausing playback.");
-          g_playing = false;
-          g_bgEffectActive = false;
-          g_bgEffectNextAttemptMs = millis();
-          g_sdFailStreak = 0;
-          g_frameValid = false;
-          blackoutAll();
-        }
-      }
-      feedWatchdog();
+    bool swapped = swapPrefetchedFrame(nowUsFrame);
+    if (!swapped && !g_frameValid) {
+      handlePlaybackSdFailure("no frame ready");
       return;
     }
 
-    g_sdFailStreak = 0;
+    SdResult forceResult = maybePrefetchFrame(nowUsFrame, true);
+    if (forceResult == SD_RESULT_ERROR) {
+      handlePlaybackSdFailure("prefetch failed");
+      return;
+    } else if (forceResult == SD_RESULT_OK) {
+      g_sdFailStreak = 0;
+    }
   }
 
   uint32_t nowUs = micros();
@@ -2211,13 +2354,13 @@ void loop(){
 
       if (!in && g_armState[a].lit) blankArm(a);
     }
-    lanesCommit(); // single commit for the strobe path
   } else {
     processHallSyncEvent(nowUs);
     advancePredictedSpokes(nowUs);
     processArmBlanking(nowUs);
   }
 
+  lanesCommit();
   feedWatchdog();
 }
 
