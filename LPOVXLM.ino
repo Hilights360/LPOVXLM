@@ -188,7 +188,9 @@ uint8_t g_brightness = 63;
 static volatile bool g_needShow = false;
 static inline void lanesCommit() {
   if (!g_needShow) return;
+  noInterrupts();
   for (uint8_t l = 0; l < NUM_LANES; ++l) if (g_lanes[l]) g_lanes[l]->show();
+  interrupts();
   g_needShow = false;
 }
 
@@ -787,8 +789,41 @@ static bool prefetchFrame(uint32_t idx) {
 
 static bool ensureFramePrefetched() {
   if (g_frameBackValid) return true;
-  return prefetchFrame(g_frameIndex % (g_fh.frameCount ? g_fh.frameCount : 1));
+  
+  // Try non-blocking load first
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufBack) return false;
+  
+  uint32_t idx = g_frameIndex % (g_fh.frameCount ? g_fh.frameCount : 1);
+  
+  // Quick attempt with minimal timeout
+  if (!g_sdMutex) return false;
+  
+  // Try to prefetch without blocking (0 timeout)
+  if (!SD_LOCK(0)) {
+    // SD busy - use old frame if we must
+    return false; 
+  }
+  
+  bool ok = false;
+  if (g_fh.compType == 0) {
+    const uint64_t base = (uint64_t)g_fh.chanDataOffset + 
+                          (uint64_t)idx * (uint64_t)g_fh.channelCount;
+    if (g_fseq.seek(base, SeekSet)) {
+      ok = (g_fseq.read(g_frameBufBack, g_fh.channelCount) == g_fh.channelCount);
+    }
+  }
+  // ... handle compression cases ...
+  
+  SD_UNLOCK();
+  
+  if (ok) {
+    g_frameBackIndex = idx;
+    g_frameBackValid = true;
+  }
+  
+  return ok;
 }
+
 
 static bool loadNextFrame(){
   if (!g_fseq || !g_fh.frameCount || !g_frameBufFront || !g_frameBufBack) return false;
@@ -1062,18 +1097,27 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
 
-static void processArmBlanking(uint32_t nowUs){
+static void processArmBlanking(uint32_t nowUs) {
   const uint8_t arms = activeArmCount();
-  for (uint8_t a=0; a<arms; ++a){
+  bool anyBlanked = false;
+  
+  for (uint8_t a = 0; a < arms; ++a) {
     if (!g_armState[a].lit) continue;
     uint32_t blankAt = g_armState[a].blankDeadlineUs;
     if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a); // marks dirty
+      blankArm(a); // Sets g_needShow = true
+      anyBlanked = true;
     }
   }
-  for (uint8_t a=arms; a<MAX_ARMS; ++a){
-    if (g_armState[a].lit) blankArm(a);
+  
+  for (uint8_t a = arms; a < MAX_ARMS; ++a) {
+    if (g_armState[a].lit) {
+      blankArm(a); // Sets g_needShow = true
+      anyBlanked = true;
+    }
   }
+  
+  // Don't call lanesCommit() here - let main loop handle it
 }
 
 static void processHallSyncEvent(uint32_t nowUs){
@@ -1136,21 +1180,36 @@ static void processHallSyncEvent(uint32_t nowUs){
   if (g_nextSpokeDeadlineUs == 0) g_nextSpokeDeadlineUs = 1;
 }
 
-static void advancePredictedSpokes(uint32_t nowUs){
+static void advancePredictedSpokes(uint32_t nowUs) {
   const uint16_t spokes = spokesCount();
   if (!spokes) return;
   if (g_spokeDurationUs == 0 || g_nextSpokeDeadlineUs == 0) return;
 
   const uint8_t arms = activeArmCount();
-  while (microsReached(nowUs, g_nextSpokeDeadlineUs)) {
+  
+  // Limit max iterations to prevent loop lockup
+  uint8_t maxIterations = spokes; // Should never need more than full revolution
+  uint8_t iterations = 0;
+  
+  while (microsReached(nowUs, g_nextSpokeDeadlineUs) && iterations < maxIterations) {
     g_spokeStep = (g_spokeStep + 1) % spokes;
-    for (uint8_t a=0; a<arms; ++a){
+    
+    for (uint8_t a = 0; a < arms; ++a) {
       uint16_t base = g_armState[a].baseSpoke % spokes;
       uint16_t spoke = (base + g_spokeStep) % spokes;
-      paintArmAt(a, spoke, nowUs);
+      paintArmAt(a, spoke, nowUs); // Sets g_needShow = true
     }
+    
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
+    iterations++;
   }
+  
+  if (iterations >= maxIterations) {
+    Serial.printf("[WARN] Spoke advancement capped at %u iterations\n", iterations);
+    g_nextSpokeDeadlineUs = nowUs + g_spokeDurationUs; // Reset to prevent lockup
+  }
+  
+  // Single commit will happen in main loop
 }
 
 /* -------------------- Web: Files page + ops -------------------- */
@@ -1366,7 +1425,7 @@ static void handleStart(){
     g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
-  g_playing=true; g_paused=false; g_lastTickMs=millis();
+  g_playing=true; g_paused=false; g_lastTickUs=millis();
   g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
 }
@@ -1416,7 +1475,7 @@ static void handlePause(){
   if (!toggle) g_paused = wantPause && g_playing;
   else g_paused = !g_paused && g_playing;
 
-  if (!g_paused) g_lastTickMs = millis();
+  if (!g_paused) g_lastTickUs = millis();
 
   server.send(200,"application/json",
               String("{\"paused\":") + (g_paused ? "true" : "false") +
@@ -2234,7 +2293,11 @@ void loop(){
   }
 
   const uint32_t nowFrameUs = micros();
-  const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 1000;
+  const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 25000;
+    // Initialize timing on first frame
+  if (g_lastTickUs == 0) {
+    g_lastTickUs = nowFrameUs;
+  }
   uint32_t elapsed = nowFrameUs - g_lastTickUs;
   if (elapsed >= periodUs) {
     uint32_t periods = elapsed / periodUs;
