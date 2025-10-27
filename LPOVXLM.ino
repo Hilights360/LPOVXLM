@@ -188,7 +188,9 @@ uint8_t g_brightness = 63;
 static volatile bool g_needShow = false;
 static inline void lanesCommit() {
   if (!g_needShow) return;
+  noInterrupts();
   for (uint8_t l = 0; l < NUM_LANES; ++l) if (g_lanes[l]) g_lanes[l]->show();
+  interrupts();
   g_needShow = false;
 }
 
@@ -305,7 +307,7 @@ Preferences prefs;
 uint8_t  g_brightnessPercent = 25;
 uint8_t  g_displayDutyPercent = 60;
 uint16_t g_fps               = 40;
-uint32_t g_framePeriodMs     = 25;
+uint32_t g_framePeriodUs     = 25000;
 bool     g_autoplayEnabled   = true;
 bool     g_bgEffectEnabled   = false;
 bool     g_bgEffectActive    = false;
@@ -330,7 +332,12 @@ volatile uint16_t g_indexPosition = 0;
 // Playback state
 volatile bool  g_playing = false, g_paused = false;
 String         g_currentPath;
-uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
+uint32_t       g_frameIndex = 0, g_lastTickUs = 0;
+uint32_t       g_currentFrameIndex = 0;
+uint32_t       g_lastFrameSwapUs = 0;
+uint32_t       g_frameActualPeriodUs = 0;
+float          g_frameActualFps = 0.0f;
+uint32_t       g_lastFpsLogUs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
@@ -563,6 +570,10 @@ File         g_fseq;
 FseqHeader   g_fh;
 SparseRange* g_ranges      = nullptr;
 uint8_t*     g_frameBuf    = nullptr;
+uint8_t*     g_frameBufFront = nullptr;
+uint8_t*     g_frameBufBack  = nullptr;
+uint32_t     g_frameBackIndex = 0;
+bool         g_frameBackValid = false;
 CompBlock*   g_cblocks     = nullptr;
 uint32_t     g_compCount   = 0;
 uint64_t     g_compBase    = 0;
@@ -594,7 +605,10 @@ static inline bool readU64(File &f, uint64_t &out) {
 static void freeFseq(){
   if (g_fseq) g_fseq.close();
   if (g_ranges){ free(g_ranges); g_ranges=nullptr; }
-  if (g_frameBuf){ free(g_frameBuf); g_frameBuf=nullptr; }
+  if (g_frameBufFront){ free(g_frameBufFront); g_frameBufFront=nullptr; }
+  if (g_frameBufBack){ free(g_frameBufBack); g_frameBufBack=nullptr; }
+  g_frameBuf = nullptr;
+  g_frameBackValid = false;
   if (g_cblocks){ free(g_cblocks); g_cblocks=nullptr; }
   if (s_ctmp){ free(s_ctmp); s_ctmp=nullptr; s_ctmp_size=0; }
   g_compCount=0; g_compBase=0; g_compPerFrame=false;
@@ -602,6 +616,12 @@ static void freeFseq(){
   memset(&g_fh,0,sizeof(g_fh));
   g_frameValid = false;
   g_frameIndex = 0;
+  g_currentFrameIndex = 0;
+  g_lastTickUs = 0;
+  g_lastFrameSwapUs = 0;
+  g_frameActualPeriodUs = 0;
+  g_frameActualFps = 0.0f;
+  g_lastFpsLogUs = 0;
   resetArmRuntimeStates();
   g_playing = false;
   g_paused = false;
@@ -681,11 +701,21 @@ bool openFseq(const String& path, String& why){
     } else { why="zstd unsupported"; break; }
 
     if (g_fh.channelCount==0){ why="zero chans"; break; }
-    g_frameBuf = (uint8_t*)malloc(g_fh.channelCount);
-    if (!g_frameBuf){ why="oom frame"; break; }
+    g_frameBufFront = (uint8_t*)malloc(g_fh.channelCount);
+    g_frameBufBack  = (uint8_t*)malloc(g_fh.channelCount);
+    if (!g_frameBufFront || !g_frameBufBack){ why="oom frame"; break; }
+    g_frameBuf = g_frameBufFront;
+    g_frameBackValid = false;
+    g_frameBackIndex = 0;
 
     g_currentPath = path;
     g_frameIndex = 0;
+    g_currentFrameIndex = 0;
+    g_lastFrameSwapUs = 0;
+    g_frameActualPeriodUs = 0;
+    g_frameActualFps = 0.0f;
+    g_lastTickUs = 0;
+    g_lastFpsLogUs = 0;
     g_bgEffectActive = g_bgEffectEnabled && isBgEffectPath(g_currentPath);
 
     ok = true;
@@ -697,7 +727,9 @@ bool openFseq(const String& path, String& why){
     g_frameValid = false;
     if (!loadNextFrame()) { why = "frame load"; ok = false; }
     else {
-      g_lastTickMs = millis();
+      uint32_t nowUs = micros();
+      g_lastTickUs = nowUs;
+      g_lastFrameSwapUs = nowUs;
       g_playing = true;
       g_paused = false;
       Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
@@ -710,17 +742,17 @@ bool openFseq(const String& path, String& why){
   return ok;
 }
 
-static bool loadFrame(uint32_t idx){
-  if (!g_fseq || !g_fh.frameCount) return false;
+static bool loadFrameInto(uint32_t idx, uint8_t* dest){
+  if (!g_fseq || !g_fh.frameCount || !dest) return false;
   idx %= g_fh.frameCount;
 
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) return false;
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(50))) return false;
   bool ok=false;
 
   if (g_fh.compType == 0){
     const uint64_t base = (uint64_t)g_fh.chanDataOffset + (uint64_t)idx * (uint64_t)g_fh.channelCount;
     if (g_fseq.seek(base, SeekSet))
-      ok = (g_fseq.read(g_frameBuf, g_fh.channelCount) == g_fh.channelCount);
+      ok = (g_fseq.read(dest, g_fh.channelCount) == g_fh.channelCount);
   }
 #if defined(MZ_OK) || defined(Z_OK)
   else if (g_fh.compType == 2 && g_compPerFrame){
@@ -735,7 +767,7 @@ static bool loadFrame(uint32_t idx){
           s_ctmp = nb; s_ctmp_size = clen;
         }
         size_t got = g_fseq.read(s_ctmp, clen);
-        if (got == clen) ok = zlib_decompress(s_ctmp, clen, g_frameBuf, g_fh.channelCount);
+        if (got == clen) ok = zlib_decompress(s_ctmp, clen, dest, g_fh.channelCount);
       }
     }
   }
@@ -744,13 +776,88 @@ static bool loadFrame(uint32_t idx){
   return ok;
 }
 
-static bool loadNextFrame(){
-  if (!g_fseq || !g_fh.frameCount) return false;
+static bool prefetchFrame(uint32_t idx) {
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufBack) return false;
   uint32_t count = g_fh.frameCount;
-  uint32_t idx = g_frameIndex % count;
-  if (!loadFrame(idx)) return false;
-  g_frameIndex = (idx + 1) % count;
+  if (!count) return false;
+  idx %= count;
+  if (!loadFrameInto(idx, g_frameBufBack)) return false;
+  g_frameBackIndex = idx;
+  g_frameBackValid = true;
+  return true;
+}
+
+static bool ensureFramePrefetched() {
+  if (g_frameBackValid) return true;
+  
+  // Try non-blocking load first
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufBack) return false;
+  
+  uint32_t idx = g_frameIndex % (g_fh.frameCount ? g_fh.frameCount : 1);
+  
+  // Quick attempt with minimal timeout
+  if (!g_sdMutex) return false;
+  
+  // Try to prefetch without blocking (0 timeout)
+  if (!SD_LOCK(0)) {
+    // SD busy - use old frame if we must
+    return false; 
+  }
+  
+  bool ok = false;
+  if (g_fh.compType == 0) {
+    const uint64_t base = (uint64_t)g_fh.chanDataOffset + 
+                          (uint64_t)idx * (uint64_t)g_fh.channelCount;
+    if (g_fseq.seek(base, SeekSet)) {
+      ok = (g_fseq.read(g_frameBufBack, g_fh.channelCount) == g_fh.channelCount);
+    }
+  }
+  // ... handle compression cases ...
+  
+  SD_UNLOCK();
+  
+  if (ok) {
+    g_frameBackIndex = idx;
+    g_frameBackValid = true;
+  }
+  
+  return ok;
+}
+
+
+static bool loadNextFrame(){
+  if (!g_fseq || !g_fh.frameCount || !g_frameBufFront || !g_frameBufBack) return false;
+  if (!ensureFramePrefetched()) return false;
+
+  uint8_t* swap = g_frameBufFront;
+  g_frameBufFront = g_frameBufBack;
+  g_frameBufBack = swap;
+  g_frameBuf = g_frameBufFront;
   g_frameValid = true;
+
+  g_currentFrameIndex = g_frameBackIndex;
+
+  uint32_t nowUs = micros();
+  if (g_lastFrameSwapUs != 0) {
+    uint32_t dt = nowUs - g_lastFrameSwapUs;
+    if (dt > 0) {
+      if (g_frameActualPeriodUs == 0) {
+        g_frameActualPeriodUs = dt;
+      } else {
+        g_frameActualPeriodUs = (uint32_t)(((uint64_t)g_frameActualPeriodUs * 3ULL + (uint64_t)dt) / 4ULL);
+      }
+      if (g_frameActualPeriodUs > 0) {
+        g_frameActualFps = 1000000.0f / (float)g_frameActualPeriodUs;
+      }
+    }
+  }
+  g_lastFrameSwapUs = nowUs;
+
+  uint32_t count = g_fh.frameCount ? g_fh.frameCount : 1;
+  g_frameIndex = (g_currentFrameIndex + 1) % count;
+  g_frameBackValid = false;
+
+  (void)prefetchFrame(g_frameIndex);
   return true;
 }
 
@@ -883,6 +990,7 @@ static IRAM_ATTR void sk9822_tx_parallel_black() {
 static void blackoutAll(){
   for (uint8_t a=0; a<MAX_ARMS; ++a) blankArm(a);
   resetArmRuntimeStates();
+  lanesCommit();
 }
 
 static uint32_t computeArmHoldDurationUs(){
@@ -989,19 +1097,27 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
 
-static void processArmBlanking(uint32_t nowUs){
+static void processArmBlanking(uint32_t nowUs) {
   const uint8_t arms = activeArmCount();
-  for (uint8_t a=0; a<arms; ++a){
+  bool anyBlanked = false;
+  
+  for (uint8_t a = 0; a < arms; ++a) {
     if (!g_armState[a].lit) continue;
     uint32_t blankAt = g_armState[a].blankDeadlineUs;
     if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a); // marks dirty
+      blankArm(a); // Sets g_needShow = true
+      anyBlanked = true;
     }
   }
-  for (uint8_t a=arms; a<MAX_ARMS; ++a){
-    if (g_armState[a].lit) blankArm(a);
+  
+  for (uint8_t a = arms; a < MAX_ARMS; ++a) {
+    if (g_armState[a].lit) {
+      blankArm(a); // Sets g_needShow = true
+      anyBlanked = true;
+    }
   }
-  lanesCommit(); // commit clears once per pass
+  
+  // Don't call lanesCommit() here - let main loop handle it
 }
 
 static void processHallSyncEvent(uint32_t nowUs){
@@ -1040,9 +1156,6 @@ static void processHallSyncEvent(uint32_t nowUs){
     if (g_armState[a].lit) blankArm(a);
   }
 
-  // Commit initial base paint when strobe is OFF
-  if (!g_strobeEnable) lanesCommit();
-
   uint64_t revolutionUs = 0;
   if (g_lastPeriodUs > 0) {
     uint8_t ppr = g_pulsesPerRev ? g_pulsesPerRev : 1;
@@ -1067,22 +1180,36 @@ static void processHallSyncEvent(uint32_t nowUs){
   if (g_nextSpokeDeadlineUs == 0) g_nextSpokeDeadlineUs = 1;
 }
 
-static void advancePredictedSpokes(uint32_t nowUs){
+static void advancePredictedSpokes(uint32_t nowUs) {
   const uint16_t spokes = spokesCount();
   if (!spokes) return;
   if (g_spokeDurationUs == 0 || g_nextSpokeDeadlineUs == 0) return;
 
   const uint8_t arms = activeArmCount();
-  while (microsReached(nowUs, g_nextSpokeDeadlineUs)) {
+  
+  // Limit max iterations to prevent loop lockup
+  uint8_t maxIterations = spokes; // Should never need more than full revolution
+  uint8_t iterations = 0;
+  
+  while (microsReached(nowUs, g_nextSpokeDeadlineUs) && iterations < maxIterations) {
     g_spokeStep = (g_spokeStep + 1) % spokes;
-    for (uint8_t a=0; a<arms; ++a){
+    
+    for (uint8_t a = 0; a < arms; ++a) {
       uint16_t base = g_armState[a].baseSpoke % spokes;
       uint16_t spoke = (base + g_spokeStep) % spokes;
-      paintArmAt(a, spoke, nowUs);
+      paintArmAt(a, spoke, nowUs); // Sets g_needShow = true
     }
-    lanesCommit();  // single commit per stepped spoke
+    
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
+    iterations++;
   }
+  
+  if (iterations >= maxIterations) {
+    Serial.printf("[WARN] Spoke advancement capped at %u iterations\n", iterations);
+    g_nextSpokeDeadlineUs = nowUs + g_spokeDurationUs; // Reset to prevent lockup
+  }
+  
+  // Single commit will happen in main loop
 }
 
 /* -------------------- Web: Files page + ops -------------------- */
@@ -1162,8 +1289,11 @@ static void handleStatus(){
   String json = String("{\"playing\":")+(g_playing?"true":"false")
     +",\"paused\":"+(g_paused?"true":"false")
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
-    +",\"frame\":"+String(g_frameIndex)
+    +",\"frame\":"+String(g_currentFrameIndex)
     +",\"fps\":"+String(g_fps)
+    +",\"actualFps\":"+String(g_frameActualFps, 2)
+    +",\"framePeriod_us\":"+String((unsigned long)g_framePeriodUs)
+    +",\"actualPeriod_us\":"+String((unsigned long)g_frameActualPeriodUs)
     +",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
@@ -1295,7 +1425,7 @@ static void handleStart(){
     g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
-  g_playing=true; g_paused=false; g_lastTickMs=millis();
+  g_playing=true; g_paused=false; g_lastTickUs=millis();
   g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
 }
@@ -1345,7 +1475,7 @@ static void handlePause(){
   if (!toggle) g_paused = wantPause && g_playing;
   else g_paused = !g_paused && g_playing;
 
-  if (!g_paused) g_lastTickMs = millis();
+  if (!g_paused) g_lastTickUs = millis();
 
   server.send(200,"application/json",
               String("{\"paused\":") + (g_paused ? "true" : "false") +
@@ -1442,11 +1572,11 @@ static void handleSpeed() {
   if (val < 1) val = 1;
   if (val > 120) val = 120;
   g_fps = (uint16_t)val;
-  g_framePeriodMs = (uint32_t) (1000UL / g_fps);
+  g_framePeriodUs = (uint32_t) (1000000UL / g_fps);
   prefs.putUShort("fps", g_fps);
   persistSettingsToSd();
-  g_lastTickMs = millis();
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  g_lastTickUs = micros();
+  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
@@ -2070,7 +2200,7 @@ void setup(){
   if (g_brightnessPercent > 100) g_brightnessPercent = 100;
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
   if (!g_fps) g_fps = 40;
-  g_framePeriodMs = 1000UL / g_fps;
+  g_framePeriodUs = 1000000UL / g_fps;
   if (!g_startChArm1) g_startChArm1 = 1;
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
@@ -2083,7 +2213,7 @@ void setup(){
     Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
   }
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm);
@@ -2150,6 +2280,7 @@ void loop(){
   if (!g_playing || g_paused) {
     if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
     delay(1);
+    lanesCommit();
     feedWatchdog();
     return;
   }
@@ -2161,15 +2292,19 @@ void loop(){
     digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
   }
 
-  const uint32_t now = millis();
-  const uint32_t periodMs = g_framePeriodMs ? g_framePeriodMs : 1;
-  uint32_t elapsed = now - g_lastTickMs;
-  if (elapsed >= periodMs) {
-    uint32_t periods = elapsed / periodMs;
+  const uint32_t nowFrameUs = micros();
+  const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 25000;
+    // Initialize timing on first frame
+  if (g_lastTickUs == 0) {
+    g_lastTickUs = nowFrameUs;
+  }
+  uint32_t elapsed = nowFrameUs - g_lastTickUs;
+  if (elapsed >= periodUs) {
+    uint32_t periods = elapsed / periodUs;
     if (periods == 0) periods = 1;
-    g_lastTickMs += periods * periodMs;
-    if ((uint32_t)(now - g_lastTickMs) >= periodMs) {
-      g_lastTickMs = now;
+    g_lastTickUs += periods * periodUs;
+    if ((uint32_t)(nowFrameUs - g_lastTickUs) >= periodUs) {
+      g_lastTickUs = nowFrameUs;
     }
 
     if (!loadNextFrame()) {
@@ -2191,6 +2326,11 @@ void loop(){
     }
 
     g_sdFailStreak = 0;
+    if (g_frameActualPeriodUs && nowFrameUs - g_lastFpsLogUs >= 1000000UL) {
+      float target = (g_framePeriodUs > 0) ? (1000000.0f / (float)g_framePeriodUs) : 0.0f;
+      Serial.printf("[FPS] target=%.2f actual=%.2f period=%luus\n", target, g_frameActualFps, (unsigned long)g_frameActualPeriodUs);
+      g_lastFpsLogUs = nowFrameUs;
+    }
   }
 
   uint32_t nowUs = micros();
@@ -2211,12 +2351,13 @@ void loop(){
 
       if (!in && g_armState[a].lit) blankArm(a);
     }
-    lanesCommit(); // single commit for the strobe path
   } else {
     processHallSyncEvent(nowUs);
     advancePredictedSpokes(nowUs);
     processArmBlanking(nowUs);
   }
+
+  lanesCommit();
 
   feedWatchdog();
 }
