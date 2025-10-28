@@ -1,3 +1,7 @@
 /build
 /build
 /build
+/build
+build/esp32.esp32.esp32s3/LPOVXLM.ino.elf
+build/esp32.esp32.esp32s3/LPOVXLM.ino.map
+build/esp32.esp32.esp32s3/LPOVXLM.ino.merged.bin

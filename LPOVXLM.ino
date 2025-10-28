@@ -9,7 +9,7 @@
 //       Arm2 = center-fed   (reversed direction; index 0 at the center input)
 //   - Lane 1 (reuses prior Arm3 pins): CLK=35, DATA=36 drives Arm3 then Arm4
 //       Arm3 = outside-fed (normal)
-//       Arm4 = center-fed   (reversed)
+//       Arm4 = center-fed   (reversed`)
 //
 // Notes:
 //   * All timing / strobe / Hall logic unchanged EXCEPT default strobe now OFF (see g_strobeEnable).
@@ -305,7 +305,7 @@ Preferences prefs;
 uint8_t  g_brightnessPercent = 25;
 uint8_t  g_displayDutyPercent = 60;
 uint16_t g_fps               = 40;
-uint32_t g_framePeriodMs     = 25;
+uint32_t g_framePeriodUs = 25000;  // 40 FPS = 25000 microseconds
 bool     g_autoplayEnabled   = true;
 bool     g_bgEffectEnabled   = false;
 bool     g_bgEffectActive    = false;
@@ -330,7 +330,7 @@ volatile uint16_t g_indexPosition = 0;
 // Playback state
 volatile bool  g_playing = false, g_paused = false;
 String         g_currentPath;
-uint32_t       g_frameIndex = 0, g_lastTickMs = 0;
+uint32_t       g_frameIndex = 0, g_lastTickUs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
@@ -348,6 +348,11 @@ static uint16_t        g_spokeStep           = 0;
 static const uint32_t  ARM_BLANK_MIN_US      = 40;   // minimum ON microseconds per spoke
 static const uint32_t  ARM_BLANK_FALLBACK_US = 1000; // fallback if duration unknown
 static bool            g_frameValid          = false;
+
+// Also ADD these for diagnostics:
+uint32_t g_frameCounter = 0;
+uint32_t g_lastFpsReportUs = 0;
+float    g_measuredFps = 0.0f;
 
 static inline bool microsReached(uint32_t now, uint32_t target) {
   return (int32_t)(now - target) >= 0;
@@ -697,7 +702,7 @@ bool openFseq(const String& path, String& why){
     g_frameValid = false;
     if (!loadNextFrame()) { why = "frame load"; ok = false; }
     else {
-      g_lastTickMs = millis();
+      g_lastTickUs = micros();  // CHANGE from g_lastTickMs = millis()
       g_playing = true;
       g_paused = false;
       Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
@@ -707,6 +712,7 @@ bool openFseq(const String& path, String& why){
   }
 
   if (!ok) { freeFseq(); }
+  
   return ok;
 }
 
@@ -995,13 +1001,13 @@ static void processArmBlanking(uint32_t nowUs){
     if (!g_armState[a].lit) continue;
     uint32_t blankAt = g_armState[a].blankDeadlineUs;
     if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a); // marks dirty
+      blankArm(a); // marks g_needShow = true
     }
   }
   for (uint8_t a=arms; a<MAX_ARMS; ++a){
     if (g_armState[a].lit) blankArm(a);
   }
-  lanesCommit(); // commit clears once per pass
+  //lanesCommit(); // commit clears once per pass REMOVED TO FREE UP TIME
 }
 
 static void processHallSyncEvent(uint32_t nowUs){
@@ -1041,7 +1047,7 @@ static void processHallSyncEvent(uint32_t nowUs){
   }
 
   // Commit initial base paint when strobe is OFF
-  if (!g_strobeEnable) lanesCommit();
+  // if (!g_strobeEnable) lanesCommit();  REMOVED TO FREE UP TIME
 
   uint64_t revolutionUs = 0;
   if (g_lastPeriodUs > 0) {
@@ -1072,7 +1078,12 @@ static void advancePredictedSpokes(uint32_t nowUs){
   if (!spokes) return;
   if (g_spokeDurationUs == 0 || g_nextSpokeDeadlineUs == 0) return;
 
-  const uint8_t arms = activeArmCount();
+   const uint8_t arms = activeArmCount();   // ← ADD THIS LINE
+
+   // Add safety limit
+  uint8_t iterations = 0;
+  const uint8_t maxIterations = spokes;
+
   while (microsReached(nowUs, g_nextSpokeDeadlineUs)) {
     g_spokeStep = (g_spokeStep + 1) % spokes;
     for (uint8_t a=0; a<arms; ++a){
@@ -1080,7 +1091,7 @@ static void advancePredictedSpokes(uint32_t nowUs){
       uint16_t spoke = (base + g_spokeStep) % spokes;
       paintArmAt(a, spoke, nowUs);
     }
-    lanesCommit();  // single commit per stepped spoke
+    //lanesCommit();  // single commit per stepped spoke REMOVED TO FREE UP TIME
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
   }
 }
@@ -1164,6 +1175,7 @@ static void handleStatus(){
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
     +",\"fps\":"+String(g_fps)
+    +",\"measuredFps\":"+String(g_measuredFps, 2) 
     +",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
@@ -1199,6 +1211,31 @@ static void handleStatus(){
           ",\"start4\":" + String(g_startChArm[3]) + "}";
   json += "}";
   server.send(200,"application/json",json);
+}
+
+static void handleDiagTiming() {
+  String json = "{";
+  json += "\"targetFps\":" + String(g_fps);
+  json += ",\"measuredFps\":" + String(g_measuredFps, 2);
+  json += ",\"targetPeriod_us\":" + String((unsigned long)g_framePeriodUs);
+  json += ",\"spokeDuration_us\":" + String((unsigned long)g_spokeDurationUs);
+  json += ",\"lastPeriod_us\":" + String((unsigned long)g_lastPeriodUs);
+  json += ",\"frameCounter\":" + String((unsigned long)g_frameCounter);
+  json += ",\"sdFailStreak\":" + String(g_sdFailStreak);
+  
+  // Calculate current drift
+  uint32_t nowUs = micros();
+  int32_t drift = (int32_t)(g_lastTickUs + g_framePeriodUs - nowUs);
+  json += ",\"drift_us\":" + String((long)drift);
+  
+  // Display duty cycle info
+  json += ",\"dutyPercent\":" + String((unsigned)g_displayDutyPercent);
+  uint32_t holdUs = computeArmHoldDurationUs();
+  json += ",\"holdDuration_us\":" + String((unsigned long)holdUs);
+  
+  json += "}";
+  
+  server.send(200, "application/json", json);
 }
 
 static void handleRoot() {
@@ -1295,7 +1332,9 @@ static void handleStart(){
     g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
-  g_playing=true; g_paused=false; g_lastTickMs=millis();
+  g_playing=true; 
+  g_paused=false; 
+  g_lastTickUs = micros();  // CHANGE from millis()
   g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
 }
@@ -1345,7 +1384,7 @@ static void handlePause(){
   if (!toggle) g_paused = wantPause && g_playing;
   else g_paused = !g_paused && g_playing;
 
-  if (!g_paused) g_lastTickMs = millis();
+  if (!g_paused) g_lastTickUs = micros();  // CHANGE from millis()
 
   server.send(200,"application/json",
               String("{\"paused\":") + (g_paused ? "true" : "false") +
@@ -1442,11 +1481,16 @@ static void handleSpeed() {
   if (val < 1) val = 1;
   if (val > 120) val = 120;
   g_fps = (uint16_t)val;
-  g_framePeriodMs = (uint32_t) (1000UL / g_fps);
+  
+  // CRITICAL: Calculate in microseconds, not milliseconds!
+  g_framePeriodUs = (uint32_t)(1000000UL / g_fps);
+  
   prefs.putUShort("fps", g_fps);
   persistSettingsToSd();
-  g_lastTickMs = millis();
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  
+  g_lastTickUs = micros(); // Use micros, not millis!
+  
+  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
@@ -1944,6 +1988,9 @@ static void startWifiAP(){
   // Upload FSEQ
   server.on("/upload",  HTTP_POST, handleUploadDone, handleUploadData);
 
+  // Diagnostic Timing
+  server.on("/diag/timing", HTTP_GET, handleDiagTiming);
+
   // Updates hub / OTA / FW to SD
   server.on("/updates",    HTTP_GET,  handleUpdatesPage);
   server.on("/ota",        HTTP_GET,  handleOtaPage);
@@ -2070,7 +2117,7 @@ void setup(){
   if (g_brightnessPercent > 100) g_brightnessPercent = 100;
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
   if (!g_fps) g_fps = 40;
-  g_framePeriodMs = 1000UL / g_fps;
+  g_framePeriodUs = 1000000UL / g_fps;
   if (!g_startChArm1) g_startChArm1 = 1;
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
@@ -2083,7 +2130,7 @@ void setup(){
     Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
   }
   Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodMs);
+  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodUs);
   Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm);
@@ -2126,27 +2173,45 @@ void loop(){
 
   static uint32_t lastRpmPoll = 0;
   uint32_t nowMs = millis();
-  if (nowMs - lastRpmPoll >= 250) { (void)computeRpmSnapshot(); lastRpmPoll = nowMs; }
+  if (nowMs - lastRpmPoll >= 250) { 
+    (void)computeRpmSnapshot(); 
+    lastRpmPoll = nowMs; 
+  }
 
   feedWatchdog();
 
+  // Background effect auto-start
   if (g_bgEffectEnabled && g_bgEffectPath.length() && !g_hallDiagEnabled && !g_armTestEnabled && !g_playing) {
     uint32_t now = millis();
     if (now >= g_bgEffectNextAttemptMs) {
       String why;
       g_paused = false;
-      if (openFseq(g_bgEffectPath, why)) { Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); g_bgEffectNextAttemptMs = now; }
-      else { Serial.printf("[BGE] open fail: %s\n", why.c_str()); g_bgEffectNextAttemptMs = now + 5000; }
+      if (openFseq(g_bgEffectPath, why)) { 
+        Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); 
+        g_bgEffectNextAttemptMs = now; 
+      }
+      else { 
+        Serial.printf("[BGE] open fail: %s\n", why.c_str()); 
+        g_bgEffectNextAttemptMs = now + 5000; 
+      }
     }
   }
 
-  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && !g_armTestEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
+  // Autoplay timeout
+  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && 
+      !g_armTestEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     g_paused = false;
-    if (openFseq("/test2.fseq", why)) { Serial.println("[TIMEOUT] Auto-start /test2.fseq"); }
-    else { Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str()); g_bootMs = millis(); }
+    if (openFseq("/test2.fseq", why)) { 
+      Serial.println("[TIMEOUT] Auto-start /test2.fseq"); 
+    }
+    else { 
+      Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str()); 
+      g_bootMs = millis(); 
+    }
   }
 
+  // Early exit if not playing
   if (!g_playing || g_paused) {
     if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
     delay(1);
@@ -2154,24 +2219,22 @@ void loop(){
     return;
   }
 
-  const uint16_t spokeNow = currentSpokeIndex();
-
-  if (PIN_STROBE_GATE >= 0) {
-    bool on = inStrobeWindowForArm(spokeNow, 0);
-    digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
+  // ========== FRAME TIMING (in microseconds) ==========
+  const uint32_t nowUs = micros();
+  
+  // Initialize timing on first frame
+  if (g_lastTickUs == 0) {
+    g_lastTickUs = nowUs;
   }
-
-  const uint32_t now = millis();
-  const uint32_t periodMs = g_framePeriodMs ? g_framePeriodMs : 1;
-  uint32_t elapsed = now - g_lastTickMs;
-  if (elapsed >= periodMs) {
-    uint32_t periods = elapsed / periodMs;
-    if (periods == 0) periods = 1;
-    g_lastTickMs += periods * periodMs;
-    if ((uint32_t)(now - g_lastTickMs) >= periodMs) {
-      g_lastTickMs = now;
-    }
-
+  
+  // Check if it's time for next frame
+  const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 25000;
+  const int32_t timeUntilNext = (int32_t)(g_lastTickUs + periodUs - nowUs);
+  
+  if (timeUntilNext <= 0) {
+    // Time for new frame
+    g_lastTickUs = nowUs; // Use actual time, not accumulated
+    
     if (!loadNextFrame()) {
       ++g_sdFailStreak;
       Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
@@ -2191,12 +2254,34 @@ void loop(){
     }
 
     g_sdFailStreak = 0;
+    g_frameCounter++;
+    
+    // Log FPS every second
+    if (g_lastFpsReportUs == 0) g_lastFpsReportUs = nowUs;
+    if (nowUs - g_lastFpsReportUs >= 1000000UL) {
+      uint32_t elapsed = nowUs - g_lastFpsReportUs;
+      g_measuredFps = (g_frameCounter * 1000000.0f) / (float)elapsed;
+      float target = (g_framePeriodUs > 0) ? (1000000.0f / (float)g_framePeriodUs) : 0.0f;
+      
+      // This will appear in your WiFi serial console
+      Serial.printf("[FPS] target=%.2f measured=%.2f frames=%lu drift=%ldus\n", 
+                    target, g_measuredFps, (unsigned long)g_frameCounter, (long)timeUntilNext);
+      
+      g_frameCounter = 0;
+      g_lastFpsReportUs = nowUs;
+    }
   }
 
-  uint32_t nowUs = micros();
+  // ========== DISPLAY UPDATE ==========
+  const uint16_t spokeNow = currentSpokeIndex();
+  
+  if (PIN_STROBE_GATE >= 0) {
+    bool on = inStrobeWindowForArm(spokeNow, 0);
+    digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
+  }
+
   if (g_strobeEnable) {
     processHallSyncEvent(nowUs);
-
     const uint16_t spokeNow2 = currentSpokeIndex();
     const uint8_t arms = activeArmCount();
 
@@ -2209,13 +2294,19 @@ void loop(){
         g_armState[a].lit = true;
       }
 
-      if (!in && g_armState[a].lit) blankArm(a);
+      if (!in && g_armState[a].lit) {
+        blankArm(a);
+      }
     }
-    lanesCommit(); // single commit for the strobe path
   } else {
     processHallSyncEvent(nowUs);
     advancePredictedSpokes(nowUs);
     processArmBlanking(nowUs);
+  }
+
+  // CRITICAL: Single commit per loop iteration
+  if (g_needShow) {
+    lanesCommit();
   }
 
   feedWatchdog();
