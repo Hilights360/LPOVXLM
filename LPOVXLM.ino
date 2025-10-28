@@ -1,6 +1,9 @@
 // POV Spinner — full sketch with RPM counter, OTA, Updates page, and DUAL-SPI lanes (2 posts) 
 // Board: ESP32-S3
 // Tim Nash (Inventor)
+
+// Arduino 2.3.1
+// ESP32 S3 N16R8 Dev
 //
 // Wiring mode in this build:
 //   - Two SPI "posts" (lanes). Each drives TWO arms chained back-to-back.
