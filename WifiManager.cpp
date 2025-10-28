@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <esp_system.h>
 
+#include "DebugLog.h"
+
 String defaultStationId() {
   char buf[16];
   uint64_t mac = ESP.getEfuseMac();
@@ -20,7 +22,7 @@ void applyStationHostname() {
 void markStationState(bool connected) {
   if (connected != g_staConnected) {
     g_staConnected = connected;
-    Serial.printf("[WIFI] Station %s\n", connected ? "connected" : "disconnected");
+    DebugLog::printf("[WIFI] Station %s\n", connected ? "connected" : "disconnected");
   }
   if (connected) g_staConnecting = false;
 }
@@ -31,7 +33,7 @@ void connectWifiStation() {
     return;
   }
   applyStationHostname();
-  Serial.printf("[WIFI] Connecting to SSID '%s'...\n", g_staSsid.c_str());
+  DebugLog::printf("[WIFI] Connecting to SSID '%s'...\n", g_staSsid.c_str());
   WiFi.disconnect(false, true);
   markStationState(false);
   WiFi.begin(g_staSsid.c_str(), g_staPass.c_str());
@@ -47,7 +49,7 @@ void pollWifiStation() {
   } else {
     if (g_staConnected) markStationState(false);
     if (g_staConnecting && millis() - g_staConnectStartMs > 20000) {
-      Serial.println("[WIFI] Retry station connection");
+      DebugLog::println("[WIFI] Retry station connection");
       connectWifiStation();
     }
   }

@@ -73,4 +73,6 @@ String uploadSuccessPage(const String &backUrl,
                          const String &filename,
                          size_t bytesWritten);
 
+String logsPage(const String &logsPreEscaped);
+
 }  // namespace WebPages

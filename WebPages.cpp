@@ -329,6 +329,7 @@ String rootPage(const String &statusClass,
           "<button id='cblocks'>Compression Blocks</button>"
           "<button id='sdre'>SD Reinit</button>"
           "<button id='stat'>Status JSON</button>"
+          "<button id='logs'>Wi-Fi Logs</button>"
           "</div>";
 
   html += "<div style='margin-top:.75rem'>"
@@ -451,6 +452,9 @@ if(sdre){sdre.onclick=()=>fetch('/sd/reinit',{method:'POST'}).then(r=>r.text()).
 
 const stat=document.getElementById('stat');
 if(stat){stat.onclick=()=>fetch('/status').then(r=>r.json()).then(j=>alert(JSON.stringify(j,null,2)));}
+
+const logs=document.getElementById('logs');
+if(logs){logs.onclick=()=>{location='/logs';};}
 
 const halldiag=document.getElementById('halldiag');
 if(halldiag){halldiag.onchange=()=>{const en=halldiag.checked?'1':'0';fetch('/halldiag?enable='+en,{method:'POST'}).then(()=>location.reload());};}
@@ -645,6 +649,66 @@ String uploadSuccessPage(const String &backUrl,
   String nameEsc = htmlEscape(filename);
   String body = "<div class='card'><p>Uploaded <b>" + nameEsc + "</b> (" + String((unsigned long)bytesWritten) + " bytes).</p><p>Refreshing…</p></div>";
   return uploadRefreshPage(backUrl, 1, body);
+}
+
+String logsPage(const String &logsPreEscaped) {
+  String html;
+  html.reserve(logsPreEscaped.length() + 2048);
+  html += "<!doctype html><html><head><meta charset='utf-8'>"
+          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+          "<title>Wi-Fi Logs</title>";
+  html += kRootCss;
+  html += R"HTML(
+<style>
+  .card{max-width:960px}
+  pre{background:#050910;border:1px solid #1b2741;border-radius:12px;padding:1rem;overflow:auto;min-height:50vh;max-height:70vh;margin-top:1rem;font:14px/1.4em "SFMono-Regular",Menlo,Monaco,"Consolas","Liberation Mono","Courier New",monospace;color:#d4d7dd}
+  .controls{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin-top:.75rem}
+  label{display:flex;align-items:center;gap:.4rem}
+  a.button-link{padding:.6rem 1rem;border-radius:10px;background:#1c2b4a;color:#e8ecf1}
+</style>
+</head><body><div class='card'>
+  <div style='display:flex;justify-content:space-between;align-items:center'>
+    <h2 style='margin:0'>Wi-Fi Logs</h2>
+    <a href='/'>Back to Control</a>
+  </div>
+  <div class='controls'>
+    <button id='refresh'>Refresh</button>
+    <button id='clear'>Clear Logs</button>
+    <a class='button-link' href='/logs.txt'>Download Text</a>
+    <label><input type='checkbox' id='autoscroll' checked> Auto-scroll</label>
+  </div>
+  <pre id='logbox'>)HTML";
+  html += logsPreEscaped;
+  html += R"HTML(</pre>
+</div>
+<script>
+const box=document.getElementById('logbox');
+const autoScroll=document.getElementById('autoscroll');
+const refreshBtn=document.getElementById('refresh');
+const clearBtn=document.getElementById('clear');
+
+function refreshLogs(){
+  fetch('/logs.txt').then(r=>r.text()).then(t=>{
+    box.textContent=t;
+    if(autoScroll && autoScroll.checked){
+      box.scrollTop=box.scrollHeight;
+    }
+  }).catch(()=>{});
+}
+
+if(refreshBtn){
+  refreshBtn.onclick=(ev)=>{ev.preventDefault(); refreshLogs();};
+}
+if(clearBtn){
+  clearBtn.onclick=(ev)=>{ev.preventDefault(); fetch('/logs/clear',{method:'POST'}).then(()=>refreshLogs());};
+}
+
+refreshLogs();
+setInterval(refreshLogs,2000);
+</script>
+</body></html>
+)HTML";
+  return html;
 }
 
 } // namespace WebPages

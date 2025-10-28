@@ -44,6 +44,11 @@
 #include "HtmlUtils.h"
 #include "WifiManager.h"
 #include "SD_Functions.h"
+#include "DebugLog.h"
+
+// Toggle physical serial output via USB/COM port. When false, logs are only
+// accessible through the Wi-Fi log viewer.
+static constexpr bool kEnableSerialDebug = false;
 
 // ---------- Optional zlib backends (auto-detect) ----------
 #if defined(__has_include)
@@ -255,7 +260,7 @@ static void applyWatchdogSetting() {
     esp_err_t err = esp_task_wdt_init(&cfg);
     if (err == ESP_ERR_INVALID_STATE) err = esp_task_wdt_reconfigure(&cfg);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-      Serial.printf("[WDT] init/reconfig failed: %d\n", (int)err);
+      DebugLog::printf("[WDT] init/reconfig failed: %d\n", (int)err);
       return;
     }
     if (!g_watchdogAttached) {
@@ -263,16 +268,16 @@ static void applyWatchdogSetting() {
       if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
         g_watchdogAttached = true;
         esp_task_wdt_reset();
-        Serial.printf("[WDT] Enabled (timeout %us)\n", (unsigned)WATCHDOG_TIMEOUT_SECONDS);
+        DebugLog::printf("[WDT] Enabled (timeout %us)\n", (unsigned)WATCHDOG_TIMEOUT_SECONDS);
       } else {
-        Serial.printf("[WDT] add failed: %d\n", (int)err);
+        DebugLog::printf("[WDT] add failed: %d\n", (int)err);
       }
     }
   } else if (g_watchdogAttached) {
     esp_task_wdt_delete(nullptr);
     esp_task_wdt_deinit();
     g_watchdogAttached = false;
-    Serial.println("[WDT] Disabled");
+    DebugLog::println("[WDT] Disabled");
   }
 }
 void feedWatchdog() { if (g_watchdogAttached) esp_task_wdt_reset(); }
@@ -543,6 +548,9 @@ static void handleOutMode(); // declared here; implemented later with setOutputM
 static void handleDiagMap();     // /diag/map?arm=1&pix=0&spoke=0
 static void handleFseqRanges();  // /fseq/ranges
 static void handleLaneDiag();    // /lanediag
+static void handleLogsPage();
+static void handleLogsText();
+static void handleLogsClear();
 
 static bool otaAuthOK() { return true; } // stub (shared with SD module)
 
@@ -705,7 +713,7 @@ bool openFseq(const String& path, String& why){
       g_lastTickUs = micros();  // CHANGE from g_lastTickMs = millis()
       g_playing = true;
       g_paused = false;
-      Serial.printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
+      DebugLog::printf("[FSEQ] %s frames=%lu chans=%lu step=%ums comp=%u blocks=%u sparse=%u CDO=0x%04x\n",
         path.c_str(), (unsigned long)g_fh.frameCount, (unsigned long)g_fh.channelCount,
         g_fh.stepTimeMs, g_fh.compType, (unsigned)g_compCount, (unsigned)g_fh.sparseCnt, g_fh.chanDataOffset);
     }
@@ -1238,6 +1246,20 @@ static void handleDiagTiming() {
   server.send(200, "application/json", json);
 }
 
+static void handleLogsPage() {
+  String page = WebPages::logsPage(DebugLog::logsHtmlPre());
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+static void handleLogsText() {
+  server.send(200, "text/plain; charset=utf-8", DebugLog::logsText());
+}
+
+static void handleLogsClear() {
+  DebugLog::clear();
+  server.send(200, "text/plain", "OK");
+}
+
 static void handleRoot() {
   String options; listFseqInDir("/", options);
   String bgOptions; listBgEffects(bgOptions, g_bgEffectPath);
@@ -1490,7 +1512,7 @@ static void handleSpeed() {
   
   g_lastTickUs = micros(); // Use micros, not millis!
   
-  Serial.printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
+  DebugLog::printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
 
@@ -1666,7 +1688,7 @@ static void handleBgEffect(){
         String why;
         g_paused = false;
         if (openFseq(g_bgEffectPath, why)) { g_bgEffectNextAttemptMs = millis(); }
-        else { Serial.printf("[BGE] open fail: %s\n", why.c_str()); g_bgEffectNextAttemptMs = millis() + 5000; }
+        else { DebugLog::printf("[BGE] open fail: %s\n", why.c_str()); g_bgEffectNextAttemptMs = millis() + 5000; }
       } else if (stateChanged) {
         g_bgEffectNextAttemptMs = millis();
       }
@@ -1769,12 +1791,12 @@ static void handleFseqRanges() {
 
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
-  Serial.printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
+  DebugLog::printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
       reason, g_sdFailStreak, (unsigned long)g_sdFreqKHz,
       (int)digitalRead(PIN_SD_CD), (unsigned)g_sdBusWidth);
 
   if (!cardPresent()) {
-    Serial.println("[SD] Card not present (CD HIGH). Waiting...");
+    DebugLog::println("[SD] Card not present (CD HIGH). Waiting...");
     uint32_t t0 = millis();
     while (!cardPresent() && millis() - t0 < 5000) { 
       delay(50); 
@@ -1790,7 +1812,7 @@ static bool recoverSd(const char* reason) {
     if (g_currentPath.length()) {
       String why; 
       ok = openFseq(g_currentPath, why);
-      Serial.printf("[SD] Reopen file: %s\n", ok?"OK": why.c_str());
+      DebugLog::printf("[SD] Reopen file: %s\n", ok?"OK": why.c_str());
       if (ok) { feedWatchdog(); return true; }
     }
   }
@@ -1816,7 +1838,7 @@ static bool recoverSd(const char* reason) {
   if (ok && g_currentPath.length()) {
     String why; 
     ok = openFseq(g_currentPath, why);
-    Serial.printf("[SD] Reopen after remount: %s\n", ok?"OK": why.c_str());
+    DebugLog::printf("[SD] Reopen after remount: %s\n", ok?"OK": why.c_str());
   }
 
   if (ok) g_sdFailStreak = 0;
@@ -1991,6 +2013,11 @@ static void startWifiAP(){
   // Diagnostic Timing
   server.on("/diag/timing", HTTP_GET, handleDiagTiming);
 
+  // Wi-Fi log viewer
+  server.on("/logs",       HTTP_GET,  handleLogsPage);
+  server.on("/logs.txt",   HTTP_GET,  handleLogsText);
+  server.on("/logs/clear", HTTP_POST, handleLogsClear);
+
   // Updates hub / OTA / FW to SD
   server.on("/updates",    HTTP_GET,  handleUpdatesPage);
   server.on("/ota",        HTTP_GET,  handleOtaPage);
@@ -2007,14 +2034,13 @@ static void startWifiAP(){
 
   server.onNotFound([](){ server.send(404, "text/plain", String("404 Not Found: ") + server.uri()); });
   server.begin();
-  Serial.println("[HTTP] WebServer listening on :80");
+  DebugLog::println("[HTTP] WebServer listening on :80");
 }
 
 void setup(){
-  Serial.begin(115200);
-  delay(800);
-  Serial.println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame) — DUAL-SPI lanes build");
-  Serial.printf("[MAP] labelMode=%d\n", (int)gLabelMode);
+  DebugLog::begin(kEnableSerialDebug);
+  DebugLog::println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame) — DUAL-SPI lanes build");
+  DebugLog::printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
   pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
 
@@ -2099,11 +2125,11 @@ void setup(){
   if (PIN_STROBE_GATE >= 0) { pinMode(PIN_STROBE_GATE, OUTPUT); digitalWrite(PIN_STROBE_GATE, LOW); }
 
   bool card = cardPresent();
-  if (!card) Serial.printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
+  if (!card) DebugLog::printf("[SD] No card (CD HIGH on GPIO%d); UI still available.\n", PIN_SD_CD);
 
   if (card) {
     g_sdReady = mountSdmmc();
-    if (!g_sdReady) Serial.println("[SD] Mount failed; UI still available for diagnostics.");
+    if (!g_sdReady) DebugLog::println("[SD] Mount failed; UI still available for diagnostics.");
   }
 
   if (g_sdReady) checkSdFirmwareUpdate();
@@ -2124,18 +2150,18 @@ void setup(){
   g_pixelsPerArm = clampPixelsPerArm(g_pixelsPerArm);
   if (!g_stationId.length()) g_stationId = defaultStationId();
 
-  Serial.println(F("[Quadrant self-check]"));
+  DebugLog::println(F("[Quadrant self-check]"));
   for (int k = 0; k < activeArmCount(); ++k) {
     int s0 = armSpokeIdx0(k, spoke1BasedToIdx0(START_SPOKE_1BASED, SPOKES), SPOKES, activeArmCount());
-    Serial.printf("Arm %d → spoke %d\n", k+1, s0 + 1);
+    DebugLog::printf("Arm %d → spoke %d\n", k+1, s0 + 1);
   }
-  Serial.printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
-  Serial.printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodUs);
-  Serial.printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
+  DebugLog::printf("[BRIGHTNESS] %u%% (%u)\n", g_brightnessPercent, g_brightness);
+  DebugLog::printf("[PLAY] FPS=%u  period=%lums\n", g_fps, (unsigned long)g_framePeriodUs);
+  DebugLog::printf("[MAP] startCh(Arm1)=%lu spokes=%u arms=%u pixels/arm=%u\n",
                 (unsigned long)g_startChArm1, g_spokesTotal, (unsigned)activeArmCount(),
                 (unsigned)g_pixelsPerArm);
-  Serial.printf("[OUTMODE] %s\n", (g_outputMode==OUT_PARALLEL?"PARALLEL":"SPI"));
-  Serial.printf("[STROBE] enable=%d width=%.2f phase=%.2f\n", (int)g_strobeEnable, g_strobeWidthDeg, g_strobePhaseDeg);
+  DebugLog::printf("[OUTMODE] %s\n", (g_outputMode==OUT_PARALLEL?"PARALLEL":"SPI"));
+  DebugLog::printf("[STROBE] enable=%d width=%.2f phase=%.2f\n", (int)g_strobeEnable, g_strobeWidthDeg, g_strobePhaseDeg);
 
   startWifiAP();
 
@@ -2144,7 +2170,7 @@ void setup(){
       uint8_t type = SD_MMC.cardType();
       uint64_t sizeMB = (type==CARD_NONE) ? 0 : (SD_MMC.cardSize() / (1024ULL*1024ULL));
       SD_UNLOCK();
-      Serial.printf("[SD] Type=%u  Size=%llu MB\n", (unsigned)type, (unsigned long long)sizeMB);
+      DebugLog::printf("[SD] Type=%u  Size=%llu MB\n", (unsigned)type, (unsigned long long)sizeMB);
     }
     persistSettingsToSd();
   }
@@ -2162,7 +2188,7 @@ void setup(){
   g_rpmLastCount = g_pulseCount;
   g_rpmAccumulatedUs = 0;
   g_rpmAccumulatedPulses = 0;
-  Serial.println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
+  DebugLog::println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
 }
 
 void loop(){
@@ -2187,11 +2213,11 @@ void loop(){
       String why;
       g_paused = false;
       if (openFseq(g_bgEffectPath, why)) { 
-        Serial.printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); 
+        DebugLog::printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); 
         g_bgEffectNextAttemptMs = now; 
       }
       else { 
-        Serial.printf("[BGE] open fail: %s\n", why.c_str()); 
+        DebugLog::printf("[BGE] open fail: %s\n", why.c_str()); 
         g_bgEffectNextAttemptMs = now + 5000; 
       }
     }
@@ -2203,10 +2229,10 @@ void loop(){
     String why;
     g_paused = false;
     if (openFseq("/test2.fseq", why)) { 
-      Serial.println("[TIMEOUT] Auto-start /test2.fseq"); 
+      DebugLog::println("[TIMEOUT] Auto-start /test2.fseq"); 
     }
     else { 
-      Serial.printf("[TIMEOUT] open fail: %s\n", why.c_str()); 
+      DebugLog::printf("[TIMEOUT] open fail: %s\n", why.c_str()); 
       g_bootMs = millis(); 
     }
   }
@@ -2237,10 +2263,10 @@ void loop(){
     
     if (!loadNextFrame()) {
       ++g_sdFailStreak;
-      Serial.printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
+      DebugLog::printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
       if (!recoverSd("frame read failed")) {
         if (g_sdFailStreak >= 6) {
-          Serial.println("[SD] Unrecoverable — pausing playback.");
+          DebugLog::println("[SD] Unrecoverable — pausing playback.");
           g_playing = false;
           g_bgEffectActive = false;
           g_bgEffectNextAttemptMs = millis();
@@ -2264,7 +2290,7 @@ void loop(){
       float target = (g_framePeriodUs > 0) ? (1000000.0f / (float)g_framePeriodUs) : 0.0f;
       
       // This will appear in your WiFi serial console
-      Serial.printf("[FPS] target=%.2f measured=%.2f frames=%lu drift=%ldus\n", 
+      DebugLog::printf("[FPS] target=%.2f measured=%.2f frames=%lu drift=%ldus\n", 
                     target, g_measuredFps, (unsigned long)g_frameCounter, (long)timeUntilNext);
       
       g_frameCounter = 0;
