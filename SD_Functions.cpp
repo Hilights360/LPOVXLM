@@ -5,6 +5,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
+#include "DebugLog.h"
+
 #include "HtmlUtils.h"
 #include "WebPages.h"
 
@@ -70,7 +72,7 @@ namespace {
 bool ensureSettingsDirLocked() {
   if (!SD_MMC.exists(SETTINGS_DIR)) {
     if (!SD_MMC.mkdir(SETTINGS_DIR)) {
-      Serial.println("[CFG] mkdir /config failed");
+      DebugLog::println("[CFG] mkdir /config failed");
       return false;
     }
   }
@@ -80,7 +82,7 @@ bool ensureSettingsDirLocked() {
 bool ensureBgEffectsDirLocked() {
   if (!SD_MMC.exists(BG_EFFECTS_DIR)) {
     if (!SD_MMC.mkdir(BG_EFFECTS_DIR)) {
-      Serial.println("[CFG] mkdir /BGEffects failed");
+      DebugLog::println("[CFG] mkdir /BGEffects failed");
       return false;
     }
   }
@@ -92,7 +94,7 @@ bool saveSettingsBackupLocked() {
   SD_MMC.remove(SETTINGS_FILE);
   File f = SD_MMC.open(SETTINGS_FILE, FILE_WRITE);
   if (!f) {
-    Serial.println("[CFG] open settings.ini failed");
+    DebugLog::println("[CFG] open settings.ini failed");
     return false;
   }
   f.print("brightness="); f.println((unsigned)g_brightnessPercent);
@@ -191,7 +193,7 @@ void persistSettingsToSd() {
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) return;
   bool ok = saveSettingsBackupLocked();
   SD_UNLOCK();
-  if (!ok) Serial.println("[CFG] Failed to persist settings to SD");
+  if (!ok) DebugLog::println("[CFG] Failed to persist settings to SD");
 }
 
 void ensureSettingsFromBackup(const PrefPresence &present) {
@@ -286,12 +288,12 @@ void checkSdFirmwareUpdate() {
     f.close();
     SD_MMC.remove(OTA_FILE);
     SD_UNLOCK();
-    Serial.println("[OTA] Empty firmware.bin removed");
+    DebugLog::println("[OTA] Empty firmware.bin removed");
     return;
   }
-  Serial.printf("[OTA] Found %s (%u bytes)\n", OTA_FILE, (unsigned)size);
+  DebugLog::printf("[OTA] Found %s (%u bytes)\n", OTA_FILE, (unsigned)size);
   if (!Update.begin(size)) {
-    Serial.printf("[OTA] Update begin failed: %s\n", Update.errorString());
+    DebugLog::printf("[OTA] Update begin failed: %s\n", Update.errorString());
     f.close();
     SD_MMC.remove(OTA_FAIL_FILE);
     SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
@@ -303,7 +305,7 @@ void checkSdFirmwareUpdate() {
     size_t rd = f.read(buf, sizeof(buf));
     if (!rd) break;
     if (Update.write(buf, rd) != rd) {
-      Serial.printf("[OTA] Write failed: %s\n", Update.errorString());
+      DebugLog::printf("[OTA] Write failed: %s\n", Update.errorString());
       Update.end();
       f.close();
       SD_MMC.remove(OTA_FAIL_FILE);
@@ -315,20 +317,20 @@ void checkSdFirmwareUpdate() {
   }
   f.close();
   if (!Update.end()) {
-    Serial.printf("[OTA] Update end failed: %s\n", Update.errorString());
+    DebugLog::printf("[OTA] Update end failed: %s\n", Update.errorString());
     SD_MMC.remove(OTA_FAIL_FILE);
     SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
     SD_UNLOCK();
     return;
   }
   if (!Update.isFinished()) {
-    Serial.println("[OTA] Update incomplete");
+    DebugLog::println("[OTA] Update incomplete");
     SD_MMC.remove(OTA_FAIL_FILE);
     SD_MMC.rename(OTA_FILE, OTA_FAIL_FILE);
     SD_UNLOCK();
     return;
   }
-  Serial.println("[OTA] Update successful, rebooting...");
+  DebugLog::println("[OTA] Update successful, rebooting...");
   SD_MMC.remove(OTA_FILE);
   SD_UNLOCK();
   delay(200);
@@ -348,7 +350,7 @@ void sd_preflight() {
   pinMode(PIN_SD_D2,  INPUT_PULLUP);
   pinMode(PIN_SD_D3,  INPUT_PULLUP);
   delay(2);
-  Serial.printf("[SD] Preflight CMD@%d=%d  D0@%d=%d  D1@%d=%d  D2@%d=%d  D3@%d=%d (expect 1s)\n",
+  DebugLog::printf("[SD] Preflight CMD@%d=%d  D0@%d=%d  D1@%d=%d  D2@%d=%d  D3@%d=%d (expect 1s)\n",
                 PIN_SD_CMD, digitalRead(PIN_SD_CMD),
                 PIN_SD_D0,  digitalRead(PIN_SD_D0),
                 PIN_SD_D1,  digitalRead(PIN_SD_D1),
@@ -359,7 +361,7 @@ void sd_preflight() {
 
 bool mountSdmmc() {
   if (!SD_LOCK(pdMS_TO_TICKS(2000))) {
-    Serial.println("[SD] mount lock timeout");
+    DebugLog::println("[SD] mount lock timeout");
     return false;
   }
   g_sdFreqKHz = sanitizeSdFreq(g_sdFreqKHz);
@@ -386,7 +388,7 @@ bool mountSdmmc() {
       SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0, -1, -1, -1);
       ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*no-format*/, g_sdFreqKHz);
     }
-    Serial.printf("[SD] Mounted (%ubit request=%u) @ %lu kHz: %s\n",
+    DebugLog::printf("[SD] Mounted (%ubit request=%u) @ %lu kHz: %s\n",
                   (unsigned)mode, (unsigned)g_sdPreferredBusWidth,
                   (unsigned long)g_sdFreqKHz, ok?"OK":"FAIL");
     if (ok) { g_sdBusWidth = mode; break; }
@@ -420,7 +422,7 @@ static void listFseqInDir_locked(const char* path, String& optionsHtml, uint8_t 
 }
 
 void listFseqInDir(const char* path, String& optionsHtml, uint8_t depth) {
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip list"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { DebugLog::println("[SD] busy; skip list"); return; }
   listFseqInDir_locked(path, optionsHtml, depth);
   SD_UNLOCK();
 }
@@ -452,7 +454,7 @@ void listBgEffects(String& optionsHtml, const String& current) {
   optionsHtml += "<option value=''";
   if (!current.length()) optionsHtml += " selected";
   optionsHtml += ">(none)</option>";
-  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { Serial.println("[SD] busy; skip bge list"); return; }
+  if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(2000))) { DebugLog::println("[SD] busy; skip bge list"); return; }
   listBgEffects_locked(optionsHtml, current);
   SD_UNLOCK();
 }
@@ -602,17 +604,17 @@ void handleUploadData() {
     g_uploadFilename = joinPath(dir, g_uploadFilename);
 
     if (!isFseqName(g_uploadFilename)) {
-      Serial.printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
+      DebugLog::printf("[UPLOAD] Rejected non-.fseq: %s\n", g_uploadFilename.c_str());
     } else {
-      if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[UPLOAD] SD busy"); return; }
+      if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { DebugLog::println("[UPLOAD] SD busy"); return; }
       File d = SD_MMC.open(dir);
       bool okdir = d && d.isDirectory(); if (d) d.close();
       if (!okdir) {
-        Serial.printf("[UPLOAD] Target dir missing: %s\n", dir.c_str());
+        DebugLog::printf("[UPLOAD] Target dir missing: %s\n", dir.c_str());
       } else {
         if (SD_MMC.exists(g_uploadFilename)) SD_MMC.remove(g_uploadFilename);
         g_uploadFile = SD_MMC.open(g_uploadFilename, FILE_WRITE);
-        Serial.printf("[UPLOAD] START %s\n", g_uploadFilename.c_str());
+        DebugLog::printf("[UPLOAD] START %s\n", g_uploadFilename.c_str());
       }
       SD_UNLOCK();
     }
@@ -628,9 +630,9 @@ void handleUploadData() {
   } else if (up.status == UPLOAD_FILE_END) {
     if (g_uploadFile) {
       if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_uploadFile.close(); SD_UNLOCK(); }
-      Serial.printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes);
+      DebugLog::printf("[UPLOAD] DONE %s (%u bytes)\n", g_uploadFilename.c_str(), (unsigned)g_uploadBytes);
     } else {
-      Serial.println("[UPLOAD] Aborted/invalid file");
+      DebugLog::println("[UPLOAD] Aborted/invalid file");
     }
   }
 }
@@ -708,7 +710,7 @@ void handleSdConfig() {
       if (g_currentPath.length()) {
         String why;
         reopened = openFseq(g_currentPath, why);
-        if (!reopened && why.length()) Serial.printf("[SD] reopen after config failed: %s\n", why.c_str());
+        if (!reopened && why.length()) DebugLog::printf("[SD] reopen after config failed: %s\n", why.c_str());
       }
     }
   } else { g_sdReady = false; g_sdBusWidth = 0; }
@@ -743,18 +745,18 @@ void handleOtaData() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     g_otaBytes = 0;
-    Serial.printf("[OTA] Direct start: %s\n", up.filename.c_str());
-    if (!Update.begin()) { Serial.printf("[OTA] begin failed: %s\n", Update.errorString()); }
+    DebugLog::printf("[OTA] Direct start: %s\n", up.filename.c_str());
+    if (!Update.begin()) { DebugLog::printf("[OTA] begin failed: %s\n", Update.errorString()); }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.isRunning()) {
       size_t w = Update.write(up.buf, up.currentSize);
-      if (w != up.currentSize) Serial.printf("[OTA] write failed: %s\n", Update.errorString());
+      if (w != up.currentSize) DebugLog::printf("[OTA] write failed: %s\n", Update.errorString());
     }
     g_otaBytes += up.currentSize;
     feedWatchdog();
   } else if (up.status == UPLOAD_FILE_END) {
     bool ok = Update.end(true);
-    Serial.printf("[OTA] Direct end (%u bytes): %s\n", (unsigned)g_otaBytes, ok?"OK":"FAIL");
+    DebugLog::printf("[OTA] Direct end (%u bytes): %s\n", (unsigned)g_otaBytes, ok?"OK":"FAIL");
   }
 }
 
@@ -769,11 +771,11 @@ void handleFwUploadData() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     g_fwSdBytes = 0;
-    if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { Serial.println("[FWSD] SD busy at START"); return; }
+    if (!g_sdMutex || !SD_LOCK(pdMS_TO_TICKS(5000))) { DebugLog::println("[FWSD] SD busy at START"); return; }
     if (SD_MMC.exists(OTA_FILE)) SD_MMC.remove(OTA_FILE);
     g_fwSdFile = SD_MMC.open(OTA_FILE, FILE_WRITE);
     SD_UNLOCK();
-    Serial.println("[FWSD] START -> /firmware.bin");
+    DebugLog::println("[FWSD] START -> /firmware.bin");
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (g_fwSdFile) {
       if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) {
@@ -785,9 +787,9 @@ void handleFwUploadData() {
   } else if (up.status == UPLOAD_FILE_END) {
     if (g_fwSdFile) {
       if (g_sdMutex && SD_LOCK(pdMS_TO_TICKS(2000))) { g_fwSdFile.close(); SD_UNLOCK(); }
-      Serial.printf("[FWSD] DONE (%u bytes)\n", (unsigned)g_fwSdBytes);
+      DebugLog::printf("[FWSD] DONE (%u bytes)\n", (unsigned)g_fwSdBytes);
     } else {
-      Serial.println("[FWSD] Aborted/invalid");
+      DebugLog::println("[FWSD] Aborted/invalid");
     }
   }
 }
