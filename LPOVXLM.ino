@@ -347,6 +347,7 @@ struct ArmRuntimeState {
   uint16_t baseSpoke = 0;
   uint16_t currentSpoke = 0;
   uint32_t blankDeadlineUs = 0;
+  uint32_t paintTimestampUs = 0;  // NEW: track when arm was painted
   bool     lit = false;
 };
 static ArmRuntimeState g_armState[MAX_ARMS];
@@ -809,12 +810,21 @@ static void rebuildStrips(){
   // Build new lanes (each drives 2 * pixelsPerArm)
   const uint16_t nPerArm = armPixelCount();
   const uint16_t nPerLane = nPerArm * 2;
-  for (uint8_t l=0;l<NUM_LANES;++l) {
+ for (uint8_t l=0;l<NUM_LANES;++l) {
     g_lanes[l] = new Adafruit_DotStar(nPerLane, LANE_DATA[l], LANE_CLK[l], DOTSTAR_BGR);
     g_lanes[l]->begin();
+    
+    // CRITICAL: Set maximum SPI speed for SK9822
+    // SK9822 supports up to 30 MHz, we'll use 24 MHz for stability
+    // Default is only 8 MHz which causes visible smearing
+    g_lanes[l]->updateLength(nPerLane); 
+    SPI.setClockDivider(SPI_CLOCK_DIV2); // 80MHz / 2 = 40 MHz (may need DIV4 for 20MHz if unstable)
+    
     g_lanes[l]->setBrightness(g_brightness);
     g_lanes[l]->clear();
     g_lanes[l]->show();
+    
+    DebugLog::printf("[LANE%u] %u pixels, SPI optimized for low-latency\n", l, nPerLane);
   }
 
   // Route table: Arm1+Arm2 on Lane0 ; Arm3+Arm4 on Lane1
@@ -916,8 +926,14 @@ static uint32_t computeArmHoldDurationUs(){
 
   uint32_t duty = g_displayDutyPercent;
   if (duty > 100) duty = 100;
+  
+  // Calculate hold time based on duty cycle
   uint64_t hold = ((uint64_t)base * (uint64_t)duty) / 100ULL;
-  if (hold < ARM_BLANK_MIN_US) hold = ARM_BLANK_MIN_US;
+  
+  // REMOVED minimum clamp - allow duty to go all the way to 0
+  // This allows full range control from 0% (instant blank) to 100% (full spoke)
+  // The old ARM_BLANK_MIN_US clamp prevented low duty cycles from working
+  
   return (uint32_t)hold;
 }
 
@@ -992,33 +1008,44 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
       mapChannels(&g_frameBuf[idxR], R, G, B);
     }
 
-    if (g_brightness < 255) {
+    /*if (g_brightness < 255) {
       R = (uint8_t)((uint16_t)R * g_brightness / 255);
       G = (uint8_t)((uint16_t)G * g_brightness / 255);
       B = (uint8_t)((uint16_t)B * g_brightness / 255);
-    }
+    }*/
     armSetPixel(arm, i, R, G, B);
   }
 
   armShow(arm);
   g_armState[arm].lit = true;
+  g_armState[arm].paintTimestampUs = nowUs;  // NEW: store paint time
   g_armState[arm].blankDeadlineUs = nowUs + holdUs;
   if (g_armState[arm].blankDeadlineUs == 0) g_armState[arm].blankDeadlineUs = 1;
 }
 
 static void processArmBlanking(uint32_t nowUs){
   const uint8_t arms = activeArmCount();
+  bool anyBlanked = false;
+  
   for (uint8_t a=0; a<arms; ++a){
     if (!g_armState[a].lit) continue;
     uint32_t blankAt = g_armState[a].blankDeadlineUs;
     if (blankAt && microsReached(nowUs, blankAt)) {
       blankArm(a); // marks g_needShow = true
+      anyBlanked = true;
     }
   }
   for (uint8_t a=arms; a<MAX_ARMS; ++a){
-    if (g_armState[a].lit) blankArm(a);
+    if (g_armState[a].lit) {
+      blankArm(a);
+      anyBlanked = true;
+    }
   }
-  //lanesCommit(); // commit clears once per pass REMOVED TO FREE UP TIME
+  
+  // Only commit if we actually blanked something
+  if (anyBlanked) {
+    lanesCommit();
+  }
 }
 
 static void processHallSyncEvent(uint32_t nowUs){
@@ -1058,7 +1085,7 @@ static void processHallSyncEvent(uint32_t nowUs){
   }
 
   // Commit initial base paint when strobe is OFF
-  // if (!g_strobeEnable) lanesCommit();  REMOVED TO FREE UP TIME
+  if (!g_strobeEnable) lanesCommit();  
 
   uint64_t revolutionUs = 0;
   if (g_lastPeriodUs > 0) {
@@ -1089,21 +1116,24 @@ static void advancePredictedSpokes(uint32_t nowUs){
   if (!spokes) return;
   if (g_spokeDurationUs == 0 || g_nextSpokeDeadlineUs == 0) return;
 
-   const uint8_t arms = activeArmCount();   // ← ADD THIS LINE
+  const uint8_t arms = activeArmCount();
+  uint8_t stepsProcessed = 0;
+  const uint8_t maxSteps = 4; // Limit steps per loop to avoid blocking
 
-   // Add safety limit
-  uint8_t iterations = 0;
-  const uint8_t maxIterations = spokes;
-
-  while (microsReached(nowUs, g_nextSpokeDeadlineUs)) {
+  while (microsReached(nowUs, g_nextSpokeDeadlineUs) && stepsProcessed < maxSteps) {
     g_spokeStep = (g_spokeStep + 1) % spokes;
     for (uint8_t a=0; a<arms; ++a){
       uint16_t base = g_armState[a].baseSpoke % spokes;
       uint16_t spoke = (base + g_spokeStep) % spokes;
       paintArmAt(a, spoke, nowUs);
     }
-    //lanesCommit();  // single commit per stepped spoke REMOVED TO FREE UP TIME
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
+    stepsProcessed++;
+  }
+  
+  // Commit all painted spokes at once
+  if (stepsProcessed > 0) {
+    lanesCommit();
   }
 }
 
@@ -1249,6 +1279,34 @@ static void handleDiagTiming() {
   server.send(200, "application/json", json);
 }
 
+static void handleDiagDuty() {
+  uint32_t base = g_spokeDurationUs;
+  uint32_t hold = computeArmHoldDurationUs();
+  uint32_t period = g_lastPeriodUs;
+  
+  String json = "{";
+  json += "\"dutyPercent\":" + String((unsigned)g_displayDutyPercent);
+  json += ",\"spokeDuration_us\":" + String((unsigned long)g_spokeDurationUs);
+  json += ",\"lastPeriod_us\":" + String((unsigned long)g_lastPeriodUs);
+  json += ",\"computedHold_us\":" + String((unsigned long)hold);
+  json += ",\"minHold_us\":" + String((unsigned long)ARM_BLANK_MIN_US);
+  json += ",\"fallback_us\":" + String((unsigned long)ARM_BLANK_FALLBACK_US);
+  
+  // Show per-arm state
+  json += ",\"arms\":[";
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (a > 0) json += ",";
+    json += "{\"lit\":" + String(g_armState[a].lit ? "true" : "false");
+    json += ",\"deadline\":" + String((unsigned long)g_armState[a].blankDeadlineUs);
+    json += ",\"spoke\":" + String((unsigned)g_armState[a].currentSpoke);
+    json += "}";
+  }
+  json += "]}";
+  
+  server.send(200, "application/json", json);
+}
+
 static void handleLogsPage() {
   String page = WebPages::logsPage(DebugLog::logsHtmlPre());
   server.send(200, "text/html; charset=utf-8", page);
@@ -1298,14 +1356,31 @@ static void applyDisplayDuty(uint8_t pct){
   prefs.putUChar("duty", g_displayDutyPercent);
   persistSettingsToSd();
 
+  uint32_t newHold = computeArmHoldDurationUs();
   uint32_t now = micros();
-  uint32_t hold = computeArmHoldDurationUs();
   const uint8_t arms = activeArmCount();
+  
+  // Update currently lit arms with new deadline based on when they were painted
   for (uint8_t a = 0; a < arms; ++a) {
-    if (!g_armState[a].lit) continue;
-    g_armState[a].blankDeadlineUs = now + hold;
-    if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+    if (g_armState[a].lit && g_armState[a].paintTimestampUs > 0) {
+      // Recalculate deadline from original paint time with new hold duration
+      g_armState[a].blankDeadlineUs = g_armState[a].paintTimestampUs + newHold;
+      if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
+      
+      // If new deadline already passed, blank immediately
+      if (microsReached(now, g_armState[a].blankDeadlineUs)) {
+        blankArm(a);
+      }
+    }
   }
+  
+  if (g_needShow) {
+    lanesCommit();
+  }
+  
+  DebugLog::printf("[DUTY] %u%% → hold=%lu us (spoke=%lu us)\n", 
+                   (unsigned)pct, (unsigned long)newHold, 
+                   (unsigned long)g_spokeDurationUs);
 }
 
 static void applyBrightness(uint8_t pct){
@@ -2015,6 +2090,8 @@ static void startWifiAP(){
 
   // Diagnostic Timing
   server.on("/diag/timing", HTTP_GET, handleDiagTiming);
+    // Diagnostic Duty
+  server.on("/diag/duty", HTTP_GET, handleDiagDuty);
 
   // Wi-Fi log viewer
   server.on("/logs",       HTTP_GET,  handleLogsPage);
@@ -2309,10 +2386,11 @@ void loop(){
     digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
   }
 
-  if (g_strobeEnable) {
+ if (g_strobeEnable) {
     processHallSyncEvent(nowUs);
     const uint16_t spokeNow2 = currentSpokeIndex();
     const uint8_t arms = activeArmCount();
+    bool anyChange = false;
 
     for (uint8_t a = 0; a < arms; ++a) {
       const bool in = inStrobeWindowForArm(spokeNow2, a);
@@ -2321,22 +2399,30 @@ void loop(){
         paintArmAt(a, spokeNow2, nowUs);
         g_lastPulseSpoke[a] = spokeNow2;
         g_armState[a].lit = true;
+        anyChange = true;
       }
 
       if (!in && g_armState[a].lit) {
         blankArm(a);
+        anyChange = true;
       }
     }
-  } else {
+    
+    // Commit strobe changes once per loop
+    if (anyChange) {
+      lanesCommit();
+    }
+   } else {
     processHallSyncEvent(nowUs);
     advancePredictedSpokes(nowUs);
     processArmBlanking(nowUs);
-  }
+  
+ }
 
   // CRITICAL: Single commit per loop iteration
-  if (g_needShow) {
+ /* if (g_needShow) {
     lanesCommit();
-  }
+  }*/
 
   feedWatchdog();
 }

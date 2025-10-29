@@ -1,7 +1,7 @@
 #pragma once
 #include <math.h>
 
-// Labeling mode: xLights “lower wedge at boundary” (matches what you see: 1,11,20,30)
+// Labeling mode: xLights “lower wedge at boundary” (matches what you see: 1,11,21,31)
 // or “round to center” (mathematically exact: 1,11,21,31)
 enum SpokeLabelMode { ROUND_TO_CENTER, FLOOR_TO_BOUNDARY };
 
