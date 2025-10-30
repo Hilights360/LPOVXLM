@@ -194,9 +194,25 @@ uint8_t g_brightness = 63;
 
 // ---- One-commit-per-step flag + lane commit helper (NEW) ----
 static volatile bool g_needShow = false;
+// SPI clock override (set once, reused)
+static bool g_spiClockConfigured = false;
+static const uint32_t g_spiClockHz = 40000000; // 40 MHz
+
 static inline void lanesCommit() {
   if (!g_needShow) return;
-  for (uint8_t l = 0; l < NUM_LANES; ++l) if (g_lanes[l]) g_lanes[l]->show();
+  
+  // Configure SPI speed on first use
+  if (!g_spiClockConfigured) {
+    // Force SPI bus configuration for both lanes
+    // Lane 0 uses HSPI, Lane 1 uses VSPI (typically)
+    SPI.setFrequency(g_spiClockHz);
+    g_spiClockConfigured = true;
+    DebugLog::printf("[SPI] Clock set to %lu MHz\n", g_spiClockHz / 1000000UL);
+  }
+  
+  for (uint8_t l = 0; l < NUM_LANES; ++l) {
+    if (g_lanes[l]) g_lanes[l]->show();
+  }
   g_needShow = false;
 }
 
@@ -810,21 +826,28 @@ static void rebuildStrips(){
   // Build new lanes (each drives 2 * pixelsPerArm)
   const uint16_t nPerArm = armPixelCount();
   const uint16_t nPerLane = nPerArm * 2;
- for (uint8_t l=0;l<NUM_LANES;++l) {
+// ESP32 SPI buses: HSPI and VSPI can run up to 80 MHz
+  // SK9822 chips support up to 30 MHz officially, but many work at 40 MHz
+  // We'll start aggressive at 40 MHz and can back down if needed
+  const uint32_t spiClockHz = 40000000; // 40 MHz - adjust down to 30000000 if unstable
+  
+  for (uint8_t l=0;l<NUM_LANES;++l) {
+    // Adafruit_DotStar will use hardware SPI, but we need to configure it AFTER begin()
     g_lanes[l] = new Adafruit_DotStar(nPerLane, LANE_DATA[l], LANE_CLK[l], DOTSTAR_BGR);
     g_lanes[l]->begin();
-    
-    // CRITICAL: Set maximum SPI speed for SK9822
-    // SK9822 supports up to 30 MHz, we'll use 24 MHz for stability
-    // Default is only 8 MHz which causes visible smearing
-    g_lanes[l]->updateLength(nPerLane); 
-    SPI.setClockDivider(SPI_CLOCK_DIV2); // 80MHz / 2 = 40 MHz (may need DIV4 for 20MHz if unstable)
-    
     g_lanes[l]->setBrightness(g_brightness);
-    g_lanes[l]->clear();
-    g_lanes[l]->show();
     
-    DebugLog::printf("[LANE%u] %u pixels, SPI optimized for low-latency\n", l, nPerLane);
+    // Access the underlying SPI settings
+    // Adafruit_DotStar stores SPI settings internally, we'll override on first show()
+    g_lanes[l]->clear();
+    
+    DebugLog::printf("[LANE%u] %u pixels, targeting %lu MHz SPI\n", 
+                     l, nPerLane, spiClockHz / 1000000UL);
+  }
+  
+  // Initial show
+  for (uint8_t l=0;l<NUM_LANES;++l) {
+    g_lanes[l]->show();
   }
 
   // Route table: Arm1+Arm2 on Lane0 ; Arm3+Arm4 on Lane1
@@ -1959,6 +1982,27 @@ static void handleArmPhase() {
               String("{\"arm\":") + arm + ",\"phase\":" + String(g_armPhaseDeg[arm-1],2) + "}");
 }
 
+static void handleDiagSpi() {
+  const uint16_t nPerArm = armPixelCount();
+  const uint16_t nPerLane = nPerArm * 2;
+  
+  // Calculate theoretical transmission time at current SPI clock
+  uint32_t bitsPerLane = 32 + (nPerLane * 32) + 32; // start + pixels + end
+  uint32_t transmitUs = (bitsPerLane * 1000000UL) / g_spiClockHz;
+  
+  String json = "{";
+  json += "\"spiClock_hz\":" + String((unsigned long)g_spiClockHz);
+  json += ",\"spiClock_mhz\":" + String(g_spiClockHz / 1000000.0f, 1);
+  json += ",\"pixelsPerLane\":" + String(nPerLane);
+  json += ",\"bitsPerLane\":" + String((unsigned long)bitsPerLane);
+  json += ",\"transmitTime_us\":" + String((unsigned long)transmitUs);
+  json += ",\"spokePeriod_us\":" + String((unsigned long)g_spokeDurationUs);
+  json += ",\"transmitPercent\":" + String((transmitUs * 100.0f) / (g_spokeDurationUs ? g_spokeDurationUs : 1), 1);
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
 /* -------------------- RPM config handler -------------------- */
 static void handleRpmCfg(){
   bool changed = false;
@@ -2059,6 +2103,7 @@ static void startWifiAP(){
   
   // SPI Lane Diag
   server.on("/lanediag", HTTP_POST, handleLaneDiag);
+  
 
   // Strobe + per-arm phase
   server.on("/strobe",   HTTP_POST, handleStrobe);
@@ -2090,7 +2135,7 @@ static void startWifiAP(){
 
   // Diagnostic Timing
   server.on("/diag/timing", HTTP_GET, handleDiagTiming);
-    // Diagnostic Duty
+  server.on("/diag/spi", HTTP_GET, handleDiagSpi);
   server.on("/diag/duty", HTTP_GET, handleDiagDuty);
 
   // Wi-Fi log viewer
@@ -2222,8 +2267,13 @@ void setup(){
 
   if (g_brightnessPercent > 100) g_brightnessPercent = 100;
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
-  if (!g_fps) g_fps = 40;
+if (!g_fps) g_fps = 40;
   g_framePeriodUs = 1000000UL / g_fps;
+  
+  DebugLog::printf("[TIMING] FPS=%u period=%lu us, spokes=%u spoke_period=%lu us\n",
+                   g_fps, (unsigned long)g_framePeriodUs, 
+                   g_spokesTotal, 
+                   g_spokesTotal ? (unsigned long)(g_framePeriodUs * g_fps / g_spokesTotal) : 0UL);
   if (!g_startChArm1) g_startChArm1 = 1;
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
