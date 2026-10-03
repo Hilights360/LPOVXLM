@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SD Card - LPOVXLM</title>
+<style>
+:root{color-scheme:dark;--bg:#101820;--panel:#192630;--line:#354752;--text:#edf5f8;--muted:#a8beca;--accent:#82dcc8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif}main,header{max-width:1120px;margin:auto;padding:20px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}h1{font-size:1.5rem;margin:0}h2{font-size:1.2rem;margin:0 0 16px}h3{font-size:1rem}nav{display:flex;gap:18px;flex-wrap:wrap}a{color:var(--accent)}section{scroll-margin-top:20px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:18px}.card{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px}.row{display:flex;align-items:end;gap:12px;flex-wrap:wrap}label{display:block;margin:10px 0;flex:1;min-width:100px}input,select,button{font:inherit;border-radius:6px;border:1px solid var(--line);padding:9px 12px}input:not([type=checkbox]),select{display:block;width:100%;background:var(--bg);color:var(--text);margin-top:5px}input[type=checkbox]{margin-right:8px;accent-color:var(--accent)}button{background:var(--accent);color:#10211e;font-weight:600;cursor:pointer}button.secondary{background:transparent;color:var(--text)}button:disabled{opacity:.5;cursor:wait}:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.muted,small{color:var(--muted)}#notice{position:sticky;top:0;z-index:2;background:#223740;padding:12px 20px;display:none;white-space:pre-wrap}#notice.error{background:#672d32}pre{padding:14px;background:#0a131a;border-radius:8px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word}table{width:100%;border-collapse:collapse}td,th{text-align:left;border-bottom:1px solid var(--line);padding:9px 5px;overflow-wrap:anywhere}td button{font-size:.8rem;margin:3px}.table-wrap{overflow:auto}#state{color:var(--accent);font-weight:600}.metrics{display:flex;gap:20px;flex-wrap:wrap}.metrics strong{display:block;font-size:1.4rem}footer{padding:20px;color:var(--muted)}
+h1{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.build-tag{font-size:.85rem;font-weight:500;color:var(--muted);white-space:nowrap}.build-tag:empty{display:none}.page-title{margin:4px 0;font-size:1.1rem;color:var(--accent)}
+html{scroll-padding-top:calc(var(--header-height,160px) + var(--notice-height,0px))}
+header{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);box-shadow:0 4px 16px #0004}
+header>div{min-width:0;max-width:100%;overflow-wrap:anywhere}header nav{align-items:center}header #reboot{white-space:nowrap}
+#notice{top:var(--header-height,160px);z-index:19;overflow-wrap:anywhere}
+section{scroll-margin-top:16px}
+@media(max-width:600px){header{padding:12px 16px;gap:10px}header h1{font-size:1.15rem}header nav{gap:8px 14px;font-size:.9rem}header #reboot{padding:6px 10px}}
+progress{width:100%;height:18px;accent-color:var(--accent)}button.danger{background:#b8434d;color:white}#formatconfirm{max-width:240px}details summary{cursor:pointer}
+</style></head><body>
+<header><div><h1>LPOVXLM Spinner <span id="headerbuild" class="build-tag"></span></h1><p class="page-title">SD Card</p><span id="state">Connecting...</span></div><nav aria-label="Main"><a href="/">Controller</a><a href="/leds">LEDs</a><a href="/speed-test">Speed test</a><a href="/wifi">Wi-Fi setup</a><a href="/sd" aria-current="page">SD Card</a><a href="/sd/scope">SD pin scope</a><button type="button" id="reboot" class="secondary" title="Restart the controller and stop lights">Reboot</button></nav></header><div id="notice" role="status" aria-live="polite"></div><main><nav aria-label="SD Card sections" style="margin-bottom:20px"><a href="#card">Card setup</a><a href="#sdtools">Speed test / format</a><a href="#files">Files</a><a href="#diagnostics">Diagnostics</a><a href="#updates">Firmware / OTA</a><a href="#logs">Logs</a></nav><section id="card" class="card"><h2>SD card</h2><p id="sdstate" role="status">Checking card...</p><p id="sdinfo" class="muted"></p><form data-route="/sd/config"><label>Preferred bus width<select id="sdmode" name="mode"><option value="0">4-bit preferred (legacy Auto)</option><option value="1">1-bit</option><option value="4">4-bit</option></select></label><label>Maximum clock<select id="sdfreq" name="freq"><option value="400">400 kHz</option><option value="20000">20 MHz (recommended)</option><option value="40000">40 MHz</option></select></label><label style="display:block"><input type="checkbox" id="sdfallback" name="fallback" style="width:auto"> Automatically use 1-bit backup and lower clocks</label><label style="display:block"><input type="checkbox" id="sdrecover" name="recover" style="width:auto"> Recover after SD read/write errors</label><p id="sdladder" class="muted"></p><p class="muted">Recovery stops playback, waits for pending reads, and tries settings below the one that failed. It never formats or erases files. Interrupted transfers must be retried. Retry mount starts again at the preferred setting.</p><button>Save and mount</button> <button type="button" id="remount" class="secondary">Retry mount</button> <button type="button" id="sdstepdown" class="secondary">Try next lower setting</button><p id="sdrecovery" role="status" aria-live="polite"></p></form></section><section id="sdtools" class="card"><h2>SD speed test</h2><p>Measure the mounted card at its current bus width and clock. Writes a temporary file, reads it back, verifies every byte, and removes the test file.</p><form id="sdspeedform" class="row"><label>Test size<select id="sdtestsize"><option value="1">1 MiB (quick)</option><option value="4" selected>4 MiB</option><option value="16">16 MiB (longer)</option></select></label><button id="runsdspeed">Run SD speed test</button><button type="button" id="cancelsdspeed" class="secondary" disabled>Cancel speed test</button></form><p id="sdtoolstatus" role="status" aria-live="polite">No SD tool run yet.</p><progress id="sdprogress" max="100" value="0" hidden></progress><div class="metrics"><div><small>Write speed</small><strong id="sdwrite">—</strong></div><div><small>Read speed</small><strong id="sdread">—</strong></div></div><p id="sdtiming" class="muted"></p><p class="muted">Stops playback while testing. Uses 16 KiB blocks; speeds measure file I/O time, including the write flush. Data verification and scheduling time are excluded. Worst read/write pauses help identify stalls. Cancellation takes effect after the current card operation returns; tests stop after 60 seconds between operations.</p><details><summary>Test details</summary><pre id="sdtooldetail">No results yet.</pre></details><hr><details><summary>Format SD card (erase files)</summary><p><strong>Formatting erases every file and partition on the SD card.</strong> This includes sequences, folders, firmware.bin, and the card's settings backup. Current controller settings stored in ESP32 flash are preserved.</p><p>Creates one FAT partition and mounts it again. The card must respond electrically; formatting cannot fix a bad connection. Keep power connected and leave the card inserted until the operation finishes.</p><form id="formatform"><label>Type ERASE to confirm<input id="formatconfirm" pattern="ERASE" required autocomplete="off" spellcheck="false" placeholder="ERASE"></label><button class="danger" id="formatsd">Erase and format SD card</button></form></details></section><section id="files"><div class="card"><h2>Files</h2><p id="filehint" class="muted"></p><form id="browseform" class="row"><label>Directory<input id="directory" value="/" required></label><label>Sort files<select id="filesort"><option value="name-asc">Name: A to Z</option><option value="name-desc">Name: Z to A</option><option value="date-desc">Modified: newest first</option><option value="date-asc">Modified: oldest first</option></select></label><button>Browse</button><button type="button" id="parent" class="secondary">Parent folder</button></form><div class="table-wrap"><table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead><tbody id="filelist"></tbody></table></div><form id="uploadform" class="row"><label>File to upload<input id="file" type="file" required></label><button>Upload to this folder</button></form><form id="mkdirform" class="row"><label>New folder name<input id="folder" required></label><button>Create folder</button></form><p class="muted">Folders sort first. Dates come from the card's stored file timestamps; uploads retain the source file's modified date. File transfers and file changes stop playback. Delete removes files or empty folders only.</p></div></section><section id="diagnostics"><div class="card"><h2>Diagnostics</h2><p><a href="/sd/scope">Open SD pin scope</a> to capture slow voltage changes with the card inserted and SD communication paused.</p><p><a href="/leds#tests">Open LED tests</a> for light patterns, wiring checks, output timing, and DMA speed.</p><div class="row"><button id="sddiagnostic">SD card status</button><button data-diag="/diag/timing">Playback timing</button><button data-diag="/fseq/header">FSEQ header</button><button data-diag="/status">Full status</button><button data-diag="/diag/wifi">Wi-Fi details</button><button data-diag="/diag/crash">Saved crash report</button></div><pre id="diagnostic">Select a diagnostic above.</pre></div></section><section id="updates"><div class="card"><h2>Firmware updates / OTA</h2><p>Choose the application binary <strong>lpovxlm.bin</strong> from the build output.</p><form id="firmwareform"><label>Firmware<input type="file" id="firmware" accept=".bin" required></label><div class="row"><button name="method" value="/ota">Install over Wi-Fi</button><button name="method" value="/fw/upload" class="secondary">Save firmware.bin on SD</button></div></form><p class="muted">Install over Wi-Fi works without an SD card and restarts the controller after validation. SD updates install on the next restart.</p></div></section><section id="logs"><div class="card"><h2>Controller logs</h2><div class="row"><button id="refreshlogs">Refresh logs</button><button id="clearlogs" class="secondary">Clear logs</button></div><pre id="logtext">Select Refresh logs.</pre></div></section><footer>SD card, files, diagnostics, and firmware updates</footer></main>
+<script src="/recent.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let lastStatus,dir='/',noticeTimer,transferring=false,jobWasRunning=false,fileEntries=[],filesTruncated=false;
+function renderBuild(s){$('headerbuild').textContent=s.firmwareVersion&&s.firmwareBuildNumber!=null?'Ver'+s.firmwareVersion+' \u00b7 Build '+s.firmwareBuildNumber:'';}
+function notice(text,bad=false){clearTimeout(noticeTimer);$('notice').textContent=text;$('notice').className=bad?'error':'';$('notice').style.display='block';if(!bad)noticeTimer=setTimeout(()=>$('notice').style.display='none',6000);}
+async function api(url,options={}){const r=await fetch(url,options);const text=await r.text();let j;try{j=JSON.parse(text);}catch{throw Error(text||r.statusText);}if(!r.ok)throw Error(j.error||r.statusText);return j;}
+const post=(path,params={})=>api(path,{method:'POST',body:new URLSearchParams(params)});
+async function act(fn){try{await fn();}catch(e){notice(e.message,true);}}
+async function refresh(fill=false){
+    const j=await api('/status');lastStatus=j;renderBuild(j);
+    $('state').textContent='Controller connected'+(j.error?' — '+j.error:'');
+    $('sdstate').textContent=j.sd.ready?'Mounted':'Not mounted';
+    $('sdinfo').textContent=j.sd.ready?j.sd.currentWidth+'-bit at '+j.sd.freq+' kHz':'Insert a card and retry mounting. Diagnostics and Wi-Fi firmware updates remain available.';
+    const io=j.sd.ioErrors;
+    if(io?.count)$('sdinfo').textContent+=' Last bus error: '+io.lastError+' on CMD'+io.command+' at '+io.busWidth+'-bit/'+io.clockKHz+' kHz ('+io.count+' since boot).';
+    $('filehint').textContent=j.sd.ready?'Browse sequences and manage files on the SD card.':'Mount the SD card above to browse or change files.';
+    const busy=!!j.sdTools?.running;
+    document.querySelectorAll('#browseform button,#uploadform button,#mkdirform button,button[value="/fw/upload"]').forEach(b=>b.disabled=busy||!j.sd.ready);
+    document.querySelectorAll('form[data-route="/sd/config"] button,#formatsd,#formatconfirm,#sdtestsize,button[value="/ota"]').forEach(b=>b.disabled=busy);
+    $('runsdspeed').disabled=busy||!j.sd.ready;
+    $('sdstepdown').disabled=busy||!j.sd.ready||!j.sd.fallback||(j.sd.currentWidth===1&&j.sd.freq<=400);
+    const recovery=j.sd.recovery;
+    $('sdrecovery').textContent=recovery&&recovery.state!=='idle'?'Recovery: '+recovery.state+'. '+(recovery.reason||'')+(recovery.attempts?' — '+recovery.attempts+' attempt(s), '+recovery.width+'-bit/'+recovery.frequency+' kHz.':'')+(recovery.state==='complete'?' Remount completed; a successful speed test is needed to verify data transfers.':'')+(recovery.error?' '+recovery.error:''):'';
+    $('cancelsdspeed').disabled=!busy||!['speed','read','scope'].includes(j.sdTools.operation);
+    renderTools(j.sdTools);
+    if(jobWasRunning&&!busy){
+        if(j.sd.ready){if(j.sdTools.operation==='format')$('directory').value='/';await browse();}
+        if(j.sdTools.operation==='mount')notice(j.sd.ready?'SD card mounted.':j.sdTools.error||'SD mount failed',!j.sd.ready);
+    }
+    jobWasRunning=busy;
+    if(!j.sd.ready||busy){fileEntries=[];$('filelist').replaceChildren();}
+    if(fill){$('sdmode').value=j.sd.desiredMode;$('sdfreq').value=j.sd.baseFreq;$('sdfallback').checked=j.sd.fallback!==false;$('sdrecover').checked=j.sd.recoverErrors!==false;renderLadder();}
+}
+function renderTools(t){
+    if(!t||t.state==='idle')return;
+    $('sdtooldetail').textContent=JSON.stringify(t,null,2);
+    const format=t.operation!=='speed';
+    let text=({format:'SD format',mount:'SD mount',recovery:'SD recovery',speed:'SD speed test',read:'SD read-only test',scope:'SD pin scope'})[t.operation]||'SD operation';
+    text+=': '+(t.running?t.phase:t.state)+'.';
+    if(t.operation==='read')text+=' '+t.bytesRead.toLocaleString()+' bytes read.'+(t.sha256?' SHA-256: '+t.sha256+'. Compare with the reference hash.':'');
+    if(t.verified&&!format)text+=' All data verified.';
+    const incomplete=!format&&!t.running&&!t.verified;
+    if(incomplete)text+=' Test incomplete: '+t.bytesWritten.toLocaleString()+' of '+t.bytesTarget.toLocaleString()+' bytes written; '+t.bytesRead.toLocaleString()+' bytes read and verified. Speeds below are partial results.';
+    if(t.error)text+=' '+t.error;
+    if(t.temporaryFile)text+='; temporary file remains: '+t.temporaryFile;
+    $('sdtoolstatus').textContent=text;
+    $('sdprogress').hidden=!t.running;
+    if(format)$('sdprogress').removeAttribute('value');
+    else $('sdprogress').value=t.bytesTarget?100*(t.bytesWritten+t.bytesRead)/(2*t.bytesTarget):0;
+    $('sdwrite').textContent=format?'—':t.writeMiBps.toFixed(2)+' MiB/s';
+    $('sdread').textContent=format?'—':t.readMiBps.toFixed(2)+' MiB/s';
+    $('sdtiming').textContent=format?'':t.busWidth+'-bit at '+t.clockKHz+' kHz. Longest write/flush: '+t.maxWrite_ms.toFixed(2)+' ms; read: '+t.maxRead_ms.toFixed(2)+' ms. Total elapsed: '+(t.elapsed_ms/1000).toFixed(1)+' s.';
+}
+$('sdspeedform').onsubmit=e=>{e.preventDefault();act(async()=>{renderTools(await post('/sd/speed',{mib:$('sdtestsize').value}));jobWasRunning=true;await refresh();});};
+$('cancelsdspeed').onclick=()=>act(async()=>{renderTools(await post('/sd/cancel'));notice('Cancellation requested; waiting for the current SD operation.');await refresh();});
+$('formatform').onsubmit=e=>{e.preventDefault();if($('formatconfirm').value!=='ERASE')return;act(async()=>{renderTools(await post('/sd/format',{confirm:'ERASE SD CARD'}));$('formatconfirm').value='';jobWasRunning=true;await refresh();});};
+async function mount(path,params={}){
+    try{const result=await post(path,params);if(result.running){jobWasRunning=true;notice('SD mount started; trying saved fallback settings.');}else notice('SD card mounted.');}
+    finally{await refresh(true);if(lastStatus.sd.ready)await browse();}
+}
+function renderLadder(){
+    const maximum=+$('sdfreq').value,width=+$('sdmode').value===1?1:4,fallback=$('sdfallback').checked;
+    let profiles=width===1?[[1,40000],[1,20000],[1,400]]:maximum>=20000?[[4,40000],[4,20000],[1,20000],[1,400]]:[[4,400],[1,400]];
+    profiles=profiles.filter(([,rate])=>rate<=maximum);
+    if(!fallback)profiles=profiles.slice(0,1);
+    $('sdladder').textContent='Attempt order: '+profiles.map(([bits,rate])=>bits+'-bit / '+(rate<1000?rate+' kHz':rate/1000+' MHz')).join(' → ')+'.';
+    $('sdrecover').disabled=!fallback;
+}
+for(const id of ['sdmode','sdfreq','sdfallback'])$(id).addEventListener('change',renderLadder);
+document.querySelector('form[data-route="/sd/config"]').onsubmit=e=>{e.preventDefault();const p=new URLSearchParams(new FormData(e.target));p.set('fallback',$('sdfallback').checked?'1':'0');p.set('recover',$('sdrecover').checked?'1':'0');act(()=>mount('/sd/config',p));};
+$('sdstepdown').onclick=()=>act(async()=>{await post('/sd/recover');jobWasRunning=true;notice('Trying the next lower SD setting.');await refresh();});
+$('remount').onclick=()=>act(()=>mount('/sd/reinit'));
+$('sddiagnostic').onclick=()=>act(async()=>{const j=await api('/status');$('diagnostic').textContent=JSON.stringify(j.sd,null,2);});
+function child(name){return(dir==='/'?'':dir)+'/'+name;}
+function button(label,fn){const b=document.createElement('button');b.type='button';b.textContent=label;b.className='secondary';b.onclick=()=>act(fn);return b;}
+const fileNames=new Intl.Collator(undefined,{numeric:true,sensitivity:'base'});
+function sortedFiles(){
+    const order=$('filesort').value,descending=order.endsWith('desc'),date=order.startsWith('date');
+    return fileEntries.slice().sort((a,b)=>{
+        if(a.directory!==b.directory)return a.directory?-1:1;
+        if(date){if(!!a.modified!==!!b.modified)return a.modified?-1:1;const delta=(a.modified||0)-(b.modified||0);if(delta)return descending?-delta:delta;}
+        const name=fileNames.compare(a.name,b.name);return !date&&descending?-name:name;
+    });
+}
+function renderFiles(){$('filelist').replaceChildren();for(const f of sortedFiles()){const row=document.createElement('tr'),name=document.createElement('td'),size=document.createElement('td'),modified=document.createElement('td'),actions=document.createElement('td');name.textContent=f.name+(f.directory?'/':'');size.textContent=f.directory?'—':f.size.toLocaleString()+' B';modified.textContent=f.modified?new Date(f.modified*1000).toLocaleString():'Unknown';if(f.directory)actions.append(button('Open',async()=>{$('directory').value=f.path;await browse();}));else{if(/\.fseq$/i.test(f.name))actions.append(button('Play',async()=>{await api('/start?path='+encodeURIComponent(f.path));sequenceHistory.remember(f.path);location.href='/#playback';}));const dl=document.createElement('a');dl.href='/dl?path='+encodeURIComponent(f.path);dl.textContent='Download';actions.append(dl);}actions.append(button('Rename',async()=>{const n=prompt('New name',f.name);if(!n)return;if(/[\\/]/.test(n))throw Error('Enter a name without slashes.');await post('/ren',{path:f.path,to:child(n)});if(sequenceHistory.list().includes(f.path)){sequenceHistory.forget(f.path);sequenceHistory.remember(child(n));}await browse();}));actions.append(button('Delete',async()=>{if(!confirm('Delete '+f.name+'?'))return;await post('/rm',{path:f.path});sequenceHistory.forget(f.path);await browse();}));row.append(name,size,modified,actions);$('filelist').append(row);}}
+async function browse(){const j=await api('/api/files?path='+encodeURIComponent($('directory').value));dir=j.path.replace(/\/$/,'')||'/';$('directory').value=dir;fileEntries=j.files;filesTruncated=!!j.truncated;if(!filesTruncated)sequenceHistory.reconcile(dir,j.files);renderFiles();if(filesTruncated)notice('Only the first 512 directory entries are loaded; sorting applies to the displayed entries.',true);}
+try{const saved=localStorage.getItem('lpov-file-sort');if([...$('filesort').options].some(o=>o.value===saved))$('filesort').value=saved;}catch{}
+$('filesort').onchange=()=>{try{localStorage.setItem('lpov-file-sort',$('filesort').value);}catch{}renderFiles();};
+$('browseform').onsubmit=e=>{e.preventDefault();act(browse);};
+$('parent').onclick=()=>act(async()=>{$('directory').value=dir.slice(0,dir.lastIndexOf('/'))||'/';await browse();});
+function fileDateQuery(file){const seconds=Math.floor(file.lastModified/1000);return seconds>=315532800&&seconds<=4354819199?'&modified='+seconds:'';}
+$('uploadform').onsubmit=e=>{e.preventDefault();act(async()=>{const file=$('file').files[0];if(!file)return;notice('Uploading '+file.name+'…');transferring=true;try{await api('/upload?path='+encodeURIComponent(child(file.name))+fileDateQuery(file),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});}finally{transferring=false;}sequenceHistory.remember(child(file.name));notice('File uploaded.');$('file').value='';await browse();});};
+$('mkdirform').onsubmit=e=>{e.preventDefault();act(async()=>{const n=$('folder').value;if(/[\\/]/.test(n))throw Error('Enter a name without slashes.');await post('/mkdir',{path:child(n)});$('folder').value='';await browse();});};
+document.querySelectorAll('[data-diag]').forEach(b=>b.onclick=()=>act(async()=>{$('diagnostic').textContent=JSON.stringify(await api(b.dataset.diag),null,2);}));
+$('firmwareform').onsubmit=e=>{e.preventDefault();const target=e.submitter.value;act(async()=>{const file=$('firmware').files[0];if(!file)return;if(target==='/ota'&&!confirm('Install '+file.name+' and restart the controller?'))return;notice('Uploading firmware…');transferring=true;try{await api(target+(target==='/fw/upload'?fileDateQuery(file).replace('&','?'):''),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});}finally{transferring=false;}notice(target==='/ota'?'Firmware validated. Controller restarting…':'Saved as /firmware.bin. Reboot to install.');});};
+
+async function logs(){const r=await fetch('/logs.txt');if(!r.ok)throw Error('Cannot read logs');$('logtext').textContent=await r.text();}
+$('refreshlogs').onclick=()=>act(logs);$('clearlogs').onclick=()=>act(async()=>{await post('/logs/clear');await logs();});
+
+act(async()=>{await refresh(true);if(lastStatus.sd.ready)await browse();});
+setInterval(()=>{if(!transferring)refresh().catch(()=>{$('state').textContent='Controller disconnected';});},2000);
+function updateHeaderOffsets(){const root=document.documentElement;root.style.setProperty('--header-height',document.querySelector('header').getBoundingClientRect().height+'px');root.style.setProperty('--notice-height',$('notice').getBoundingClientRect().height+'px');}
+const headerObserver=new ResizeObserver(updateHeaderOffsets);headerObserver.observe(document.querySelector('header'));headerObserver.observe($('notice'));updateHeaderOffsets();
+addEventListener('load',()=>{updateHeaderOffsets();if(location.hash)document.getElementById(location.hash.slice(1))?.scrollIntoView();});
+$('reboot').onclick=()=>act(async()=>{const button=$('reboot');if(button.disabled)return;button.disabled=true;try{await post('/reboot');notice('Restarting controller. Reconnect to Wi-Fi if needed.');setTimeout(()=>{button.disabled=false;},5000);}catch(e){button.disabled=false;throw e;}});
+</script></body></html>

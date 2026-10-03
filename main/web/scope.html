@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SD pin scope - LPOVXLM</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#0c1421;color:#e6edf6}*{box-sizing:border-box}body{margin:0}header{position:sticky;top:0;z-index:2;background:#162338;border-bottom:1px solid #33465e;padding:16px 24px}header strong{margin-right:20px}a{color:#8cc8ff}main{max-width:1100px;margin:auto;padding:22px}h1{font-size:1.65rem}h2{font-size:1.1rem}.card{background:#142135;border:1px solid #30445e;border-radius:12px;padding:20px;margin:18px 0}.muted{color:#afbdd0;line-height:1.5}.row{display:flex;flex-wrap:wrap;align-items:end;gap:12px}label{display:flex;flex-direction:column;gap:7px}button,select{font:inherit;padding:10px 12px;background:#223854;color:inherit;border:1px solid #4c6888;border-radius:6px}button{cursor:pointer}button.primary{background:#176aab}button:disabled{opacity:.45;cursor:default}.warning{color:#ffd18c}.error{color:#ff9eaa;white-space:pre-wrap}canvas{display:block;width:100%;height:340px;background:#0b1420;border:1px solid #30445e;border-radius:8px;touch-action:pan-y}#cursor{min-height:1.5em;font-variant-numeric:tabular-nums}#stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:16px;margin:16px 0}#stats span{display:block;color:#afbdd0;font-size:.85rem}#stats strong{font-variant-numeric:tabular-nums}input[type=range]{width:170px;max-width:100%}details{margin-top:18px}summary{cursor:pointer}p{line-height:1.5}#status{min-height:1.5em}small{color:#afbdd0}@media(max-width:600px){main{padding:12px}.card{padding:14px}header{padding:14px}canvas{height:280px}.row>*{max-width:100%}}
+#stats.group{display:block;overflow-x:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:10px 9px;border-bottom:1px solid #30445e;white-space:nowrap}th{color:#afbdd0;font-size:.85rem}.signal-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}
+</style></head><body>
+<header><strong>LPOVXLM Spinner</strong><a href="/">Controller</a> | <a href="/sd#diagnostics">SD Card</a> <small id="build"></small></header>
+<main><h1>SD pin scope</h1><p class="muted">Capture all six SD pins as one sample set, or select a single pin. The card stays inserted; playback stops and SD communication pauses. Pins are sampled one after another, not simultaneously. The card is remounted at its previous setting after the whole set.</p>
+<div class="card"><form id="captureform" class="row">
+<label>Signal<select id="pin"><option value="-1" selected>All six pins</option><option value="10">DAT0 - GPIO10</option><option value="9">DAT1 - GPIO9</option><option value="12">CMD - GPIO12</option><option value="11">CLK - GPIO11</option><option value="14">DAT2 - GPIO14</option><option value="13">DAT3 - GPIO13</option></select></label>
+<label>Requested sample spacing<select id="interval"><option value="100">100 us (up to 10 k samples/s)</option><option value="1000">1 ms (up to 1 k samples/s)</option><option value="10000">10 ms (up to 100 samples/s)</option></select></label>
+<label>Wi-Fi during capture<select id="wifiOff"><option value="0">On</option><option value="1">Off, then restore</option></select></label>
+<button class="primary" id="capture">Capture all six pins</button><button type="button" id="cancel" disabled>Cancel</button></form>
+<p id="pinhelp" class="muted"></p><p id="status" role="status" aria-live="polite">Connecting...</p><p id="error" class="error" role="alert"></p>
+<p id="wifihelp" class="muted"></p>
+<p class="warning">Slow voltage changes only. This cannot resolve SD clock edges, ringing, or fast glitches. The ADC's nominal range ends around 3.1 V, so a normal 3.3 V HIGH and its noise may be clipped. A flat trace does not prove a clean signal.</p></div>
+<section class="card"><h2 id="traceheading">Voltage trace</h2>
+<div class="row"><label>Readings<select id="units"><option value="auto">Automatic units</option><option value="raw">Raw ADC counts</option><option value="voltage">Voltage where valid</option></select></label><label>Vertical scale<select id="scale"><option value="full">Full range</option><option value="auto">Fit each trace</option></select></label><label>Time zoom<select id="zoom"><option value="1">Full capture</option><option value="2">2x</option><option value="5">5x</option><option value="10">10x</option></select></label><label>Position<input id="pan" type="range" min="0" max="1000" value="0" disabled></label><button id="csv" disabled>Download CSV</button><button id="json" disabled>Download capture</button></div>
+<p id="settiming" class="muted"></p><p id="radiocondition" class="muted"></p><p id="quality" class="warning" aria-live="polite"></p><canvas id="trace" aria-label="Captured pin readings against actual time" role="img"></canvas><p id="cursor" class="muted">Move over a trace to inspect a sample.</p>
+<div id="stats"></div><p id="restore" class="muted"></p>
+<details><summary>What this capture measures</summary><p class="muted">Samples are taken at the ESP32 pad, with SD transfers stopped. The selected pad changes to analog input and its internal pull-up is disabled; the board's external pull-ups remain. ADC sampling loads the line and adds its own measurement noise. This is not a direct measurement of the card's supply.</p><p class="muted">Timing comes from each conversion's actual timestamp. Wi-Fi and task scheduling cause gaps; unavailable readings appear as gaps, never as zero volts. The trace also breaks across long scheduling gaps. Voltage uses the chip's ADC calibration when available; otherwise the display uses raw ADC counts. The displayed range is the variation in recorded readings, not an isolated measurement of electrical noise. This board has pull-ups on CMD and DAT0-3 only. CLK has no pull-up and the ESP32 releases it during capture; its falling or low reading is consistent with an undriven line and is not evidence of a clock fault.</p><p class="muted">Captures stay in RAM until another SD tool is started or the controller restarts. In an all-pin set, every trace starts at its own time zero for comparison. The table and exports include each pin's start offset; matching positions across traces do not represent simultaneous events. Download a capture to retain its samples and settings. Playback remains stopped after capture.</p></details>
+</section></main><script>
+const $=id=>document.getElementById(id);
+const colors=['#65d9eb','#b8a1ff','#ffbc72','#7fe0a3','#ff91b6','#e8df78'];
+let capture=null,connected=false,busy=false,scopeRunning=false,polling=false,submitting=false,seen=0,geometry=[],useVoltage=false,quietPending=false;
+async function api(path,options={}){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);try{const r=await fetch(path,{...options,signal:controller.signal});const j=await r.json();if(!r.ok){const error=Error(j.error||r.statusText);error.httpStatus=r.status;throw error;}return j;}finally{clearTimeout(timer);}}
+const post=(path,p={})=>api(path,{method:'POST',body:new URLSearchParams(p)});
+function traces(){return capture?(capture.channels||[capture]):[];}
+function sampleCount(){return traces().reduce((n,t)=>n+(t.samples?.length||0),0);}
+function isSet(){return capture?.captureMode==='sequential'||Array.isArray(capture?.channels);}
+function controls(){for(const id of ['capture','pin','interval','wifiOff'])$(id).disabled=!connected||busy||submitting;$('cancel').disabled=!connected||!scopeRunning||submitting;for(const id of ['csv','json'])$(id).disabled=!sampleCount();}
+function wifiHelp(){$('wifihelp').textContent=$('wifiOff').value==='1'?'Both Wi-Fi links will disconnect during capture (about 2 seconds at the fastest setting; up to 70 seconds at 10 ms). Samples stay in RAM, Wi-Fi restarts automatically, and this page reconnects. Cancel is unavailable while offline. If your device changes networks, reconnect to POV-Spinner.':'Wi-Fi stays active during sampling. Choose Off to compare the readings with the ESP32 radio stopped.';}
+function pinHelp(){const pin=+$('pin').value;$('capture').textContent=pin===-1?'Capture all six pins':'Capture 1,024 samples';$('pinhelp').textContent=pin===-1?'1,024 readings per pin, 6,144 total. Sequence: DAT0, DAT1, CMD, DAT2, DAT3, CLK. SD access resumes after the whole set.':(pin===9||pin===10?'ADC1: available independently of Wi-Fi.':'ADC2: shared with Wi-Fi; some readings may be unavailable.')+' External pull-ups remain connected; the ESP32 releases the selected pin.';}
+function voltage(){return useVoltage;}
+function upperLimit(row){return !!row[3]||row[1]!==null&&(row[1]>=4090||row[2]!==null&&row[2]>=3100);}
+function reading(row){return row[useVoltage?2:1];}
+function selectUnits(){const list=traces();useVoltage=$('units').value==='voltage'||$('units').value==='auto'&&list.length>0&&list.every(t=>t.calibrated&&t.samples.some(r=>r[2]!==null));}
+function summary(t){
+ const rows=t.samples||[],vals=rows.map(reading).filter(v=>v!==null),valid=rows.filter(r=>r[1]!==null).length;
+ let gap=0;for(let i=1;i<rows.length;i++)gap=Math.max(gap,rows[i][0]-rows[i-1][0]);
+ const duration=rows.length>1?rows.at(-1)[0]-rows[0][0]:0;
+ return {rows,valid,missed:rows.length-valid,clipped:rows.filter(upperLimit).length,lowClipped:rows.filter(r=>r[1]!==null&&r[1]<=5).length,
+  low:vals.length?Math.min(...vals):null,high:vals.length?Math.max(...vals):null,mean:vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:null,
+  gap,rate:duration?(rows.length-1)*1e6/duration:0};
+}
+function stats(){
+ const list=traces(),all=list.map(summary),unit=useVoltage?'mV':'counts',format=v=>v===null?'Unavailable':v.toFixed(1)+' '+unit;
+ $('stats').replaceChildren();$('stats').classList.toggle('group',isSet());
+ if(isSet()){
+  const table=document.createElement('table'),head=document.createElement('thead'),body=document.createElement('tbody'),hr=document.createElement('tr');
+  for(const label of ['Signal / GPIO','Start offset','Valid / attempted','Minimum','Maximum','Recorded range','Over range','Rate','Largest gap']){const th=document.createElement('th');th.textContent=label;hr.append(th);}head.append(hr);
+  list.forEach((t,i)=>{const a=all[i],row=document.createElement('tr');row.dataset.pin=t.pin;
+   const values=[`${t.signal} / ${t.pin}`,((t.startOffset_us||0)/1000).toFixed(1)+' ms',`${a.valid} / ${a.rows.length}`,format(a.low),format(a.high),format(a.low===null?null:a.high-a.low),String(a.clipped),a.rate.toFixed(0)+'/s',(a.gap/1000).toFixed(3)+' ms'];
+   values.forEach((value,index)=>{const td=document.createElement('td');td.textContent=value;if(index===0){const dot=document.createElement('i');dot.className='signal-dot';dot.style.background=colors[i%colors.length];td.prepend(dot);}row.append(td);});body.append(row);
+  });table.append(head,body);$('stats').append(table);
+ }else if(all.length){
+  const a=all[0],entries=[['Minimum',format(a.low)],['Maximum',format(a.high)],['Recorded range',format(a.low===null?null:a.high-a.low)],['Mean',format(a.mean)],['Valid / attempted',`${a.valid} / ${a.rows.length}`],['Average attempt rate',a.rate?a.rate.toFixed(0)+' samples/s':'Unavailable'],['Largest time gap',(a.gap/1000).toFixed(3)+' ms']];
+  for(const [label,value] of entries){const box=document.createElement('div'),name=document.createElement('span'),text=document.createElement('strong');name.textContent=label;text.textContent=value;box.append(name,text);$('stats').append(box);}
+ }
+ const clipped=all.reduce((n,a)=>n+a.clipped,0),low=all.reduce((n,a)=>n+a.lowClipped,0),missed=all.reduce((n,a)=>n+a.missed,0),warnings=[];
+ if(clipped)warnings.push(`${clipped} readings at or near the ADC upper limit. Their voltage is unavailable; peaks may be clipped. Raw-count variation is not a noise-voltage measurement.`);
+ if(low)warnings.push(`${low} readings at or near the ADC lower limit. Negative excursions cannot be measured.`);
+ if(missed)warnings.push(`${missed} missed readings (${list.map(t=>t.readError).filter(Boolean).join(', ')||'ADC unavailable'}).`);
+ if(!useVoltage){
+  if(list.some(t=>!t.calibrated))warnings.push('Voltage calibration unavailable for some readings. Showing raw ADC counts; these are not volts.');
+  else if($('units').value==='raw')warnings.push('Showing raw ADC counts; these are not volts.');
+  else warnings.push(isSet()?'Some pins have no valid in-range voltage readings. Showing raw ADC counts for the whole set; these are not volts.':'No valid in-range voltage readings. Showing raw ADC counts; these are not volts.');
+ }
+ for(const t of list){if(t.calibrationError)warnings.push(t.signal+' calibration: '+t.calibrationError+'.');if(t.error)warnings.push(t.signal+': '+t.error);}
+ if(!all.some(a=>a.low!==null))warnings.push('No valid values to plot.');
+ $('quality').textContent=warnings.join(' ');
+}
+function draw(){
+ const canvas=$('trace'),list=traces(),lanes=Math.max(list.length,1),multi=lanes>1;
+ const desired=multi?lanes*140+12:(innerWidth<600?280:340);canvas.style.height=desired+'px';
+ const w=canvas.clientWidth,h=desired,dpr=devicePixelRatio||1;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+ const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);ctx.font='12px system-ui';geometry=[];
+ const left=60,right=18,pw=w-left-right;
+ const allEnd=Math.max(1,...list.map(t=>t.samples?.at(-1)?.[0]||0)),span=allEnd/(+$('zoom').value),from=(allEnd-span)*(+$('pan').value/1000),to=from+span;
+ if(!list.length){ctx.fillStyle='#afbdd0';ctx.textAlign='center';ctx.fillText(scopeRunning?'Capturing; traces appear after SD restoration.':'Capture a signal or all six pins to display traces.',w/2,h/2);return;}
+ list.forEach((t,index)=>{
+  const rows=t.samples||[],base=multi?index*140:0,top=base+(multi?28:25),bottom=multi?base+116:h-34,ph=bottom-top;
+  const visible=rows.filter(r=>r[0]>=from&&r[0]<=to&&reading(r)!==null);let lo=0,hi=useVoltage?3500:4095;
+  if($('scale').value==='auto'&&visible.length){lo=Math.min(...visible.map(reading));hi=Math.max(...visible.map(reading));const pad=Math.max((hi-lo)*.12,useVoltage?5:8);lo=Math.max(0,lo-pad);hi+=pad;}
+  const x=v=>left+(v-from)/span*pw,y=v=>bottom-(v-lo)/(hi-lo)*ph,divisions=multi?2:5;
+  ctx.lineWidth=1;
+  for(let i=0;i<=divisions;i++){const yy=top+i*ph/divisions;ctx.strokeStyle='#26374b';ctx.beginPath();ctx.moveTo(left,yy);ctx.lineTo(w-right,yy);ctx.stroke();ctx.fillStyle='#afbdd0';ctx.textAlign='right';ctx.fillText((hi-i*(hi-lo)/divisions).toFixed(0),left-8,yy+4);}
+  for(let i=0;i<=4;i++){const xx=left+i*pw/4;ctx.strokeStyle='#26374b';ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,bottom);ctx.stroke();ctx.fillStyle='#afbdd0';ctx.textAlign='center';ctx.fillText(((from+i*span/4)/1000).toFixed(span<10000?2:1),xx,bottom+17);}
+  ctx.fillStyle=colors[index%colors.length];ctx.textAlign='left';ctx.fillText(`${t.signal} / ${t.pin}  ${useVoltage?'mV':'ADC counts'}`,left,base+15);
+  ctx.fillStyle='#afbdd0';ctx.textAlign='right';ctx.fillText(multi?'Pin time (ms)':'Time (ms)',w-right,base+15);
+  ctx.save();ctx.beginPath();ctx.rect(left,top,pw,ph);ctx.clip();ctx.strokeStyle=colors[index%colors.length];ctx.fillStyle=ctx.strokeStyle;ctx.lineWidth=1.2;ctx.beginPath();let previous=null;
+  for(const row of rows){const value=reading(row);if(value===null){previous=null;continue;}const xx=x(row[0]),yy=y(value);if(previous&&row[0]-previous[0]<=capture.requestedInterval_us*3)ctx.lineTo(xx,yy);else ctx.moveTo(xx,yy);previous=row;}
+  ctx.stroke();for(const row of visible){ctx.beginPath();ctx.arc(x(row[0]),y(reading(row)),1.3,0,Math.PI*2);ctx.fill();}
+  if(useVoltage){ctx.fillStyle='#ffd18c';for(const row of rows)if(upperLimit(row)){const xx=x(row[0]);ctx.beginPath();ctx.moveTo(xx,top+2);ctx.lineTo(xx-3,top+7);ctx.lineTo(xx+3,top+7);ctx.closePath();ctx.fill();}}
+  ctx.restore();geometry.push({left,pw,from,span,top:base,bottom:multi?base+140:h,trace:t});
+ });
+}
+function captureStatus(){return capture?`Capture ${capture.state}. ${sampleCount().toLocaleString()} sample attempts retained.`+(isSet()?` ${traces().length} of ${capture.channelsTarget||6} pins attempted.`:''):'';}
+function heading(){if(capture)$('traceheading').textContent=isSet()?`All six SD pins - ${useVoltage?'voltage':'raw ADC'} traces`:`${capture.signal} / GPIO${capture.pin} - ${useVoltage?'voltage':'raw ADC'} trace`;}
+function render(){selectUnits();heading();stats();draw();controls();}
+function show(data){
+ const list=data.channels||[data];for(const t of list)t.samples=(t.samples||[]).map(row=>upperLimit(row)?[row[0],row[1],null,true]:row);
+ capture=data;quietPending=false;$('error').textContent=[data.error,data.restoreError].filter(Boolean).join('\n');$('status').textContent=captureStatus();
+ $('radiocondition').textContent=data.wifiOffRequested?(data.wifiOffDuringCapture?'Wi-Fi was OFF throughout sampling. '+(data.wifiRestored?'Wi-Fi restarted afterward.':'Wi-Fi restart was not confirmed.'):'Wi-Fi OFF was requested but was not confirmed throughout sampling. Do not treat this as a verified radio-off capture.'):'Wi-Fi stayed ON during this capture.';
+ $('settiming').textContent=isSet()?'Sequential captures, not simultaneous. Each trace starts at its own time zero; the start-offset column shows when that pin was sampled. Zoom and position apply to all traces.':'';
+ $('restore').textContent=data.restoreError?'SD restoration failed. Open SD Card and Retry mount.':data.wasMounted?(data.sdReady?'SD card remounted at its previous setting. Playback remains stopped.':'SD card is not mounted.'):'Card left inserted and unmounted. Use Retry mount when ready.';
+ $('cursor').textContent='Move over a trace to inspect a sample.';$('zoom').value='1';$('pan').value='0';$('pan').disabled=true;render();
+}
+async function poll(){
+ if(polling||submitting)return;polling=true;
+ try{
+  const tool=await api('/sd/tools');connected=true;busy=!!tool.running;scopeRunning=busy&&tool.operation==='scope';
+  if(scopeRunning){quietPending=!!tool.scopeWifiOff;$('status').textContent=`Capturing / restoring SD access. ${tool.scopeChannelsCompleted||0} of ${tool.scopeChannelsTarget||1} pins sampled.`+(quietPending?' Wi-Fi will disconnect temporarily.':'')+(tool.scopeActiveSignal?' Current pin: '+tool.scopeActiveSignal+'.':'');}
+  else if(busy)$('status').textContent='Another SD operation is running.';
+  else if(tool.operation==='scope'){
+   if(!seen||tool.captureId!==seen){const data=await api('/sd/scope/data');if(data.captureId!==seen&&!data.running){seen=data.captureId;show(data);}}
+   else if(capture)$('status').textContent=captureStatus();
+  }else $('status').textContent=capture?captureStatus():'Ready. The card may remain inserted, mounted or unmounted.';
+ }catch(e){connected=false;$('status').textContent=quietPending?'Wi-Fi paused for capture. Waiting for automatic reconnection; samples are retained on the controller.':'Controller disconnected. Reconnecting...';}
+ finally{polling=false;controls();}
+}
+$('captureform').onsubmit=async e=>{
+ e.preventDefault();if(submitting||busy||!connected)return;submitting=true;quietPending=$('wifiOff').value==='1';$('error').textContent='';controls();
+ try{await post('/sd/scope',{pin:$('pin').value,interval:$('interval').value,wifiOff:$('wifiOff').value});busy=true;scopeRunning=true;seen=0;capture=null;$('stats').replaceChildren();$('quality').textContent='';$('settiming').textContent='';$('radiocondition').textContent='';$('restore').textContent='';$('cursor').textContent='Move over a trace to inspect a sample.';$('status').textContent='Capturing / restoring SD access...';draw();}
+ catch(e){if(quietPending&&!e.httpStatus){connected=false;$('status').textContent='Waiting for Wi-Fi to return and checking whether the capture started...';}else{quietPending=false;$('error').textContent=e.message;}}
+ finally{submitting=false;controls();await poll();}
+};
+$('cancel').onclick=async()=>{submitting=true;controls();try{await post('/sd/cancel');$('status').textContent='Cancellation requested; restoring SD access.';}catch(e){$('error').textContent=e.message;}finally{submitting=false;controls();}};
+$('pin').onchange=pinHelp;$('wifiOff').onchange=wifiHelp;$('scale').onchange=draw;$('units').onchange=()=>{if(capture)render();};$('zoom').onchange=()=>{$('pan').disabled=$('zoom').value==='1';draw();};$('pan').oninput=draw;
+$('trace').onpointermove=e=>{
+ const rect=$('trace').getBoundingClientRect(),yy=e.clientY-rect.top,g=geometry.find(g=>yy>=g.top&&yy<g.bottom);if(!g||!g.trace.samples.length)return;
+ const t=g.from+(e.clientX-rect.left-g.left)/g.pw*g.span,row=g.trace.samples.reduce((best,r)=>Math.abs(r[0]-t)<Math.abs(best[0]-t)?r:best),v=reading(row);
+ $('cursor').textContent=`${g.trace.signal}: ${(row[0]/1000).toFixed(3)} ms: ${upperLimit(row)?'voltage over range':v===null?'unavailable reading':v+' '+(useVoltage?'mV':'counts')} (raw ${row[1]===null?'unavailable':row[1]}).`;
+};
+function download(text,type,extension){const url=URL.createObjectURL(new Blob([text],{type})),a=document.createElement('a');a.href=url;a.download=`sd-${isSet()?'all-pins':capture.signal.toLowerCase()}-${capture.wifiOffDuringCapture?'wifi-off':capture.wifiOffRequested?'wifi-unconfirmed':'wifi-on'}-${capture.captureId}.${extension}`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+$('csv').onclick=()=>{
+ const group=isSet(),header=group?'signal,gpio,start_offset_us,time_us,set_time_us,raw,millivolts,upper_limit':'time_us,raw,millivolts,upper_limit',rows=[];
+ for(const t of traces())for(const r of t.samples){const prefix=group?[t.signal,t.pin,t.startOffset_us||0,r[0],(t.startOffset_us||0)+r[0]]:[r[0]];rows.push([...prefix,r[1]??'',r[2]??'',upperLimit(r)?1:0].join(','));}
+ download(header+'\n'+rows.join('\n')+'\n','text/csv','csv');
+};
+$('json').onclick=()=>download(JSON.stringify({...capture,conditions:'SD communication paused; all-pin sets are sequential, not simultaneous; samples use time relative to each pin capture; startOffset_us records each start relative to the job; external pull-ups remain connected; fast glitches and high-level noise may be missed or clipped.'},null,2),'application/json','json');
+new ResizeObserver(draw).observe($('trace'));pinHelp();wifiHelp();controls();draw();poll();setInterval(poll,700);
+api('/status').then(s=>{$('build').textContent=s.firmwareBuildNumber!=null?' | Build '+s.firmwareBuildNumber:'';}).catch(()=>{});
+</script></body></html>

@@ -1,4 +1,5 @@
 #include "SD_Functions.h"
+#include "BoardPins.h"
 
 #include <SD_MMC.h>
 #include <Update.h>
@@ -11,13 +12,13 @@
 #include "WebPages.h"
 
 // Hardware pins
-const int PIN_SD_CLK = 10;
-const int PIN_SD_CMD = 9;
-const int PIN_SD_D0  = 8;
-const int PIN_SD_D1  = 13;
-const int PIN_SD_D2  = 12;
-const int PIN_SD_D3  = 11;
-const int PIN_SD_CD  = 14;  // LOW = inserted
+const int PIN_SD_CLK = BoardPins::SdClk;
+const int PIN_SD_CMD = BoardPins::SdCmd;
+const int PIN_SD_D0  = BoardPins::SdD0;
+const int PIN_SD_D1  = BoardPins::SdD1;
+const int PIN_SD_D2  = BoardPins::SdD2;
+const int PIN_SD_D3  = BoardPins::SdD3;
+const int PIN_SD_CD  = BoardPins::SdCd;  // -1 = no detect; otherwise LOW = inserted
 
 // SD backup paths
 static const char* const SETTINGS_DIR  = "/config";
@@ -338,6 +339,8 @@ void checkSdFirmwareUpdate() {
 }
 
 bool cardPresent() {
+  // Without a dedicated detect signal, let SDMMC determine card presence.
+  if (PIN_SD_CD < 0) return true;
   pinMode(PIN_SD_CD, INPUT_PULLUP);
   return digitalRead(PIN_SD_CD) == LOW;
 }

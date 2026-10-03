@@ -1,35 +1,15 @@
-// POV Spinner — full sketch with RPM counter, OTA, Updates page, and DUAL-SPI lanes (2 posts) 
-// Board: ESP32-S3
+// POV Spinner: rebuilt 16-connector PCB, initial four independent arms.
+// ESP32-S3 N16R8: QIO flash + OPI PSRAM; see BoardPins.h and PCB_PIN_REVIEW.md.
 // Tim Nash (Inventor)
-
-// Arduino 2.3.1
-// ESP32 S3 N16R8 Dev
-//
-// Wiring mode in this build:
-//   - Two SPI "posts" (lanes). Each drives TWO arms chained back-to-back.
-//   - Lane 0 (reuses prior Arm1 pins): CLK=47, DATA=45 drives Arm1 then Arm2
-//       Arm1 = outside-fed (normal direction; index 0 at the outside)
-//       Arm2 = center-fed   (reversed direction; index 0 at the center input)
-//   - Lane 1 (reuses prior Arm3 pins): CLK=35, DATA=36 drives Arm3 then Arm4
-//       Arm3 = outside-fed (normal)
-//       Arm4 = center-fed   (reversed`)
-//
-// Notes:
-//   * All timing / strobe / Hall logic unchanged EXCEPT default strobe now OFF (see g_strobeEnable).
-//   * Per-arm drawing routes pixels into lane segments with per-arm reverse support.
-//   * If you need different two reused ports, change LANE_CLK[] / LANE_DATA[] below.
-//   * OUT_SPI remains the default. Parallel mode left available but not used in this wiring.
-//
-// === Linkage fixes ===
-//  - g_brightness is now global (not static) so SD_Functions.cpp can link to it.
-//  - feedWatchdog() and openFseq(...) now have external linkage (not static).
-//  - ensureBgEffectsDirLocked() is defined here with external linkage so setup() links.
+// All active strips are updated together on the common clock. No chained arms.
 
 #include "ConfigTypes.h"
+#include "BoardPins.h"
+#include "SharedClockOutput.h"
+#include "SharedClockProtocol.h"
+#include <esp_heap_caps.h>
 #include <Arduino.h>
 #include <SD_MMC.h>
-#include <Adafruit_DotStar.h>
-#include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -69,30 +49,14 @@ static constexpr bool kEnableSerialDebug = false;
 
 // ---------- SK9822 / APA102 ----------
 
-// ---------- NEW: Output mode (SPI vs Parallel-GPIO) ----------
+// The legacy outmode setting remains in backups; this PCB requires parallel output.
 enum OutputMode : uint8_t { OUT_SPI = 0, OUT_PARALLEL = 1 };
-uint8_t g_outputMode = OUT_SPI; // persisted in NVS (key: "outmode")
+uint8_t g_outputMode = OUT_PARALLEL;
+static SharedClockOutput g_output;
+static_assert(MAX_ARMS == BoardPins::InitialArms, "Update the arm routing before expanding");
 
-// Parallel-GPIO driver state (kept for compatibility, not used in this wiring)
-#include "soc/gpio_struct.h"
-#include "driver/gpio.h"
-static uint32_t g_clkMask1 = 0;
-static uint32_t g_dataMask1[MAX_ARMS] = {0};
-static uint32_t g_allDataMask1 = 0;
-static bool     g_parallelPinsInit = false;
-static volatile uint8_t g_clkPadNops = 0;
-static inline void clk_pad_delay() { for (uint8_t i=0;i<g_clkPadNops;i++) __asm__ __volatile__("nop"); }
-static inline uint32_t mask1_for_pin(int gpio) { return (gpio >= 32) ? (1u << (gpio - 32)) : 0u; }
-static void configureParallelPins();
-static void sk9822_tx_parallel_spoke(uint16_t spokeIdx);
-static void sk9822_tx_parallel_black();
-
-// ---------- Hall effect + status pixel ----------
-static const int      PIN_HALL_SENSOR        = 5;   // A3144 on this pin (LOW when magnet present)
-static const int      PIN_STATUS_PIXEL       = 48;
-
-static Adafruit_NeoPixel g_statusPixel(1, PIN_STATUS_PIXEL, NEO_GRB + NEO_KHZ800);
-static bool              g_hallPrevActive   = false;
+// ---------- Hall effect (GPIO48 is now an optional strip output) ----------
+static const int      PIN_HALL_SENSOR        = BoardPins::Hall;   // A3144 on this pin (LOW when magnet present)
 static bool              g_hallDiagEnabled  = false;
 static bool              g_hallDiagActive = false;
 static bool              g_armTestEnabled   = false;
@@ -110,8 +74,13 @@ static const uint32_t    ARM_TEST_SWEEP_TOTAL_MS = 600;
 static const uint32_t    ARM_TEST_STEP_MIN_MS   = 15;
 static const uint32_t    ARM_TEST_SWEEP_HOLD_MS = 300;
 
+// Dual-core architecture
+static TaskHandle_t g_displayTaskHandle = nullptr;
+static SemaphoreHandle_t g_frameMutex = nullptr;
+static volatile bool g_displayThreadRunning = false;
+
 // RPM measurement (A3144)
-static const uint8_t     PULSES_PER_REV      = 1;   // default; can override at runtime via /rpm
+static const uint8_t     PULSES_PER_REV      = BoardPins::PulsesPerRevolution;   // default; can override at runtime via /rpm
 volatile uint32_t        g_lastPeriodUs      = 0;   // last valid pulse period (us)
 volatile uint32_t        g_pulseCount        = 0;   // total pulses seen
 volatile uint32_t        g_lastPulseUsIsr    = 0;   // last pulse timestamp (us) in ISR
@@ -158,108 +127,42 @@ static void attachHallInterrupt() {
   attachInterrupt(digitalPinToInterrupt(PIN_HALL_SENSOR), hallIsr, mode);
 }
 
-// ===== PAST 4-ARM PINS (kept for reference; not used directly now) =====
-// static const int ARM_CLK[MAX_ARMS]  = { 47, 42, 38, 35 };
-// static const int ARM_DATA[MAX_ARMS] = { 45, 41, 39, 36 };
+extern uint16_t g_pixelsPerArm;
+uint8_t g_brightness = 63;
+static volatile bool g_needShow = false;
 
-// ===== NEW: TWO-LANE (TWO-POST) SPI =====
-static const uint8_t NUM_LANES = 2;
-/* This is now setup to use both SPI lanes at full clock speed. 
-Arm 1 is outside fed and feeds Arm 2 from the center and it extends 90 degrees from Arm 1 Clockwise as viewed from the Pixels. 
-Arm 3 and 4 follow suit with Arm 3 being outside fed and 4 fed from the center. Arm 3 has been moved to the Port for 
-Arm 2 to keep from drawing too much current accross the entire PCB*/
-static const int LANE_CLK[NUM_LANES]  = { 47, 35 }; // old Arm1 CLK, old Arm4 CLK
-static const int LANE_DATA[NUM_LANES] = { 45, 36 }; // old Arm1 DATA, old Arm4 DATA
-
-// Lane DotStar objects (each lane drives two arms chained)
-static Adafruit_DotStar* g_lanes[NUM_LANES] = { nullptr, nullptr };
-
-// Virtual "per-arm" routing description into lanes
-struct ArmRoute {
-  uint8_t  lane;      // 0 or 1
-  uint16_t offset;    // start index inside lane
-  bool     reverse;   // true if arm is center-fed (data enters at the "end")
+// ---- Arm runtime state (moved up so lanesCommit can see it) ----
+struct ArmRuntimeState {
+  uint16_t baseSpoke = 0;
+  uint16_t currentSpoke = 0;
+  uint32_t blankDeadlineUs = 0;
+  uint32_t paintTimestampUs = 0;
+  bool     lit = false;
 };
 
-// Filled in rebuildStrips()
-static ArmRoute g_armRoute[MAX_ARMS];
-
-extern uint16_t g_pixelsPerArm;
-
-// Keep legacy pointer array to avoid compile guards in parallel helpers
-Adafruit_DotStar* strips[MAX_ARMS] = { nullptr };
-
-// Brightness (0..255 computed from percent)
-uint8_t g_brightness = 63;
-
-// ---- One-commit-per-step flag + lane commit helper (NEW) ----
-static volatile bool g_needShow = false;
-// SPI clock override (set once, reused)
-static bool g_spiClockConfigured = false;
-static const uint32_t g_spiClockHz = 40000000; // 40 MHz
+static ArmRuntimeState g_armState[MAX_ARMS];
 
 static inline void lanesCommit() {
   if (!g_needShow) return;
-  
-  // Configure SPI speed on first use
-  if (!g_spiClockConfigured) {
-    // Force SPI bus configuration for both lanes
-    // Lane 0 uses HSPI, Lane 1 uses VSPI (typically)
-    SPI.setFrequency(g_spiClockHz);
-    g_spiClockConfigured = true;
-    DebugLog::printf("[SPI] Clock set to %lu MHz\n", g_spiClockHz / 1000000UL);
-  }
-  
-  for (uint8_t l = 0; l < NUM_LANES; ++l) {
-    if (g_lanes[l]) g_lanes[l]->show();
-  }
+  g_output.show();
   g_needShow = false;
 }
 
-// Helpers for per-arm pixel routing into lanes
-static inline uint16_t armPixelCount() { return (g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM); }
-
-static inline uint16_t laneIndexForArmPixel(uint8_t arm, uint16_t pixel) {
-  const ArmRoute &r = g_armRoute[arm];
-  const uint16_t n  = armPixelCount();
-  uint16_t local    = r.reverse ? (n - 1 - pixel) : pixel;
-  return r.offset + local;
+static inline uint16_t armPixelCount() {
+  return g_pixelsPerArm ? g_pixelsPerArm : DEFAULT_PIXELS_PER_ARM;
 }
 
-static inline void armSetPixel(uint8_t arm, uint16_t pixel, uint8_t R, uint8_t G, uint8_t B) {
-  const ArmRoute &r = g_armRoute[arm];
-  if (r.lane >= NUM_LANES || !g_lanes[r.lane]) return;
-  uint16_t idx = laneIndexForArmPixel(arm, pixel);
-  g_lanes[r.lane]->setPixelColor(idx, R, G, B);
+static inline void armSetPixel(uint8_t arm, uint16_t pixel, uint8_t r, uint8_t g, uint8_t b) {
+  if (arm >= MAX_ARMS || pixel >= armPixelCount()) return;
+  if (BoardPins::ArmReverse[arm]) pixel = armPixelCount() - 1 - pixel;
+  g_output.setPixel(arm, pixel, r, g, b);
 }
 
-static inline void armShow(uint8_t /*arm*/) {
-  // Defer hardware .show(); commit once per step/spoke
-  g_needShow = true;
-}
-
-static inline void lanesShowAll() {
-  for (uint8_t l=0; l<NUM_LANES; ++l) if (g_lanes[l]) g_lanes[l]->show();
-}
-
-static inline void armClear(uint8_t arm) {
-  const uint16_t n = armPixelCount();
-  for (uint16_t i=0;i<n;++i) armSetPixel(arm, i, 0,0,0);
-  g_needShow = true; // commit later
-}
-
-static inline void armFillColor(uint8_t arm, uint8_t R, uint8_t G, uint8_t B) {
-  const uint16_t n = armPixelCount();
-  for (uint16_t i=0; i<n; ++i) armSetPixel(arm, i, R, G, B);
-}
-
-static inline void lanesClearAll() {
-  for (uint8_t l=0; l<NUM_LANES; ++l) {
-    if (!g_lanes[l]) continue;
-    uint16_t total = armPixelCount()*2; // two arms per lane
-    for (uint16_t i=0;i<total;++i) g_lanes[l]->setPixelColor(i,0,0,0);
-    g_lanes[l]->show();
-  }
+static inline void armShow(uint8_t /*arm*/) { g_needShow = true; }
+static inline void lanesShowAll() { g_output.show(); g_needShow = false; }
+static inline void armClear(uint8_t arm) { g_output.clear(arm); g_needShow = true; }
+static inline void armFillColor(uint8_t arm, uint8_t r, uint8_t g, uint8_t b) {
+  for (uint16_t i = 0; i < armPixelCount(); ++i) armSetPixel(arm, i, r, g, b);
 }
 
 // ---------- Watchdog ----------
@@ -358,15 +261,6 @@ uint32_t       g_frameIndex = 0, g_lastTickUs = 0;
 uint32_t       g_bootMs = 0;
 const uint32_t SELECT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
-// Arm runtime (timers/blanking)
-struct ArmRuntimeState {
-  uint16_t baseSpoke = 0;
-  uint16_t currentSpoke = 0;
-  uint32_t blankDeadlineUs = 0;
-  uint32_t paintTimestampUs = 0;  // NEW: track when arm was painted
-  bool     lit = false;
-};
-static ArmRuntimeState g_armState[MAX_ARMS];
 static uint32_t        g_spokeDurationUs     = 0;
 static uint32_t        g_nextSpokeDeadlineUs = 0;
 static uint16_t        g_spokeStep           = 0;
@@ -459,13 +353,12 @@ static void setDefaultArmPhases() {
 /* -------------------- Hall effect handling (blink + diag) -------------------- */
 static void updateHallSensor() {
   const bool hallActive = (digitalRead(PIN_HALL_SENSOR) == LOW);
-  const bool prevHall   = g_hallPrevActive;
 
   if (g_hallDiagEnabled) {
     if (hallActive && !g_hallDiagActive) {
       g_hallDiagActive = true;
       const uint8_t arms = (g_armCount < 1) ? 1 : ((g_armCount > MAX_ARMS) ? MAX_ARMS : g_armCount);
-      // Fill all arms red, show once per lane
+      // Fill all arms red and transmit them together.
       for (uint8_t a = 0; a < arms; ++a) {
         const uint16_t n = armPixelCount();
         for (uint16_t i = 0; i < n; ++i) armSetPixel(a, i, 255, 0, 0);
@@ -490,12 +383,6 @@ static void updateHallSensor() {
     g_hallDiagActive = false;
   }
 
-  if (hallActive != prevHall) {
-    g_statusPixel.setPixelColor(0, hallActive ? g_statusPixel.Color(255, 255, 255) : 0);
-    g_statusPixel.show();
-  }
-
-  g_hallPrevActive = hallActive;
 }
 
 static void updateArmTest() {
@@ -714,7 +601,8 @@ bool openFseq(const String& path, String& why){
     } else { why="zstd unsupported"; break; }
 
     if (g_fh.channelCount==0){ why="zero chans"; break; }
-    g_frameBuf = (uint8_t*)malloc(g_fh.channelCount);
+    g_frameBuf = (uint8_t*)heap_caps_malloc(g_fh.channelCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_frameBuf) g_frameBuf = (uint8_t*)heap_caps_malloc(g_fh.channelCount, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!g_frameBuf){ why="oom frame"; break; }
 
     g_currentPath = path;
@@ -740,7 +628,7 @@ bool openFseq(const String& path, String& why){
   }
 
   if (!ok) { freeFseq(); }
-  
+
   return ok;
 }
 
@@ -764,7 +652,8 @@ static bool loadFrame(uint32_t idx){
       uint32_t clen = g_cblocks[idx].cSize;
       if (clen && clen <= 8*1024*1024) {
         if (s_ctmp_size < clen) {
-          uint8_t* nb = (uint8_t*)realloc(s_ctmp, clen);
+          uint8_t* nb = (uint8_t*)heap_caps_realloc(s_ctmp, clen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (!nb) nb = (uint8_t*)heap_caps_realloc(s_ctmp, clen, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
           if (!nb) { SD_UNLOCK(); return false; }
           s_ctmp = nb; s_ctmp_size = clen;
         }
@@ -817,48 +706,31 @@ static void computeDefaultArmStarts(uint32_t startArm1) {
   }
 }
 
-/* -------------------- Rebuild TWO-LANE strips and arm routes -------------------- */
-static void rebuildStrips(){
-  // Dispose old lanes
-  for (uint8_t l=0;l<NUM_LANES;++l) {
-    if (g_lanes[l]) { delete g_lanes[l]; g_lanes[l] = nullptr; }
+/* -------------------- Rebuild four independent strips -------------------- */
+static void rebuildStrips() {
+  // Clock low before parking the twelve unused data inputs. No memory pins
+  // are touched, even if preferences came from the old GPIO35/36 build.
+  static bool parked = false;
+  if (!parked) {
+    digitalWrite(BoardPins::Clock, LOW);
+    pinMode(BoardPins::Clock, OUTPUT);
+    for (int pin : BoardPins::OutputData) {
+      digitalWrite(pin, LOW);
+      pinMode(pin, OUTPUT);
+    }
+    parked = true;
   }
-  // Build new lanes (each drives 2 * pixelsPerArm)
-  const uint16_t nPerArm = armPixelCount();
-  const uint16_t nPerLane = nPerArm * 2;
-// ESP32 SPI buses: HSPI and VSPI can run up to 80 MHz
-  // SK9822 chips support up to 30 MHz officially, but many work at 40 MHz
-  // We'll start aggressive at 40 MHz and can back down if needed
-  const uint32_t spiClockHz = 40000000; // 40 MHz - adjust down to 30000000 if unstable
-  
-  for (uint8_t l=0;l<NUM_LANES;++l) {
-    // Adafruit_DotStar will use hardware SPI, but we need to configure it AFTER begin()
-    g_lanes[l] = new Adafruit_DotStar(nPerLane, LANE_DATA[l], LANE_CLK[l], DOTSTAR_BGR);
-    g_lanes[l]->begin();
-    g_lanes[l]->setBrightness(g_brightness);
-    
-    // Access the underlying SPI settings
-    // Adafruit_DotStar stores SPI settings internally, we'll override on first show()
-    g_lanes[l]->clear();
-    
-    DebugLog::printf("[LANE%u] %u pixels, targeting %lu MHz SPI\n", 
-                     l, nPerLane, spiClockHz / 1000000UL);
+  g_output.setBrightness(g_brightness);
+  if (!g_output.begin(BoardPins::Clock, BoardPins::ArmData, MAX_ARMS, armPixelCount())) {
+    DebugLog::println("[OUTPUT] Initialization failed; playback disabled");
+    g_playing = false;
+    return;
   }
-  
-  // Initial show
-  for (uint8_t l=0;l<NUM_LANES;++l) {
-    g_lanes[l]->show();
+  for (uint8_t arm = 0; arm < MAX_ARMS; ++arm) {
+    DebugLog::printf("[ARM%u] connector 16-%u: DATA=%d CLK=%d pixels=%u reverse=%d\n",
+                     arm + 1, BoardPins::ActiveConnectors[arm], BoardPins::ArmData[arm],
+                     BoardPins::Clock, armPixelCount(), BoardPins::ArmReverse[arm]);
   }
-
-  // Route table: Arm1+Arm2 on Lane0 ; Arm3+Arm4 on Lane1
-  g_armRoute[0] = { 0, 0,           false }; // Arm1 → lane 0, offset 0, normal
-  g_armRoute[1] = { 0, nPerArm,     true  }; // Arm2 → lane 0, offset N, reversed
-  g_armRoute[2] = { 1, 0,           false }; // Arm3 → lane 1, offset 0, normal
-  g_armRoute[3] = { 1, nPerArm,     true  }; // Arm4 → lane 1, offset N, reversed
-
-  // Clear legacy arm state
-  for (uint8_t a=0;a<MAX_ARMS;++a) strips[a] = nullptr;
-
   resetArmRuntimeStates();
   setDefaultArmPhases();
 }
@@ -881,7 +753,7 @@ static void resetArmRuntimeStates(){
   g_spokeStep = 0;
 }
 
-//Diagnostic to see which SPI Lane is being used for what arm
+// Identify the four physical arm connectors by color.
 static void handleLaneDiag() {
   g_playing = false; g_paused = false;
   g_hallDiagEnabled = false; g_armTestEnabled = false;
@@ -897,41 +769,10 @@ static void handleLaneDiag() {
   server.send(200, "application/json", "{\"lanediag\":\"shown\"}");
 }
 
-/* -------------------- Parallel helpers (unchanged behavior) -------------------- */
-static void configureParallelPins() {
-  if (g_parallelPinsInit) return;
-  g_clkMask1 = 0;
-  g_allDataMask1 = 0;
-  // No dedicated ARM_CLK/DATA used now; keep masks zeroed (safe no-op if parallel selected)
-  g_parallelPinsInit = true;
-}
-
-static IRAM_ATTR void sk9822_tx_parallel_spoke(uint16_t /*spokeIdx*/) {
-  // Minimal stub; not used in SPI build
-  const uint16_t pixelCount = armPixelCount();
-  if (!spokesCount() || !pixelCount) return;
-
-  noInterrupts();
-  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
-  for (uint16_t i = 0; i < pixelCount; ++i) {
-    for (int bit = 0; bit < 32; ++bit) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
-  }
-  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
-  interrupts();
-}
-
-static IRAM_ATTR void sk9822_tx_parallel_black() {
-  noInterrupts();
-  for (int k = 0; k < 32; ++k) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
-  const uint16_t pixelCount  = armPixelCount();
-  const uint32_t bits = 32u * pixelCount + 32u;
-  for (uint32_t b = 0; b < bits; ++b) { GPIO.out1_w1tc.val = g_allDataMask1; GPIO.out1_w1ts.val = g_clkMask1; clk_pad_delay(); GPIO.out1_w1tc.val = g_clkMask1; }
-  interrupts();
-}
-
-/* -------------------- Draw / blank on SPI lanes -------------------- */
+/* -------------------- Draw / blank independent arms -------------------- */
 static void blackoutAll(){
   for (uint8_t a=0; a<MAX_ARMS; ++a) blankArm(a);
+  lanesCommit();
   resetArmRuntimeStates();
 }
 
@@ -949,14 +790,14 @@ static uint32_t computeArmHoldDurationUs(){
 
   uint32_t duty = g_displayDutyPercent;
   if (duty > 100) duty = 100;
-  
+
   // Calculate hold time based on duty cycle
   uint64_t hold = ((uint64_t)base * (uint64_t)duty) / 100ULL;
-  
+
   // REMOVED minimum clamp - allow duty to go all the way to 0
   // This allows full range control from 0% (instant blank) to 100% (full spoke)
   // The old ARM_BLANK_MIN_US clamp prevented low duty cycles from working
-  
+
   return (uint32_t)hold;
 }
 
@@ -965,24 +806,7 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 
   const uint32_t holdUs = computeArmHoldDurationUs();
 
-  // Parallel fallback (unchanged)
-  if (g_outputMode == OUT_PARALLEL) {
-    if (arm == 0) {
-      configureParallelPins();
-      sk9822_tx_parallel_spoke(spokeIdx);
-      const uint8_t arms = activeArmCount();
-      const uint16_t sct = spokesCount();
-      for (uint8_t a = 0; a < arms; ++a) {
-        g_armState[a].currentSpoke = sct ? (spokeIdx % sct) : 0;
-        g_armState[a].lit = true;
-        g_armState[a].blankDeadlineUs = nowUs + holdUs;
-        if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
-      }
-    }
-    return;
-  }
-
-  // SPI (two-lane) path — indexing
+  // Each arm keeps its own image/phase; commit all four on the shared clock.
   const uint16_t spokes = spokesCount();
   const uint8_t  arms   = activeArmCount();
   const uint16_t pixelCount = armPixelCount();
@@ -1049,23 +873,33 @@ static void paintArmAt(uint8_t arm, uint16_t spokeIdx, uint32_t nowUs){
 static void processArmBlanking(uint32_t nowUs){
   const uint8_t arms = activeArmCount();
   bool anyBlanked = false;
-  
+
+  // Add a small lead time to account for processing overhead
+  // This ensures we blank ON TIME rather than slightly late
+  const uint32_t BLANK_LEAD_US = 20; // blank 20us early to compensate for latency
+
   for (uint8_t a=0; a<arms; ++a){
     if (!g_armState[a].lit) continue;
     uint32_t blankAt = g_armState[a].blankDeadlineUs;
-    if (blankAt && microsReached(nowUs, blankAt)) {
-      blankArm(a); // marks g_needShow = true
-      anyBlanked = true;
+
+    // Blank if deadline reached OR if we're within the lead window
+    if (blankAt > 0) {
+      int32_t timeUntilBlank = (int32_t)(blankAt - nowUs);
+      if (timeUntilBlank <= (int32_t)BLANK_LEAD_US) {
+        blankArm(a);
+        anyBlanked = true;
+      }
     }
   }
+
   for (uint8_t a=arms; a<MAX_ARMS; ++a){
     if (g_armState[a].lit) {
       blankArm(a);
       anyBlanked = true;
     }
   }
-  
-  // Only commit if we actually blanked something
+
+  // Commit immediately if anything blanked
   if (anyBlanked) {
     lanesCommit();
   }
@@ -1108,7 +942,7 @@ static void processHallSyncEvent(uint32_t nowUs){
   }
 
   // Commit initial base paint when strobe is OFF
-  if (!g_strobeEnable) lanesCommit();  
+  if (!g_strobeEnable) lanesCommit();
 
   uint64_t revolutionUs = 0;
   if (g_lastPeriodUs > 0) {
@@ -1153,7 +987,7 @@ static void advancePredictedSpokes(uint32_t nowUs){
     g_nextSpokeDeadlineUs += g_spokeDurationUs;
     stepsProcessed++;
   }
-  
+
   // Commit all painted spokes at once
   if (stepsProcessed > 0) {
     lanesCommit();
@@ -1239,7 +1073,7 @@ static void handleStatus(){
     +",\"path\":\""+htmlEscape(g_currentPath)+"\""
     +",\"frame\":"+String(g_frameIndex)
     +",\"fps\":"+String(g_fps)
-    +",\"measuredFps\":"+String(g_measuredFps, 2) 
+    +",\"measuredFps\":"+String(g_measuredFps, 2)
     +",\"displayDuty\":"+String((unsigned)g_displayDutyPercent)
     +",\"startChArm1\":"+String(g_startChArm1)
     +",\"spokes\":"+String(g_spokesTotal)
@@ -1286,19 +1120,19 @@ static void handleDiagTiming() {
   json += ",\"lastPeriod_us\":" + String((unsigned long)g_lastPeriodUs);
   json += ",\"frameCounter\":" + String((unsigned long)g_frameCounter);
   json += ",\"sdFailStreak\":" + String(g_sdFailStreak);
-  
+
   // Calculate current drift
   uint32_t nowUs = micros();
   int32_t drift = (int32_t)(g_lastTickUs + g_framePeriodUs - nowUs);
   json += ",\"drift_us\":" + String((long)drift);
-  
+
   // Display duty cycle info
   json += ",\"dutyPercent\":" + String((unsigned)g_displayDutyPercent);
   uint32_t holdUs = computeArmHoldDurationUs();
   json += ",\"holdDuration_us\":" + String((unsigned long)holdUs);
-  
+
   json += "}";
-  
+
   server.send(200, "application/json", json);
 }
 
@@ -1306,7 +1140,7 @@ static void handleDiagDuty() {
   uint32_t base = g_spokeDurationUs;
   uint32_t hold = computeArmHoldDurationUs();
   uint32_t period = g_lastPeriodUs;
-  
+
   String json = "{";
   json += "\"dutyPercent\":" + String((unsigned)g_displayDutyPercent);
   json += ",\"spokeDuration_us\":" + String((unsigned long)g_spokeDurationUs);
@@ -1314,7 +1148,7 @@ static void handleDiagDuty() {
   json += ",\"computedHold_us\":" + String((unsigned long)hold);
   json += ",\"minHold_us\":" + String((unsigned long)ARM_BLANK_MIN_US);
   json += ",\"fallback_us\":" + String((unsigned long)ARM_BLANK_FALLBACK_US);
-  
+
   // Show per-arm state
   json += ",\"arms\":[";
   const uint8_t arms = activeArmCount();
@@ -1326,7 +1160,7 @@ static void handleDiagDuty() {
     json += "}";
   }
   json += "]}";
-  
+
   server.send(200, "application/json", json);
 }
 
@@ -1382,34 +1216,35 @@ static void applyDisplayDuty(uint8_t pct){
   uint32_t newHold = computeArmHoldDurationUs();
   uint32_t now = micros();
   const uint8_t arms = activeArmCount();
-  
+
   // Update currently lit arms with new deadline based on when they were painted
   for (uint8_t a = 0; a < arms; ++a) {
     if (g_armState[a].lit && g_armState[a].paintTimestampUs > 0) {
       // Recalculate deadline from original paint time with new hold duration
       g_armState[a].blankDeadlineUs = g_armState[a].paintTimestampUs + newHold;
       if (g_armState[a].blankDeadlineUs == 0) g_armState[a].blankDeadlineUs = 1;
-      
+
       // If new deadline already passed, blank immediately
       if (microsReached(now, g_armState[a].blankDeadlineUs)) {
         blankArm(a);
       }
     }
   }
-  
+
   if (g_needShow) {
     lanesCommit();
   }
-  
-  DebugLog::printf("[DUTY] %u%% → hold=%lu us (spoke=%lu us)\n", 
-                   (unsigned)pct, (unsigned long)newHold, 
+
+  DebugLog::printf("[DUTY] %u%% → hold=%lu us (spoke=%lu us)\n",
+                   (unsigned)pct, (unsigned long)newHold,
                    (unsigned long)g_spokeDurationUs);
 }
 
 static void applyBrightness(uint8_t pct){
   if (pct>100) pct=100;
   g_brightnessPercent=pct; g_brightness=(uint8_t)((255*pct)/100);
-  for (uint8_t l=0; l<NUM_LANES; ++l) if (g_lanes[l]) { g_lanes[l]->setBrightness(g_brightness); g_lanes[l]->show(); }
+  g_output.setBrightness(g_brightness);
+  lanesShowAll();
   prefs.putUChar("brightness", g_brightnessPercent);
   persistSettingsToSd();
 }
@@ -1455,8 +1290,8 @@ static void handleStart(){
     g_armTestCurrentPixel = 0;
     g_armTestNextStepMs = 0;
   }
-  g_playing=true; 
-  g_paused=false; 
+  g_playing=true;
+  g_paused=false;
   g_lastTickUs = micros();  // CHANGE from millis()
   g_bootMs = millis();
   server.send(200,"application/json","{\"playing\":true}");
@@ -1604,15 +1439,15 @@ static void handleSpeed() {
   if (val < 1) val = 1;
   if (val > 120) val = 120;
   g_fps = (uint16_t)val;
-  
+
   // CRITICAL: Calculate in microseconds, not milliseconds!
   g_framePeriodUs = (uint32_t)(1000000UL / g_fps);
-  
+
   prefs.putUShort("fps", g_fps);
   persistSettingsToSd();
-  
+
   g_lastTickUs = micros(); // Use micros, not millis!
-  
+
   DebugLog::printf("[PLAY] FPS=%u  period=%luus\n", g_fps, (unsigned long)g_framePeriodUs);
   server.send(200, "application/json", String("{\"fps\":") + g_fps + "}");
 }
@@ -1889,20 +1724,45 @@ static void handleFseqRanges() {
   s += "]}";
   server.send(200,"application/json",s);
 }
+static void handleDiagBlank() {
+  uint32_t hold = computeArmHoldDurationUs();
 
+  String json = "{";
+  json += "\"dutyPercent\":" + String((unsigned)g_displayDutyPercent);
+  json += ",\"holdTime_us\":" + String((unsigned long)hold);
+  json += ",\"spokePeriod_us\":" + String((unsigned long)g_spokeDurationUs);
+  json += ",\"outputReady\":" + String(g_output.ready() ? "true" : "false");
+  json += ",\"frameBytesPerStrip\":" + String((unsigned)SharedClockProtocol::frameBytes(armPixelCount()));
+
+  json += ",\"arms\":[";
+  const uint8_t arms = activeArmCount();
+  for (uint8_t a = 0; a < arms; ++a) {
+    if (a > 0) json += ",";
+    json += "{\"lit\":" + String(g_armState[a].lit ? "true" : "false");
+    json += ",\"deadline\":" + String((unsigned long)g_armState[a].blankDeadlineUs);
+    json += ",\"paintTime\":" + String((unsigned long)g_armState[a].paintTimestampUs);
+    uint32_t now = micros();
+    int32_t timeLeft = (int32_t)(g_armState[a].blankDeadlineUs - now);
+    json += ",\"timeLeft\":" + String((long)timeLeft);
+    json += "}";
+  }
+  json += "]}";
+
+  server.send(200, "application/json", json);
+}
 /* -------------------- SD Recovery Ladder -------------------- */
 static bool recoverSd(const char* reason) {
   DebugLog::printf("[SD] Recover: %s  streak=%d  freq=%lu kHz  CD=%d  width=%u\n",
       reason, g_sdFailStreak, (unsigned long)g_sdFreqKHz,
-      (int)digitalRead(PIN_SD_CD), (unsigned)g_sdBusWidth);
+      PIN_SD_CD >= 0 ? (int)digitalRead(PIN_SD_CD) : -1, (unsigned)g_sdBusWidth);
 
   if (!cardPresent()) {
     DebugLog::println("[SD] Card not present (CD HIGH). Waiting...");
     uint32_t t0 = millis();
-    while (!cardPresent() && millis() - t0 < 5000) { 
-      delay(50); 
-      server.handleClient(); 
-      feedWatchdog(); 
+    while (!cardPresent() && millis() - t0 < 5000) {
+      delay(50);
+      server.handleClient();
+      feedWatchdog();
     }
     if (!cardPresent()) return false;
   }
@@ -1911,7 +1771,7 @@ static bool recoverSd(const char* reason) {
 
   if (g_sdFailStreak == 1) {
     if (g_currentPath.length()) {
-      String why; 
+      String why;
       ok = openFseq(g_currentPath, why);
       DebugLog::printf("[SD] Reopen file: %s\n", ok?"OK": why.c_str());
       if (ok) { feedWatchdog(); return true; }
@@ -1922,8 +1782,8 @@ static bool recoverSd(const char* reason) {
   SD_MMC.end();
   g_sdBusWidth = 0;
   g_sdReady = false;
-  pinMode(PIN_SD_CLK, OUTPUT); 
-  digitalWrite(PIN_SD_CLK, LOW); 
+  pinMode(PIN_SD_CLK, OUTPUT);
+  digitalWrite(PIN_SD_CLK, LOW);
   delay(5);
   pinMode(PIN_SD_CLK, INPUT);   // ← fixed here
   SD_UNLOCK();
@@ -1937,7 +1797,7 @@ static bool recoverSd(const char* reason) {
 
   ok = mountSdmmc();
   if (ok && g_currentPath.length()) {
-    String why; 
+    String why;
     ok = openFseq(g_currentPath, why);
     DebugLog::printf("[SD] Reopen after remount: %s\n", ok?"OK": why.c_str());
   }
@@ -1982,24 +1842,26 @@ static void handleArmPhase() {
               String("{\"arm\":") + arm + ",\"phase\":" + String(g_armPhaseDeg[arm-1],2) + "}");
 }
 
+// Retain the old diagnostic URL, reporting measured software output timing.
 static void handleDiagSpi() {
-  const uint16_t nPerArm = armPixelCount();
-  const uint16_t nPerLane = nPerArm * 2;
-  
-  // Calculate theoretical transmission time at current SPI clock
-  uint32_t bitsPerLane = 32 + (nPerLane * 32) + 32; // start + pixels + end
-  uint32_t transmitUs = (bitsPerLane * 1000000UL) / g_spiClockHz;
-  
-  String json = "{";
-  json += "\"spiClock_hz\":" + String((unsigned long)g_spiClockHz);
-  json += ",\"spiClock_mhz\":" + String(g_spiClockHz / 1000000.0f, 1);
-  json += ",\"pixelsPerLane\":" + String(nPerLane);
-  json += ",\"bitsPerLane\":" + String((unsigned long)bitsPerLane);
-  json += ",\"transmitTime_us\":" + String((unsigned long)transmitUs);
-  json += ",\"spokePeriod_us\":" + String((unsigned long)g_spokeDurationUs);
-  json += ",\"transmitPercent\":" + String((transmitUs * 100.0f) / (g_spokeDurationUs ? g_spokeDurationUs : 1), 1);
-  json += "}";
-  
+  String json = "{\"driver\":\"shared-clock-gpio\",\"ready\":";
+  json += g_output.ready() ? "true" : "false";
+  json += ",\"clockPin\":" + String(BoardPins::Clock);
+  json += ",\"pixelsPerStrip\":" + String(armPixelCount());
+  json += ",\"bitsPerStrip\":" + String((unsigned long)(8 * SharedClockProtocol::frameBytes(armPixelCount())));
+  json += ",\"lastTransmit_us\":" + String((unsigned long)g_output.lastTransmitUs());
+  json += ",\"psramBytes\":" + String((unsigned long)ESP.getPsramSize());
+  json += ",\"freePsramBytes\":" + String((unsigned long)ESP.getFreePsram());
+  json += ",\"hallPin\":" + String(BoardPins::Hall);
+  json += ",\"sdD0Pin\":" + String(BoardPins::SdD0);
+  json += ",\"arms\":[";
+  for (uint8_t a = 0; a < MAX_ARMS; ++a) {
+    if (a) json += ",";
+    json += "{\"arm\":" + String(a + 1);
+    json += ",\"connector\":" + String(BoardPins::ActiveConnectors[a]);
+    json += ",\"dataPin\":" + String(BoardPins::ArmData[a]) + "}";
+  }
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
@@ -2036,21 +1898,12 @@ static void handleRpmCfg(){
 }
 
 /* -------------------- Output mode switch -------------------- */
-static void setOutputMode(uint8_t mode) {
-  mode = (mode == OUT_PARALLEL) ? OUT_PARALLEL : OUT_SPI;
-  if (mode == g_outputMode) return;
-  g_outputMode = mode;
-  prefs.putUChar("outmode", g_outputMode);
-  persistSettingsToSd();
-  if (g_outputMode == OUT_PARALLEL) configureParallelPins();
-  blackoutAll();
-}
 static void handleOutMode() {
-  if (!server.hasArg("mode")) { server.send(400,"application/json","{\"error\":\"missing mode\"}"); return; }
-  String m = server.arg("mode"); m.toLowerCase();
-  if (m != "spi" && m != "parallel") { server.send(400,"application/json","{\"error\":\"mode must be spi|parallel\"}"); return; }
-  setOutputMode(m == "parallel" ? OUT_PARALLEL : OUT_SPI);
-  server.send(200,"application/json", String("{\"outmode\":\"") + (g_outputMode==OUT_PARALLEL?"parallel":"spi") + "\"}");
+  if (!server.hasArg("mode") || server.arg("mode") != "parallel") {
+    server.send(400, "application/json", "{\"error\":\"This PCB requires shared-clock parallel output\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"outmode\":\"parallel\"}");
 }
 
 /* -------------------- OTA / Updates page -------------------- */
@@ -2085,6 +1938,7 @@ static void startWifiAP(){
   server.on("/index.html", HTTP_GET, handleRoot);
   server.on("/status",  HTTP_GET,  handleStatus);
 
+
   // Playback & settings
   server.on("/play",    HTTP_GET,  handlePlayLink);
   server.on("/b",       HTTP_POST, handleB);
@@ -2100,10 +1954,10 @@ static void startWifiAP(){
   server.on("/autoplay",HTTP_POST, handleAutoplay);
   server.on("/watchdog",HTTP_POST, handleWatchdog);
   server.on("/bgeffect",HTTP_POST, handleBgEffect);
-  
-  // SPI Lane Diag
+
+  // Connector color diagnostic
   server.on("/lanediag", HTTP_POST, handleLaneDiag);
-  
+
 
   // Strobe + per-arm phase
   server.on("/strobe",   HTTP_POST, handleStrobe);
@@ -2122,6 +1976,7 @@ static void startWifiAP(){
   server.on("/fseq/cblocks",HTTP_GET,  handleCBlocks);
   server.on("/sd/reinit",   HTTP_POST, handleSdReinit);
   server.on("/sd/config",   HTTP_POST, handleSdConfig);
+  server.on("/diag/blank", HTTP_GET, handleDiagBlank);
 
   // Files
   server.on("/files",   HTTP_GET,  handleFiles);
@@ -2164,20 +2019,29 @@ static void startWifiAP(){
 
 void setup(){
   DebugLog::begin(kEnableSerialDebug);
-  DebugLog::println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame) — DUAL-SPI lanes build");
+  DebugLog::println("\n[POV] SK9822 spinner — FSEQ v2 (sparse + zlib per-frame) — four independent outputs on the 16-connector PCB");
   DebugLog::printf("[MAP] labelMode=%d\n", (int)gLabelMode);
 
+  DebugLog::printf("[PSRAM] found=%d total=%lu free=%lu bytes\n", psramFound(),
+                   (unsigned long)ESP.getPsramSize(), (unsigned long)ESP.getFreePsram());
+  if (!psramFound()) DebugLog::println("[PSRAM] Not detected; select OPI PSRAM for N16R8");
   pinMode(PIN_HALL_SENSOR, INPUT_PULLUP);
-
-  g_statusPixel.begin();
-  g_statusPixel.setBrightness(64);
-  g_statusPixel.clear();
-  g_statusPixel.show();
 
   g_sdMutex = xSemaphoreCreateMutex();
 
   // Restore settings from NVS first
   prefs.begin("display", false);
+  // One-time topology migration. Preserve brightness, pixel count, Wi-Fi, etc.
+  if (prefs.getUChar("pcb_rev", 0) != 1) {
+    prefs.putUChar("arms", BoardPins::InitialArms);
+    prefs.putUChar("ppr", PULSES_PER_REV);
+    prefs.putUChar("hedge", 0); // Falling edge: one count per magnet pass.
+    prefs.putBool("usepa", false); // Old chained-arm channel starts do not apply.
+    prefs.putUChar("pcb_rev", 1);
+  }
+  g_outputMode = OUT_PARALLEL;
+  if (!prefs.isKey("outmode") || prefs.getUChar("outmode", OUT_SPI) != OUT_PARALLEL)
+    prefs.putUChar("outmode", OUT_PARALLEL);
   PrefPresence present;
   present.sdMode = prefs.isKey("sdmode");
   g_sdPreferredBusWidth = sanitizeSdMode(prefs.getUChar("sdmode", (uint8_t)SD_BUS_AUTO));
@@ -2237,10 +2101,8 @@ void setup(){
   g_hallEdgeMode = prefs.getUChar("hedge", 0);
   attachHallInterrupt();
 
-  // Output mode pref (default SPI)
-  g_outputMode = prefs.getUChar("outmode", (uint8_t)OUT_SPI);
-  if (g_outputMode != OUT_SPI && g_outputMode != OUT_PARALLEL) g_outputMode = OUT_SPI;
-  if (g_outputMode == OUT_PARALLEL) configureParallelPins();
+  // Prevent an old SD backup from restoring the incompatible SPI topology.
+  present.outMode = true;
 
   // Strobe prefs (NEW): defaults to disabled
   g_strobeEnable   = prefs.getBool("strb_e", false);
@@ -2269,15 +2131,16 @@ void setup(){
   g_brightness = (uint8_t)((255 * g_brightnessPercent) / 100);
 if (!g_fps) g_fps = 40;
   g_framePeriodUs = 1000000UL / g_fps;
-  
+
   DebugLog::printf("[TIMING] FPS=%u period=%lu us, spokes=%u spoke_period=%lu us\n",
-                   g_fps, (unsigned long)g_framePeriodUs, 
-                   g_spokesTotal, 
+                   g_fps, (unsigned long)g_framePeriodUs,
+                   g_spokesTotal,
                    g_spokesTotal ? (unsigned long)(g_framePeriodUs * g_fps / g_spokesTotal) : 0UL);
   if (!g_startChArm1) g_startChArm1 = 1;
   if (!g_spokesTotal) g_spokesTotal = 1;
   g_armCount = clampArmCount(g_armCount);
   g_pixelsPerArm = clampPixelsPerArm(g_pixelsPerArm);
+  if (!g_usePerArmStart) computeDefaultArmStarts(g_startChArm1);
   if (!g_stationId.length()) g_stationId = defaultStationId();
 
   DebugLog::println(F("[Quadrant self-check]"));
@@ -2305,9 +2168,26 @@ if (!g_fps) g_fps = 40;
     persistSettingsToSd();
   }
 
-  rebuildStrips();       // Build two SPI lanes + routes
+  rebuildStrips();       // Four separate strips on connectors 1, 5, 9, 13
   setDefaultArmPhases();
   blackoutAll();
+
+    // CREATE FRAME MUTEX
+  g_frameMutex = xSemaphoreCreateMutex();
+
+  // START DISPLAY TASK ON CORE 1 (high priority)
+  xTaskCreatePinnedToCore(
+    displayTask,           // Task function
+    "DisplayTask",         // Name
+    4096,                  // Stack size
+    nullptr,               // Parameters
+    2,                     // Priority (high)
+    &g_displayTaskHandle,  // Task handle
+    1                      // Core 1 (Core 0 runs loop())
+  );
+
+  DebugLog::println("[DUAL-CORE] Display task pinned to Core 1, frame loading on Core 0");
+
 
   g_bootMs   = millis();
   g_playing  = false;
@@ -2321,6 +2201,7 @@ if (!g_fps) g_fps = 40;
   DebugLog::println("[STATE] Waiting for selection via web UI (5-min timeout to /test2.fseq)");
 }
 
+// CORE 0: Frame loading and web server (runs on core that setup() ran on)
 void loop(){
   pollWifiStation();
   server.handleClient();
@@ -2329,9 +2210,9 @@ void loop(){
 
   static uint32_t lastRpmPoll = 0;
   uint32_t nowMs = millis();
-  if (nowMs - lastRpmPoll >= 250) { 
-    (void)computeRpmSnapshot(); 
-    lastRpmPoll = nowMs; 
+  if (nowMs - lastRpmPoll >= 250) {
+    (void)computeRpmSnapshot();
+    lastRpmPoll = nowMs;
   }
 
   feedWatchdog();
@@ -2342,162 +2223,172 @@ void loop(){
     if (now >= g_bgEffectNextAttemptMs) {
       String why;
       g_paused = false;
-      if (openFseq(g_bgEffectPath, why)) { 
-        DebugLog::printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str()); 
-        g_bgEffectNextAttemptMs = now; 
+      if (openFseq(g_bgEffectPath, why)) {
+        DebugLog::printf("[BGE] Auto-start %s\n", g_bgEffectPath.c_str());
+        g_bgEffectNextAttemptMs = now;
       }
-      else { 
-        DebugLog::printf("[BGE] open fail: %s\n", why.c_str()); 
-        g_bgEffectNextAttemptMs = now + 5000; 
+      else {
+        DebugLog::printf("[BGE] open fail: %s\n", why.c_str());
+        g_bgEffectNextAttemptMs = now + 5000;
       }
     }
   }
 
   // Autoplay timeout
-  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled && 
+  if (g_autoplayEnabled && (!g_playing || g_bgEffectActive) && !g_hallDiagEnabled &&
       !g_armTestEnabled && (millis() - g_bootMs > SELECT_TIMEOUT_MS)) {
     String why;
     g_paused = false;
-    if (openFseq("/test2.fseq", why)) { 
-      DebugLog::println("[TIMEOUT] Auto-start /test2.fseq"); 
+    if (openFseq("/test2.fseq", why)) {
+      DebugLog::println("[TIMEOUT] Auto-start /test2.fseq");
     }
-    else { 
-      DebugLog::printf("[TIMEOUT] open fail: %s\n", why.c_str()); 
-      g_bootMs = millis(); 
+    else {
+      DebugLog::printf("[TIMEOUT] open fail: %s\n", why.c_str());
+      g_bootMs = millis();
     }
   }
 
   // Early exit if not playing
   if (!g_playing || g_paused) {
-    if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
-    delay(1);
-    feedWatchdog();
+    delay(10); // Don't hog CPU
     return;
   }
 
-  // ========== FRAME TIMING (in microseconds) ==========
+  // ========== FRAME LOADING (separate from display timing) ==========
   const uint32_t nowUs = micros();
-  
+
   // Initialize timing on first frame
   if (g_lastTickUs == 0) {
     g_lastTickUs = nowUs;
   }
-  
+
   // Check if it's time for next frame
   const uint32_t periodUs = g_framePeriodUs ? g_framePeriodUs : 25000;
   const int32_t timeUntilNext = (int32_t)(g_lastTickUs + periodUs - nowUs);
-  
+
   if (timeUntilNext <= 0) {
     // Time for new frame
-    g_lastTickUs = nowUs; // Use actual time, not accumulated
-    
-    if (!loadNextFrame()) {
-      ++g_sdFailStreak;
-      DebugLog::printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
-      if (!recoverSd("frame read failed")) {
-        if (g_sdFailStreak >= 6) {
-          DebugLog::println("[SD] Unrecoverable — pausing playback.");
-          g_playing = false;
-          g_bgEffectActive = false;
-          g_bgEffectNextAttemptMs = millis();
-          g_sdFailStreak = 0;
-          g_frameValid = false;
-          blackoutAll();
+    g_lastTickUs = nowUs;
+
+    // Lock frame buffer while loading
+    if (g_frameMutex && xSemaphoreTake(g_frameMutex, pdMS_TO_TICKS(10))) {
+      if (!loadNextFrame()) {
+        ++g_sdFailStreak;
+        DebugLog::printf("[PLAY] frame read failed — streak=%d\n", g_sdFailStreak);
+        if (!recoverSd("frame read failed")) {
+          if (g_sdFailStreak >= 6) {
+            DebugLog::println("[SD] Unrecoverable — pausing playback.");
+            g_playing = false;
+            g_bgEffectActive = false;
+            g_bgEffectNextAttemptMs = millis();
+            g_sdFailStreak = 0;
+            g_frameValid = false;
+            blackoutAll();
+          }
         }
+        xSemaphoreGive(g_frameMutex);
+        return;
       }
-      feedWatchdog();
-      return;
+      xSemaphoreGive(g_frameMutex);
     }
 
     g_sdFailStreak = 0;
     g_frameCounter++;
-    
+
     // Log FPS every second
     if (g_lastFpsReportUs == 0) g_lastFpsReportUs = nowUs;
     if (nowUs - g_lastFpsReportUs >= 1000000UL) {
       uint32_t elapsed = nowUs - g_lastFpsReportUs;
       g_measuredFps = (g_frameCounter * 1000000.0f) / (float)elapsed;
       float target = (g_framePeriodUs > 0) ? (1000000.0f / (float)g_framePeriodUs) : 0.0f;
-      
-      // This will appear in your WiFi serial console
-      DebugLog::printf("[FPS] target=%.2f measured=%.2f frames=%lu drift=%ldus\n", 
+
+      DebugLog::printf("[FPS] target=%.2f measured=%.2f frames=%lu drift=%ldus\n",
                     target, g_measuredFps, (unsigned long)g_frameCounter, (long)timeUntilNext);
-      
+
       g_frameCounter = 0;
       g_lastFpsReportUs = nowUs;
     }
   }
 
-  // ========== DISPLAY UPDATE ==========
-  const uint16_t spokeNow = currentSpokeIndex();
-  
-  if (PIN_STROBE_GATE >= 0) {
-    bool on = inStrobeWindowForArm(spokeNow, 0);
-    digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
-  }
-
- if (g_strobeEnable) {
-    processHallSyncEvent(nowUs);
-    const uint16_t spokeNow2 = currentSpokeIndex();
-    const uint8_t arms = activeArmCount();
-    bool anyChange = false;
-
-    for (uint8_t a = 0; a < arms; ++a) {
-      const bool in = inStrobeWindowForArm(spokeNow2, a);
-
-      if (in && g_lastPulseSpoke[a] != spokeNow2) {
-        paintArmAt(a, spokeNow2, nowUs);
-        g_lastPulseSpoke[a] = spokeNow2;
-        g_armState[a].lit = true;
-        anyChange = true;
-      }
-
-      if (!in && g_armState[a].lit) {
-        blankArm(a);
-        anyChange = true;
-      }
-    }
-    
-    // Commit strobe changes once per loop
-    if (anyChange) {
-      lanesCommit();
-    }
-   } else {
-    processHallSyncEvent(nowUs);
-    advancePredictedSpokes(nowUs);
-    processArmBlanking(nowUs);
-  
- }
-
-  // CRITICAL: Single commit per loop iteration
- /* if (g_needShow) {
-    lanesCommit();
-  }*/
-
   feedWatchdog();
 }
 
-// ====== SPI/Parallel-aware blanker ======
-static void blankArm(uint8_t arm){
-  if (arm >= MAX_ARMS) return;
+// CORE 1: Real-time display update (tight loop, no delays)
+void displayTask(void* parameter) {
+  g_displayThreadRunning = true;
+  DebugLog::println("[DISPLAY] Real-time task started on Core 1");
 
-  if (g_outputMode == OUT_PARALLEL) {
-    if (g_strobeEnable && PIN_STROBE_GATE >= 0) {
-      g_armState[arm].lit = false;
-      g_armState[arm].blankDeadlineUs = 0;
-      return;
+  while (g_displayThreadRunning) {
+    const uint32_t nowUs = micros();
+
+    // Early exit if not playing
+    if (!g_playing || g_paused) {
+      if (PIN_STROBE_GATE >= 0) digitalWrite(PIN_STROBE_GATE, LOW);
+      vTaskDelay(1); // Let the idle task run while waiting for playback.
+      continue;
     }
-    if (arm == 0) {
-      configureParallelPins();
-      sk9822_tx_parallel_black();
+
+    // Lock frame buffer briefly while reading
+    bool haveLock = (g_frameMutex && xSemaphoreTake(g_frameMutex, 0) == pdTRUE);
+
+    if (!haveLock) {
+      // Frame is being loaded, skip this iteration
+      delayMicroseconds(50);
+      continue;
+    }
+
+    // ========== DISPLAY UPDATE (critical timing path) ==========
+    const uint16_t spokeNow = currentSpokeIndex();
+
+    if (PIN_STROBE_GATE >= 0) {
+      bool on = inStrobeWindowForArm(spokeNow, 0);
+      digitalWrite(PIN_STROBE_GATE, on ? HIGH : LOW);
+    }
+
+    if (g_strobeEnable) {
+      processHallSyncEvent(nowUs);
+      const uint16_t spokeNow2 = currentSpokeIndex();
       const uint8_t arms = activeArmCount();
-      for (uint8_t a=0; a<arms; ++a) { g_armState[a].lit = false; g_armState[a].blankDeadlineUs = 0; }
+      bool anyChange = false;
+
+      for (uint8_t a = 0; a < arms; ++a) {
+        const bool in = inStrobeWindowForArm(spokeNow2, a);
+
+        if (in && g_lastPulseSpoke[a] != spokeNow2) {
+          paintArmAt(a, spokeNow2, nowUs);
+          g_lastPulseSpoke[a] = spokeNow2;
+          g_armState[a].lit = true;
+          anyChange = true;
+        }
+
+        if (!in && g_armState[a].lit) {
+          blankArm(a);
+          anyChange = true;
+        }
+      }
+
+      if (anyChange) {
+        lanesCommit();
+      }
+    } else {
+      processHallSyncEvent(nowUs);
+      advancePredictedSpokes(nowUs);
+      processArmBlanking(nowUs); // This is the critical blanking call
     }
-    return;
+
+    xSemaphoreGive(g_frameMutex);
+
+    // Minimal yield to prevent watchdog timeout
+    // This is a tight loop - runs thousands of times per second
   }
 
-  // SPI: clear that arm's segment only
-  armClear(arm);       // mark dirty; defer transmit
+  vTaskDelete(nullptr);
+}
+
+// Clear just this arm in the shared frame; other arms retain their own colors.
+static void blankArm(uint8_t arm) {
+  if (arm >= MAX_ARMS) return;
+  armClear(arm);
   g_armState[arm].lit = false;
   g_armState[arm].blankDeadlineUs = 0;
 }

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LPOVXLM Spinner</title>
+<style>
+:root{color-scheme:dark;--bg:#101820;--panel:#192630;--line:#354752;--text:#edf5f8;--muted:#a8beca;--accent:#82dcc8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,sans-serif}main,header{max-width:1120px;margin:auto;padding:20px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}h1{font-size:1.5rem;margin:0}h2{font-size:1.2rem;margin:0 0 16px}h3{font-size:1rem}nav{display:flex;gap:18px;flex-wrap:wrap}a{color:var(--accent)}section{scroll-margin-top:20px;margin-bottom:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:18px}.card{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:18px}.row{display:flex;align-items:end;gap:12px;flex-wrap:wrap}label{display:block;margin:10px 0;flex:1;min-width:100px}input,select,button{font:inherit;border-radius:6px;border:1px solid var(--line);padding:9px 12px}input:not([type=checkbox]),select{display:block;width:100%;background:var(--bg);color:var(--text);margin-top:5px}input[type=checkbox]{margin-right:8px;accent-color:var(--accent)}button{background:var(--accent);color:#10211e;font-weight:600;cursor:pointer}button.secondary{background:transparent;color:var(--text)}button:disabled{opacity:.5;cursor:wait}:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.muted,small{color:var(--muted)}#notice{position:sticky;top:0;z-index:2;background:#223740;padding:12px 20px;display:none;white-space:pre-wrap}#notice.error{background:#672d32}pre{padding:14px;background:#0a131a;border-radius:8px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word}table{width:100%;border-collapse:collapse}td,th{text-align:left;border-bottom:1px solid var(--line);padding:9px 5px;overflow-wrap:anywhere}td button{font-size:.8rem;margin:3px}.table-wrap{overflow:auto}#state{color:var(--accent);font-weight:600}.metrics{display:flex;gap:20px;flex-wrap:wrap}.metrics strong{display:block;font-size:1.4rem}footer{padding:20px;color:var(--muted)}
+h1{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.build-tag{font-size:.85rem;font-weight:500;color:var(--muted);white-space:nowrap}.build-tag:empty{display:none}.page-title{margin:4px 0;font-size:1.1rem;color:var(--accent)}
+html{scroll-padding-top:calc(var(--header-height,160px) + var(--notice-height,0px))}
+header{position:sticky;top:0;z-index:20;background:var(--bg);border-bottom:1px solid var(--line);box-shadow:0 4px 16px #0004}
+header>div{min-width:0;max-width:100%;overflow-wrap:anywhere}header nav{align-items:center}header #reboot{white-space:nowrap}
+#notice{top:var(--header-height,160px);z-index:19;overflow-wrap:anywhere}
+section{scroll-margin-top:16px}
+@media(max-width:600px){header{padding:12px 16px;gap:10px}header h1{font-size:1.15rem}header nav{gap:8px 14px;font-size:.9rem}header #reboot{padding:6px 10px}}
+.sequence-field{flex:1 1 360px;min-width:0;margin:10px 0}.sequence-field label{margin:0}.sequence-picker{display:flex;align-items:stretch;gap:0;margin-top:5px}.sequence-picker #sequence{flex:1;min-width:0;margin:0;border-radius:6px 0 0 6px}.sequence-picker #recentSequences{flex:0 0 145px;min-width:0;width:145px;margin:0;border-radius:0;border-left:0}.sequence-picker button{border-radius:0 6px 6px 0;border-left:0;padding:9px 10px}#sequencehint{font-size:.85rem;margin:0 0 8px}#sequencehint:empty{display:none}
+@media(max-width:600px){.sequence-field{flex-basis:100%}.sequence-picker #recentSequences{flex-basis:112px;width:112px;padding-left:6px;padding-right:2px}}
+#fseqsettingsinfo{overflow-wrap:anywhere}
+</style></head><body>
+<header><div><h1>LPOVXLM Spinner <span id="headerbuild" class="build-tag"></span></h1><span id="state">Connecting…</span></div><nav aria-label="Main"><a href="/" aria-current="page">Controller</a><a href="/leds">LEDs</a><a href="/speed-test">Speed test</a><a href="/wifi">Wi-Fi setup</a><a href="/sd">SD Card</a><a href="/sd/scope">SD pin scope</a><button type="button" id="reboot" class="secondary" title="Restart the controller and stop lights">Reboot</button></nav></header><div id="notice" role="status" aria-live="polite"></div><main><nav aria-label="Controller sections" style="margin-bottom:20px"><a href="#playback">Playback</a><a href="#settings">Settings</a></nav>
+<section id="playback"><div class="card"><div class="metrics"><div><small>Rotation</small><strong id="rpm">— RPM</strong></div><div><small>Magnetic pulses</small><strong id="pulses">—</strong></div><div><small>PSRAM</small><strong id="psram">—</strong></div><div><small><a href="/sd">SD card</a></small><strong id="sdstate">—</strong></div></div><p id="current" class="muted">No sequence selected</p><form id="playform" class="row"><div class="sequence-field"><label for="sequence">Sequence path</label><div class="sequence-picker"><input id="sequence" placeholder="Choose a recent file or enter a path" required autocomplete="off" spellcheck="false"><select id="recentSequences" aria-label="Recent sequence files" title="Choose a recent sequence"><option value="">Recent files</option></select><button type="button" id="refreshSequences" class="secondary" aria-label="Refresh file list" title="Refresh file list">&#8635;</button></div></div><button>Play</button><button type="button" id="pause" class="secondary">Pause / resume</button><button type="button" id="stop" class="secondary">Stop</button></form><p id="sequencehint" class="muted" role="status"></p><label><input id="autoFseq" type="checkbox" aria-describedby="fseqsettingsinfo">Use FSEQ settings (FPS and spokes)</label><p id="fseqsettingsinfo" class="muted" role="status" aria-live="polite"></p><p class="muted">Reads frame timing and infers spokes for a file containing one complete RGB spinner image, using pixels per arm and matching arm start channels. Files with unrelated models, separate arm streams or sparse gaps need manual spokes. Uncheck to restore your saved manual settings.</p><label><input id="sequenceTipFirst" type="checkbox" disabled aria-describedby="radialsettingsinfo">Reverse radial pixel order for this sequence</label><p id="radialsettingsinfo" class="muted" role="status"></p><label><input id="loop" type="checkbox" checked aria-describedby="loophelp">Loop playback</label><p id="loophelp" class="muted">Repeat the sequence when checked. When unchecked, finish the current pass and turn off the lights. Saved automatically.</p><p class="muted">One falling-edge magnetic pulse per revolution. Outputs use connectors 16-1, 16-5, 16-9, and 16-13.</p></div></section>
+<section id="settings"><h2>Settings</h2><div class="grid">
+<div class="card"><h3>Light and playback</h3><form data-route="/b"><label>Brightness (%)<input id="brightness" name="value" type="number" min="0" max="100" required></label><button>Save brightness</button></form><p id="centerinfo" class="muted"></p><p><a href="/leds#brightnessform">Adjust center fade on the LEDs page</a>.</p><label><input id="autoDuty" type="checkbox" aria-describedby="autodutyinfo">Auto-calc lowest duty for RPM</label><p id="autodutyinfo" class="muted" role="status" aria-live="polite"></p><p class="muted">Uses current RPM, image spokes and recent LED transfer timing with a timing margin. Saves automatically and keeps adjusting with this page closed. Takes precedence over angular strobe; uncheck to restore manual duty and strobe. The level pattern keeps its fixed widths.</p><form data-route="/duty"><label>Display duty (%)<input id="duty" name="percent" type="number" min="0" max="100" required></label><button id="saveDuty">Save duty</button></form><form data-route="/speed"><label>Sequence frames per second<input id="fps" name="fps" type="number" min="1" max="120" required></label><button id="saveSpeed">Save speed</button></form><label><input id="autoplay" type="checkbox" data-toggle="/autoplay">Play /test2.fseq after five minutes idle</label><label><input id="watchdog" type="checkbox" data-toggle="/watchdog">Enable playback watchdog</label></div>
+<div class="card"><h3>Image mapping</h3><form data-route="/mapcfg"><div class="row"><label>First channel<input id="start" name="start" type="number" min="1" max="16777216" required></label><label>Spokes<input id="spokes" name="spokes" type="number" min="1" max="65535" required></label></div><p>Set the protocol, arm count, and pixels per arm in <a href="/leds#setup">LED setup</a>.</p><label><input id="usepa" name="usepa" type="checkbox">Use individual start channels</label><div class="row"><label>Arm 1<input id="start1" name="start1" type="number" min="1" max="16777216"></label><label>Arm 2<input id="start2" name="start2" type="number" min="1" max="16777216"></label></div><div class="row"><label>Arm 3<input id="start3" name="start3" type="number" min="1" max="16777216"></label><label>Arm 4<input id="start4" name="start4" type="number" min="1" max="16777216"></label></div><button>Save mapping</button></form><small>Changing arm or pixel count stops playback. Connector positions remain 90° apart.</small></div>
+<div class="card"><h3>Rotation timing</h3><p><a href="/leds#alignment">Show the level pattern and adjust the arm offset</a>.</p><form data-route="/strobe"><label><input id="strobe" name="enable" type="checkbox">Enable angular strobe</label><label>Strobe width (degrees)<input id="strobeWidth" name="deg" type="number" min="0.1" max="10" step="0.1" required></label><label>Arm offset from sensor (degrees)<input id="phase" name="phase" type="number" min="-360" max="360" step="0.1" required></label><button>Save timing</button></form><form id="phaseform"><label>Arm<select name="arm" id="phaseArm"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label>Additional phase (degrees)<input name="deg" id="armPhase" type="number" min="-360" max="360" step="0.1" value="0"></label><button>Save arm phase</button></form></div>
+<div class="card"><h3>Wi-Fi</h3><p id="wifiinfo" class="muted"></p><p id="wifidiag" class="muted"></p><p><a href="/wifi">Open Wi-Fi setup</a> to scan networks, connect to a router, or show passwords.</p></div>
+
+<div class="card"><h3>Background effect</h3><form data-route="/bgeffect"><label><input id="background" name="enable" type="checkbox">Play background when stopped</label><label>Background sequence<input id="backgroundPath" name="path" placeholder="/BGEffects/effect.fseq"></label><button>Save background</button></form><p class="muted">Background playback starts after five seconds idle. Use uncompressed or zlib FSEQ exports. Zstd is not supported.</p></div></div></section>
+
+
+
+
+<footer>Native ESP-IDF firmware · 16 MB flash · OPI PSRAM · 4 active outputs</footer></main>
+<script src="/recent.js"></script>
+<script src="/duty.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+let lastStatus,noticeTimer,fseqSettingsBusy=false,radialSettingsBusy=false;
+let fseqWasFps=false,fseqWasSpokes=false;
+let cardSequences=[],sequenceInitialized=false,observedSequence='';
+function renderSequences(){
+    const select=$('recentSequences'),seen=new Set();
+    select.replaceChildren(new Option('Recent files',''));
+    function group(label,paths){
+        const element=document.createElement('optgroup');element.label=label;
+        for(const path of paths){if(seen.has(path))continue;seen.add(path);element.append(new Option(path,path));}
+        if(element.children.length)select.append(element);
+    }
+    group('Recent selections and uploads',sequenceHistory.list());
+    group('SD card: newest first',cardSequences.map(f=>f.path).filter(path=>!seen.has(path)).slice(0,12));
+    if(!seen.size){const empty=new Option('No recent sequences yet','');empty.disabled=true;select.append(empty);}
+}
+async function refreshSequences(){
+    const button=$('refreshSequences');if(button.disabled)return;button.disabled=true;
+    try{
+        if(!lastStatus?.sd.ready)throw Error('SD not mounted. Recent choices remain available.');
+        if(lastStatus.sdTools?.running)throw Error('SD is busy. Refresh the list when it finishes.');
+        const j=await api('/api/files?path=/');
+        if(!j.truncated)sequenceHistory.reconcile('/',j.files);
+        cardSequences=j.files.filter(f=>!f.directory&&/\.fseq$/i.test(f.path)).sort((a,b)=>(b.modified||0)-(a.modified||0)||a.path.localeCompare(b.path,undefined,{numeric:true}));
+        renderSequences();
+        if(!$('sequence').value&&document.activeElement!==$('sequence'))$('sequence').value=sequenceHistory.selected()||cardSequences[0]?.path||'';
+        $('sequencehint').textContent=j.truncated?'Showing recent choices and files from the first 512 SD entries. Open SD Card to browse folders.':'';
+    }catch(e){$('sequencehint').textContent=e.message;}
+    finally{button.disabled=false;}
+}
+$('recentSequences').onchange=()=>{const path=$('recentSequences').value;if(!path)return;$('sequence').value=path;sequenceHistory.remember(path);renderSequences();};
+$('refreshSequences').onclick=refreshSequences;
+addEventListener('sequencehistorychange',renderSequences);
+renderSequences();
+function renderBuild(s){$('headerbuild').textContent=s.firmwareVersion&&s.firmwareBuildNumber!=null?'Ver'+s.firmwareVersion+' \u00b7 Build '+s.firmwareBuildNumber:'';}
+function notice(text,bad=false){clearTimeout(noticeTimer);$('notice').textContent=text;$('notice').className=bad?'error':'';$('notice').style.display='block';if(!bad)noticeTimer=setTimeout(()=>$('notice').style.display='none',6000);}
+async function api(url,options={}){const r=await fetch(url,options);const text=await r.text();let j;try{j=JSON.parse(text);}catch{throw Error(text||r.statusText);}if(!r.ok)throw Error(j.error||r.statusText);return j;}
+const post=(path,params={})=>api(path,{method:'POST',body:new URLSearchParams(params)});
+async function act(fn){try{await fn();}catch(e){notice(e.message,true);}}
+function renderNetwork(j){const w=j.wifi;if(w.apClients===undefined)return;let text=`${w.mode}, channel ${w.channel??'?'}: ${w.apClients} local clients, ${w.apDisconnects} disconnects. Uptime ${Math.floor(w.uptime_ms/1000)} s.`;if(w.apDisconnects)text+=` Last disconnect reason: ${w.lastApDisconnectReason}.`;if(w.stationConnecting)text+=' Connecting to router.';else if(w.retriesPaused)text+=' Automatic router retries paused to keep the local connection available.';if(w.brownoutReset)text+=' Last restart was caused by low supply voltage.';else if(w.resetReason===4)text+=' Last restart followed a firmware crash. Open SD Card > Diagnostics > Saved crash report.';if(j.firmwareBuild)text+=' Firmware: '+j.firmwareBuild;$('wifidiag').textContent=text;}
+function formParams(form){const p=new URLSearchParams(new FormData(form));form.querySelectorAll('input[type=checkbox]').forEach(c=>p.set(c.name,c.checked?'1':'0'));return p;}
+async function refresh(fill=false){const j=await api('/status');lastStatus=j;if(j.path&&j.path!==observedSequence){sequenceHistory.remember(j.path);renderSequences();}observedSequence=j.path||'';renderBuild(j);renderNetwork(j);$('centerinfo').textContent=j.settings.centerDimming?'Center fade: '+Math.min(j.settings.centerBrightness,j.settings.brightness)+'% at the hub to '+j.settings.brightness+'% at the tips.':'Center fade is off.';const names=['Stopped','Playing','Arm RGB test','Hall test','Connector colors','DMA speed test','All-arm color fade','Solid color','Signal check','Quarter colors','Alternating spokes','Strip speed test','Arm-order test','White blinking','Arm alignment'];$('state').textContent=j.playbackComplete?'Finished':j.paused?'Paused':names[j.mode];if(!$('loop').disabled)$('loop').checked=j.settings.loop??true;$('rpm').textContent=j.rpm.toFixed(1)+' RPM';$('pulses').textContent=j.pulseCount;$('psram').textContent=(j.psramBytes/1048576).toFixed(0)+' MB';$('sdstate').textContent=j.sd.ready?'Mounted':'Not mounted';$('current').textContent=j.path?j.path+' · Frame '+j.frame:'No sequence selected';$('wifiinfo').textContent=j.wifi.ip?'Connected: '+j.wifi.ip+' · '+j.wifi.station+'.local':'Access point available · '+j.wifi.station+'.local';if(j.error)$('state').textContent+=' — '+j.error;if(j.playbackWarning&&!j.error)$('state').textContent+=' - '+j.playbackWarning;dutyControls.render(j);renderFseqSettings(j);if(!fill)return;for(const [k,v]of Object.entries(j.settings)){if(k==='autoFseq'||k==='fps'&&j.fileSettings?.fpsFromFile||k==='spokes'&&j.fileSettings?.spokesFromFile||k==='duty'&&j.settings.autoDuty)continue;const el=$(k);if(el){if(el.type==='checkbox')el.checked=v;else el.value=v;}}j.settings.starts.forEach((v,i)=>$('start'+(i+1)).value=v);$('armPhase').value=j.settings.armPhase[+$('phaseArm').value-1];if(!sequenceInitialized){$('sequence').value=j.path||sequenceHistory.selected()||$('sequence').value;sequenceInitialized=true;}}
+document.querySelectorAll('form[data-route]').forEach(form=>form.onsubmit=e=>{e.preventDefault();act(async()=>{await post(form.dataset.route,formParams(form));notice('Settings saved.');await refresh(true);});});
+document.querySelectorAll('[data-toggle]').forEach(el=>el.onchange=()=>act(async()=>{await post(el.dataset.toggle,{enable:el.checked?'1':'0'});notice('Setting saved.');}));
+function renderFseqSettings(s){
+    const radial=s.radialMapping||{};
+    if(!radialSettingsBusy)$('sequenceTipFirst').checked=!!radial.tipFirst;
+    $('sequenceTipFirst').disabled=radialSettingsBusy||!radial.path;
+    $('radialsettingsinfo').textContent=radial.path?'Pixel order saved separately for '+radial.path+'.':'Play a sequence to set its radial pixel order.';
+    const f=s.fileSettings||{},enabled=!!s.settings.autoFseq;
+    if(!fseqSettingsBusy)$('autoFseq').checked=enabled;
+    $('autoFseq').disabled=fseqSettingsBusy;
+    const fps=!!f.fpsFromFile,spokes=!!f.spokesFromFile;
+    $('fps').disabled=$('saveSpeed').disabled=fps;
+    $('spokes').disabled=spokes;
+    if(fps)$('fps').value=Number(f.effectiveFps.toFixed(3));
+    else if(fseqWasFps)$('fps').value=s.settings.fps;
+    if(spokes)$('spokes').value=f.effectiveSpokes;
+    else if(fseqWasSpokes)$('spokes').value=s.settings.spokes;
+    fseqWasFps=fps;fseqWasSpokes=spokes;
+    let text=enabled?'Load a sequence to read its settings. Manual values apply until a file is loaded.':'Manual FPS and spokes. Check Use FSEQ settings to read each file automatically.';
+    if(enabled&&f.loaded){
+        text=f.path+': '+(fps?Number(f.effectiveFps.toFixed(3))+' FPS ('+f.stepTimeMs+' ms/frame)':f.timingNote)+'; '+(spokes?f.effectiveSpokes+' spokes inferred from '+f.channelCount+' channels':f.layoutNote)+'.';
+        text+=' Saved manual values: '+s.settings.fps+' FPS, '+s.settings.spokes+' spokes.';
+    }
+    $('fseqsettingsinfo').textContent=text;
+}
+$('autoFseq').onchange=async()=>{
+    if(fseqSettingsBusy)return;
+    const enabled=$('autoFseq').checked;fseqSettingsBusy=true;$('autoFseq').disabled=true;
+    try{await post('/fseq/settings',{enable:enabled?1:0});await refresh();notice(enabled?'FSEQ settings enabled.':'Manual FPS and spokes restored.');}
+    catch(e){notice(e.message,true);}
+    finally{fseqSettingsBusy=false;if(lastStatus)renderFseqSettings(lastStatus);}
+};
+$('sequenceTipFirst').onchange=async()=>{
+    const path=lastStatus?.radialMapping?.path;
+    if(radialSettingsBusy||!path)return;
+    const tipFirst=$('sequenceTipFirst').checked;
+    radialSettingsBusy=true;$('sequenceTipFirst').disabled=true;
+    try{await post('/fseq/radial',{path,tipFirst:tipFirst?1:0});await refresh();notice('Pixel order saved for this sequence.');}
+    catch(e){notice(e.message,true);}
+    finally{radialSettingsBusy=false;if(lastStatus)renderFseqSettings(lastStatus);}
+};
+$('loop').onchange=async()=>{const box=$('loop');box.disabled=true;try{await post('/loop',{enable:box.checked?'1':'0'});await refresh();notice(box.checked?'Loop enabled.':'Loop disabled. Playback will stop after the last frame.');}catch(e){box.checked=lastStatus?.settings.loop??true;notice(e.message,true);}finally{box.disabled=false;}};
+$('playform').onsubmit=e=>{e.preventDefault();act(async()=>{const path=$('sequence').value.trim();await api('/start?path='+encodeURIComponent(path));$('sequence').value=path;sequenceHistory.remember(path);renderSequences();await refresh();});};
+$('pause').onclick=()=>act(async()=>{await post('/pause');await refresh();});
+$('stop').onclick=()=>act(async()=>{await post('/stop');await refresh();});
+$('phaseArm').onchange=()=>{if(lastStatus)$('armPhase').value=lastStatus.settings.armPhase[+$('phaseArm').value-1];};
+$('phaseform').onsubmit=e=>{e.preventDefault();act(async()=>{await post('/armphase',formParams(e.target));await refresh(true);notice('Arm phase saved.');});};
+// Keep bookmarks to sections that now live on the SD Card page working.
+function redirectMovedSection(){const section=location.hash.slice(1);if(['files','diagnostics','updates','logs'].includes(section)){location.replace('/sd#'+section);return true;}return false;}
+addEventListener('hashchange',redirectMovedSection);
+const dutyControls=new DutyControls({post,refresh:()=>refresh(),notice});
+if(!redirectMovedSection())act(async()=>{await refresh(true);await refreshSequences();});
+setInterval(()=>refresh().catch(()=>{$('state').textContent='Controller disconnected';}),2000);
+
+function updateHeaderOffsets(){const root=document.documentElement;root.style.setProperty('--header-height',document.querySelector('header').getBoundingClientRect().height+'px');root.style.setProperty('--notice-height',$('notice').getBoundingClientRect().height+'px');}
+const headerObserver=new ResizeObserver(updateHeaderOffsets);headerObserver.observe(document.querySelector('header'));headerObserver.observe($('notice'));updateHeaderOffsets();
+addEventListener('load',()=>{updateHeaderOffsets();if(location.hash)document.getElementById(location.hash.slice(1))?.scrollIntoView();});
+$('reboot').onclick=()=>act(async()=>{const button=$('reboot');if(button.disabled)return;button.disabled=true;try{await post('/reboot');notice('Restarting controller. Reconnect to Wi-Fi if needed.');setTimeout(()=>{button.disabled=false;},5000);}catch(e){button.disabled=false;throw e;}});
+</script></body></html>

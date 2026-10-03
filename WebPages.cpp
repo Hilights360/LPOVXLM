@@ -343,7 +343,7 @@ String rootPage(const String &statusClass,
           "<label style='display:flex;align-items:center;gap:.5rem'>"
           "<input type='checkbox' id='armtest'" + armTestAttrs + "> Arm RGB Test"
           "</label>"
-          "<div class='muted'>Sequentially sweeps each arm from hub to tip in red, green, and blue.</div>"
+          "<div class='muted'>Sequentially sweeps each connected arm in red, green, and blue.</div>"
           "</div>";
 
   html += "<div style='margin-top:.75rem'>"

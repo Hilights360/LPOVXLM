@@ -1,0 +1,7 @@
+{
+    "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.3.3/",
+    "idf.buildPath": "${workspaceFolder}/build/idf",
+    "idf.portWin": "COM30",
+    "idf.flashType": "UART",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/idf/compile_commands.json"
+}
